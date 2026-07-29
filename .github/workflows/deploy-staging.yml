@@ -1,0 +1,107 @@
+name: Deploy Staging
+
+on:
+  push:
+    branches:
+      - develop
+
+jobs:
+  deploy:
+    name: Build and Deploy Staging
+    runs-on: ubuntu-latest
+
+    environment: staging
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: curl, intl, mbstring, pdo, zlib
+          tools: composer
+
+      - name: Install PHP dependencies
+        run: |
+          composer install \
+            --no-dev \
+            --prefer-dist \
+            --no-interaction \
+            --optimize-autoloader
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+          cache: npm
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Generate release name
+        run: |
+          echo "RELEASE=$(date +%Y%m%d%H%M%S)" >> $GITHUB_ENV
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.STAGING_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -p ${{ secrets.STAGING_PORT }} \
+            ${{ secrets.STAGING_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Upload release
+        run: |
+          rsync -az --delete \
+            --exclude ".git" \
+            --exclude ".github" \
+            --exclude ".ddev" \
+            --exclude ".claude" \
+            --exclude ".gemini" \
+            --exclude ".vscode" \
+            --exclude "tests" \
+            --exclude "docs" \
+            --exclude "AGENTS.md" \
+            --exclude "README.md" \
+            --exclude "CONTRIBUTING.md" \
+            --exclude "CODE_OF_CONDUCT.md" \
+            --exclude ".editorconfig" \
+            --exclude ".gitignore" \
+            -e "ssh -p ${{ secrets.STAGING_PORT }}" \
+            ./ \
+            ${{ secrets.STAGING_USER }}@${{ secrets.STAGING_HOST }}:~/deploy/panel-staging/releases/${{ env.RELEASE }}/
+
+      - name: Prepare shared directories and activate release
+        run: |
+          ssh -p ${{ secrets.STAGING_PORT }} \
+            ${{ secrets.STAGING_USER }}@${{ secrets.STAGING_HOST }} << 'EOF'
+
+          set -e
+
+          RELEASE="${{ env.RELEASE }}"
+          DEPLOY=~/deploy/panel-staging
+
+          mkdir -p "$DEPLOY/shared/src/data/cache"
+          mkdir -p "$DEPLOY/shared/src/data/log"
+
+          rm -rf "$DEPLOY/releases/$RELEASE/src/data/cache"
+          rm -rf "$DEPLOY/releases/$RELEASE/src/data/log"
+
+          ln -sfn \
+            "$DEPLOY/shared/src/data/cache" \
+            "$DEPLOY/releases/$RELEASE/src/data/cache"
+
+          ln -sfn \
+            "$DEPLOY/shared/src/data/log" \
+            "$DEPLOY/releases/$RELEASE/src/data/log"
+
+          ln -sfn \
+            "$DEPLOY/releases/$RELEASE" \
+            "$DEPLOY/current"
+
+          EOF
