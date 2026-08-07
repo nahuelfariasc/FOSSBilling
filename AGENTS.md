@@ -237,6 +237,27 @@ tests/                         # Pest, live API, and end-to-end test structure
 4. **Module Development:** Understand the distinction between Service modules and Extension modules
 5. **Testing:** Write tests for new functionality using Pest
 
+## Fork Maintenance
+
+This repository is a fork of `FOSSBilling/FOSSBilling`. Keep these points in mind:
+
+* **Branch strategy:**
+  * `main` is the production branch. It only receives merges from `develop` (promoted after testing).
+  * `develop` is the integration branch: `main` + fork customizations (workflows, custom modules, etc.) and deploys to the staging/dev environment. Upstream updates are pulled into `develop`, tested on staging, then promoted to `main`.
+  * Sync flow: `git fetch upstream`, `git merge upstream/main` on `develop`, resolve conflicts / re-clean upstream workflows, test on staging, then `git checkout main && git merge develop && git push`.
+* **CI workflows:** The fork deliberately keeps only what is needed to run and test the app:
+  * `.github/workflows/ci.yml` — runs PHPStan + Pest (PHP 8.3) on push and PRs.
+  * `.github/workflows/codeql.yml` — security scanning.
+  * `.github/workflows/deploy-staging.yml` — deploys `develop` to the staging server.
+  * Upstream-only workflows (`auto-cs-fix`, `create-release`, `cypress-tests`, `docker-build`, `ghcr-cleanup`, `live-tests`, `preview-build`, `release-docker`) and their scripts in `.github/scripts/` are intentionally removed.
+* **After every upstream sync:** `git merge upstream/main` will restore the removed upstream workflows/scripts (upstream still tracks them). Re-remove them and commit after each sync:
+  ```bash
+  git rm -q .github/workflows/auto-cs-fix.yml .github/workflows/create-release.yml .github/workflows/cypress-tests.yml .github/workflows/docker-build.yml .github/workflows/ghcr-cleanup.yml .github/workflows/live-tests.yml .github/workflows/preview-build.yml .github/workflows/release-docker.yml .github/scripts/run-docker-cypress-tests.sh .github/scripts/run-docker-live-tests.sh
+  git commit -m "Remove upstream-only CI workflows"
+  ```
+  Merges never overwrite fork work — they only conflict where both sides changed the same file. The fork-customized files that will conflict are `ci.yml`, `php-build-test.yml`, and `AGENTS.md`: resolve by keeping the fork's trimmed versions (e.g. `git checkout --ours .github/workflows/ci.yml` then re-apply the matrix/call trim to `php-build-test.yml` if upstream changed it).
+* **Do not enable Renovate or Dependabot on the fork.** Dependency updates come from upstream merges; bot-driven PRs only add noise and merge conflicts.
+
 ## Key Files and Directories
 
 * **`README.md`:** Project overview, installation instructions, and general information
