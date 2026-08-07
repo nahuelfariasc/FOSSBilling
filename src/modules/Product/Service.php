@@ -17,6 +17,7 @@ use Box\Mod\Order\Entity\Order;
 use Box\Mod\Product\Entity\Product;
 use Box\Mod\Product\Entity\ProductCategory;
 use Box\Mod\Product\Entity\ProductPayment;
+use Box\Mod\Product\Entity\ProductPaymentPeriod;
 use Box\Mod\Product\Entity\Promo;
 use Box\Mod\Product\Entity\PromoRedemption;
 use Box\Mod\Product\Repository\DomainPricingRepository;
@@ -330,6 +331,13 @@ class Service implements InjectionAwareInterface
     {
         $service = $this->getProductModuleService($product);
 
+        // Strip client-supplied keys the product-type service hasn't declared
+        // as client-settable, preventing mass-assignment of admin-controlled
+        // fields (e.g. hosting_plan_id, server_id) via the cart/add_item endpoint.
+        if (method_exists($service, 'clientSettableConfigKeys')) {
+            $config = $this->stripUnauthorizedConfigKeys($config, $service->clientSettableConfigKeys());
+        }
+
         if (method_exists($service, 'attachOrderConfig')) {
             $config = $service->attachOrderConfig($product, $config);
         }
@@ -340,6 +348,28 @@ class Service implements InjectionAwareInterface
 
         if (method_exists($service, 'validateCustomForm')) {
             $service->validateCustomForm($config, $this->getProductValidationData($product));
+        }
+
+        return $config;
+    }
+
+    /**
+     * Remove top-level keys from the client-supplied cart config that are not
+     * in the service's `clientSettableConfigKeys()` allowlist.
+     *
+     * @param array<string, mixed> $config      client-supplied cart config
+     * @param list<string>         $allowedKeys service-defined allowlist of client-settable keys
+     *
+     * @return array<string, mixed>
+     */
+    private function stripUnauthorizedConfigKeys(array $config, array $allowedKeys): array
+    {
+        $allowedKeys = array_flip($allowedKeys);
+
+        foreach (array_keys($config) as $key) {
+            if (!isset($allowedKeys[$key])) {
+                unset($config[$key]);
+            }
         }
 
         return $config;
@@ -838,13 +868,14 @@ class Service implements InjectionAwareInterface
     public function toProductPaymentApiArray(ProductPayment $model): array
     {
         $periods = [];
-        $periods['1W'] = ['price' => $model->getPeriodPrice('w'), 'setup' => $model->getPeriodSetupPrice('w'), 'enabled' => $model->isPeriodEnabled('w')];
-        $periods['1M'] = ['price' => $model->getPeriodPrice('m'), 'setup' => $model->getPeriodSetupPrice('m'), 'enabled' => $model->isPeriodEnabled('m')];
-        $periods['3M'] = ['price' => $model->getPeriodPrice('q'), 'setup' => $model->getPeriodSetupPrice('q'), 'enabled' => $model->isPeriodEnabled('q')];
-        $periods['6M'] = ['price' => $model->getPeriodPrice('b'), 'setup' => $model->getPeriodSetupPrice('b'), 'enabled' => $model->isPeriodEnabled('b')];
-        $periods['1Y'] = ['price' => $model->getPeriodPrice('a'), 'setup' => $model->getPeriodSetupPrice('a'), 'enabled' => $model->isPeriodEnabled('a')];
-        $periods['2Y'] = ['price' => $model->getPeriodPrice('bia'), 'setup' => $model->getPeriodSetupPrice('bia'), 'enabled' => $model->isPeriodEnabled('bia')];
-        $periods['3Y'] = ['price' => $model->getPeriodPrice('tria'), 'setup' => $model->getPeriodSetupPrice('tria'), 'enabled' => $model->isPeriodEnabled('tria')];
+        foreach ($model->getPeriods() as $periodEntity) {
+            $periods[$periodEntity->getCode()] = [
+                'price' => $periodEntity->getPrice(),
+                'setup' => $periodEntity->getSetupPrice(),
+                'enabled' => $periodEntity->isEnabled(),
+                'title' => $periodEntity->getPeriod()->getTitle(),
+            ];
+        }
 
         return [
             'type' => $model->getType(),
@@ -875,32 +906,10 @@ class Service implements InjectionAwareInterface
         if ($model->getType() == ProductPayment::RECURRENT) {
             $p = [];
 
-            if ($model->isPeriodEnabled('w')) {
-                $p[] = $model->getPeriodPrice('w');
-            }
-
-            if ($model->isPeriodEnabled('m')) {
-                $p[] = $model->getPeriodPrice('m');
-            }
-
-            if ($model->isPeriodEnabled('q')) {
-                $p[] = $model->getPeriodPrice('q');
-            }
-
-            if ($model->isPeriodEnabled('b')) {
-                $p[] = $model->getPeriodPrice('b');
-            }
-
-            if ($model->isPeriodEnabled('a')) {
-                $p[] = $model->getPeriodPrice('a');
-            }
-
-            if ($model->isPeriodEnabled('bia')) {
-                $p[] = $model->getPeriodPrice('bia');
-            }
-
-            if ($model->isPeriodEnabled('tria')) {
-                $p[] = $model->getPeriodPrice('tria');
+            foreach ($model->getPeriods() as $periodEntity) {
+                if ($periodEntity->isEnabled()) {
+                    $p[] = $periodEntity->getPrice();
+                }
             }
 
             if ($p) {
@@ -1079,10 +1088,10 @@ class Service implements InjectionAwareInterface
      *   config: array
      * }
      */
-    public function getCartProductViewData(CartProduct|\Model_CartProduct $item): array
+    public function getCartProductViewData(CartProduct $item): array
     {
-        $productId = $item instanceof CartProduct ? $item->getProductId() : $item->product_id;
-        $configValue = $item instanceof CartProduct ? $item->getConfig() : $item->config;
+        $productId = $item->getProductId();
+        $configValue = $item->getConfig();
         $product = $this->findProductById((int) $productId);
         $config = json_decode($configValue ?? '', true) ?? [];
         $line = $this->getProductOrderLineConfig($product, $config);
@@ -1697,10 +1706,7 @@ class Service implements InjectionAwareInterface
         }
 
         if ($pp->getType() == ProductPayment::RECURRENT) {
-            $period = new \Box_Period((string) ($config['period'] ?? ''));
-            $key = $this->getProductPaymentPeriodKey($period);
-
-            return $pp->getPeriodSetupPrice($key);
+            return $this->getEnabledProductPaymentPeriod($pp, (string) ($config['period'] ?? ''))->getSetupPrice();
         }
 
         throw new \FOSSBilling\Exception('Unknown period selected for setup price');
@@ -1727,32 +1733,27 @@ class Service implements InjectionAwareInterface
                 throw new \FOSSBilling\Exception('Product :id payment type is recurrent, but period was not selected', [':id' => $product->getId()]);
             }
 
-            $period = new \Box_Period((string) $config['period']);
-            $key = $this->getProductPaymentPeriodKey($period);
-
-            return $pp->getPeriodPrice($key);
+            return $this->getEnabledProductPaymentPeriod($pp, (string) $config['period'])->getPrice();
         }
 
         throw new \FOSSBilling\Exception('Unknown Period selected for price');
     }
 
-    private function getProductPaymentPeriodKey(\Box_Period $period): string
+    private function getEnabledProductPaymentPeriod(ProductPayment $pp, string $code): ProductPaymentPeriod
     {
-        $code = $period->getCode();
-
+        // Validate the code shape/range up front so a malformed period gives a clear error.
         try {
-            return match ($code) {
-                '1W' => 'w',
-                '1M' => 'm',
-                '3M' => 'q',
-                '6M' => 'b',
-                '12M', '1Y' => 'a',
-                '2Y' => 'bia',
-                '3Y' => 'tria',
-            };
-        } catch (\UnhandledMatchError) {
-            throw new \FOSSBilling\Exception('Unknown period selected ' . $code);
+            $code = (new \Box_Period($code))->getCode();
+        } catch (\FOSSBilling\Exception) {
+            throw new \FOSSBilling\InformationException('Selected billing period is not available for this product');
         }
+
+        $period = $pp->getPeriod($code);
+        if (!$period instanceof ProductPaymentPeriod || !$period->isEnabled()) {
+            throw new \FOSSBilling\InformationException('Selected billing period is not available for this product');
+        }
+
+        return $period;
     }
 
     private function getProductPaymentById(int $id): ProductPayment
@@ -1835,28 +1836,50 @@ class Service implements InjectionAwareInterface
         }
 
         if ($pricing['type'] == ProductPayment::RECURRENT) {
-            $periodMap = [
-                '1W' => 'w',
-                '1M' => 'm',
-                '3M' => 'q',
-                '6M' => 'b',
-                '1Y' => 'a',
-                '2Y' => 'bia',
-                '3Y' => 'tria',
-            ];
+            $submitted = is_array($pricing['recurrent'] ?? null) ? $pricing['recurrent'] : [];
 
-            foreach ($periodMap as $period => $prefix) {
-                if (!isset($pricing['recurrent'][$period])) {
+            $existingByCode = [];
+            foreach ($productPayment->getPeriods() as $existingPeriod) {
+                $existingByCode[$existingPeriod->getCode()] = $existingPeriod;
+            }
+
+            $submittedCodes = [];
+            $sortOrder = 0;
+            foreach ($submitted as $rawCode => $periodPricing) {
+                if (!is_array($periodPricing)) {
                     continue;
                 }
 
-                $periodPricing = $pricing['recurrent'][$period];
-                $productPayment->setPeriodPricing(
-                    $prefix,
-                    (float) ($periodPricing['price'] ?? 0),
-                    (float) ($periodPricing['setup'] ?? 0),
-                    $periodPricing['enabled'] ?? false
-                );
+                try {
+                    $code = (new \Box_Period((string) $rawCode))->getCode();
+                } catch (\FOSSBilling\Exception) {
+                    throw new \FOSSBilling\InformationException('Invalid billing period :period', [':period' => (string) $rawCode]);
+                }
+
+                $submittedCodes[$code] = true;
+
+                $periodEntity = $existingByCode[$code] ?? new ProductPaymentPeriod();
+                $periodEntity
+                    ->setCode($code)
+                    ->setPrice((float) ($periodPricing['price'] ?? 0))
+                    ->setSetupPrice((float) ($periodPricing['setup'] ?? 0))
+                    ->setEnabled((bool) ($periodPricing['enabled'] ?? false))
+                    ->setSortOrder($sortOrder++);
+
+                if (!isset($existingByCode[$code])) {
+                    $productPayment->addPeriod($periodEntity);
+                    $this->di['em']->persist($periodEntity);
+                }
+            }
+
+            if ($submittedCodes === []) {
+                throw new \FOSSBilling\InformationException('At least one billing period must be configured for a recurring product');
+            }
+
+            foreach ($existingByCode as $code => $existingPeriod) {
+                if (!isset($submittedCodes[$code])) {
+                    $productPayment->removePeriod($existingPeriod);
+                }
             }
         }
     }
@@ -1910,17 +1933,31 @@ class Service implements InjectionAwareInterface
         return $value !== null ? (string) $value : null;
     }
 
-    public function getProductDiscount(Product $product, Promo $promo, ?array $config = null)
+    public function isPromoApplicableToProduct(Promo $promo, Product $product, ?array $config = null): bool
     {
         if (!$this->isPromoLinkedToProduct($promo, $product)) {
-            return 0;
+            return false;
         }
 
         if (isset($config['period'])) {
             $periods = $this->getPeriods($promo);
             if (!empty($periods) && !in_array($config['period'], $periods)) {
-                return 0;
+                return false;
             }
+        }
+
+        return true;
+    }
+
+    public function isPromoApplicableToProductById(int $productId, Promo $promo, ?array $config = null): bool
+    {
+        return $this->isPromoApplicableToProduct($promo, $this->findProductById($productId), $config);
+    }
+
+    public function getProductDiscount(Product $product, Promo $promo, ?array $config = null)
+    {
+        if (!$this->isPromoApplicableToProduct($promo, $product, $config)) {
+            return 0;
         }
 
         $line = $this->getProductOrderLineConfig($product, $config);
@@ -1954,15 +1991,8 @@ class Service implements InjectionAwareInterface
 
     public function getRenewalProductDiscount(Product $product, Promo $promo, ?array $config = null): float
     {
-        if (!$this->isPromoLinkedToProduct($promo, $product)) {
+        if (!$this->isPromoApplicableToProduct($promo, $product, $config)) {
             return 0;
-        }
-
-        if (isset($config['period'])) {
-            $periods = $this->getPeriods($promo);
-            if (!empty($periods) && !in_array($config['period'], $periods)) {
-                return 0;
-            }
         }
 
         $line = $this->getProductRenewalLineConfig($product, $config);

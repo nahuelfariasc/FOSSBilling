@@ -29,6 +29,25 @@ use Symfony\Component\HttpFoundation\Response;
 
 class Service implements InjectionAwareInterface
 {
+    /**
+     * Columns on the `client_order` table permitted in CSV exports.
+     * The `config` column (service provisioning credentials) is excluded.
+     */
+    private const array EXPORTABLE_COLUMNS = [
+        'id', 'client_id', 'product_id', 'form_id', 'promo_id', 'promo_recurring',
+        'promo_used', 'group_id', 'group_master', 'invoice_option', 'title',
+        'currency', 'unpaid_invoice_id', 'service_id', 'service_type', 'period',
+        'quantity', 'unit', 'price', 'discount', 'status', 'reason', 'notes',
+        'suspension_grace_days', 'referred_by', 'expires_at', 'activated_at',
+        'suspended_at', 'unsuspended_at', 'canceled_at', 'created_at', 'updated_at',
+    ];
+
+    /** Subset of EXPORTABLE_COLUMNS used when the caller passes no headers. */
+    private const array DEFAULT_EXPORT_COLUMNS = [
+        'id', 'client_id', 'product_id', 'title', 'currency', 'service_type',
+        'period', 'quantity', 'price', 'discount', 'status', 'reason', 'notes',
+    ];
+
     public const META_CANCEL_AT_PERIOD_END = 'cancel_at_period_end';
     private const string META_SUSPENSION_WARNING_FOR = 'suspension_warning_for';
 
@@ -546,13 +565,12 @@ class Service implements InjectionAwareInterface
         $orderStatus = $this->orderStatus($order);
 
         if ($order instanceof \Model_ClientOrder) {
-            $os = $this->di['db']->dispense('ClientOrderStatus');
-            $os->client_order_id = $orderId;
-            $os->status = $orderStatus;
-            $os->notes = $notes;
-            $os->created_at = date('Y-m-d H:i:s');
-            $os->updated_at = date('Y-m-d H:i:s');
-            $this->di['db']->store($os);
+            $os = new OrderStatus();
+            $os->setClientOrderId($orderId);
+            $os->setStatus($orderStatus);
+            $os->setNotes($notes);
+            $this->di['em']->persist($os);
+            $this->di['em']->flush();
 
             return;
         }
@@ -615,9 +633,9 @@ class Service implements InjectionAwareInterface
         $bindings['status'] = Order::STATUS_ACTIVE;
         $bindings['invoice_option'] = 'issue-invoice';
         $bindings['unpaid_invoice_status'] = \Model_Invoice::STATUS_UNPAID;
-        $bindings['pending_item_type'] = \Model_InvoiceItem::TYPE_ORDER;
-        $bindings['pending_item_task'] = \Model_InvoiceItem::TASK_RENEW;
-        $bindings['pending_item_status'] = \Model_InvoiceItem::STATUS_EXECUTED;
+        $bindings['pending_item_type'] = \Box\Mod\Invoice\Entity\InvoiceItem::TYPE_ORDER;
+        $bindings['pending_item_task'] = \Box\Mod\Invoice\Entity\InvoiceItem::TASK_RENEW;
+        $bindings['pending_item_status'] = \Box\Mod\Invoice\Entity\InvoiceItem::STATUS_EXECUTED;
         $bindings['pending_invoice_status'] = \Model_Invoice::STATUS_PAID;
         $bindings['days_until_expiration'] = $days_until_expiration;
 
@@ -670,14 +688,7 @@ class Service implements InjectionAwareInterface
         $data['config'] = json_decode($this->orderConfig($model) ?? '', true) ?? [];
         $data['total'] = $this->getTotal($model);
         $data['discount'] ??= 0;
-        if ($model instanceof Order) {
-            $data['meta'] = $this->getOrderMetaRepository()->getPairsForOrder($modelId);
-        } else {
-            $data['meta'] = [];
-            foreach ($this->di['db']->find('ClientOrderMeta', 'client_order_id = ?', [$modelId]) as $metaRow) {
-                $data['meta'][$metaRow->name] = $metaRow->value;
-            }
-        }
+        $data['meta'] = $this->getOrderMetaRepository()->getPairsForOrder($modelId);
         $data['active_tickets'] = $supportService->getSupportTicketRepository()->countActiveTicketsForOrder($modelId);
         $client = $model instanceof Order
             ? $this->di['em']->getRepository(ClientEntity::class)->find($modelClientId)
@@ -1276,51 +1287,61 @@ class Service implements InjectionAwareInterface
             }
         }
 
+        // The provisioning call and the order status update that records its
+        // outcome are treated as one unit: if anything here fails after the
+        // service has already been provisioned (e.g. while computing the new
+        // expiry date), the order must still end up in failed_setup instead
+        // of being left in pending_setup. Otherwise a retry would call
+        // _callOnService() again against a service that already exists on
+        // the remote server.
         try {
             $result = $this->_callOnService($order, Order::ACTION_ACTIVATE);
-        } catch (\Exception $e) {
+
+            $period = $this->orderPeriod($order);
+            $expiresAt = $order instanceof Order ? $order->getExpiresAt() : $order->expires_at;
+            if (!empty($period)) {
+                $from_time = ($expiresAt === null) ? time() : ($order instanceof Order ? ($expiresAt->getTimestamp() ?? time()) : strtotime((string) $expiresAt));
+
+                $periodObj = $this->di['period']($period);
+                $newExpires = date('Y-m-d H:i:s', $periodObj->getExpirationTime($from_time));
+                if ($order instanceof Order) {
+                    $order->setExpiresAt(new \DateTime($newExpires));
+                } else {
+                    $order->expires_at = $newExpires;
+                }
+            }
+
+            if ($order instanceof Order) {
+                $order->setStatus(Order::STATUS_ACTIVE);
+                $order->setActivatedAt(new \DateTime());
+                $order->setSuspendedAt(null);
+                $order->setCanceledAt(null);
+                $order->setUpdatedAt(new \DateTime());
+            } else {
+                $order->status = Order::STATUS_ACTIVE;
+                $order->activated_at = date('Y-m-d H:i:s');
+                $order->suspended_at = null;
+                $order->canceled_at = null;
+                $order->updated_at = date('Y-m-d H:i:s');
+            }
+
+            $this->persistOrder($order);
+        } catch (\Throwable $e) {
+            // Caught broadly (not just \Exception): an \Error or \TypeError
+            // here means the service was already provisioned remotely, so
+            // the order must still be recorded as failed_setup rather than
+            // left in pending_setup for a retry to re-provision it.
             if ($order instanceof Order) {
                 $order->setStatus(Order::STATUS_FAILED_SETUP);
-                $this->persistOrder($order);
             } else {
                 $order->status = Order::STATUS_FAILED_SETUP;
-                $this->persistOrder($order);
             }
+            $this->persistOrder($order);
 
             $this->saveStatusChange($order, $e->getMessage());
 
             throw $e;
         }
-
-        $period = $this->orderPeriod($order);
-        $expiresAt = $order instanceof Order ? $order->getExpiresAt() : $order->expires_at;
-        if (!empty($period)) {
-            $from_time = ($expiresAt === null) ? time() : ($order instanceof Order ? ($expiresAt->getTimestamp() ?? time()) : strtotime((string) $expiresAt));
-
-            $periodObj = $this->di['period']($period);
-            $newExpires = date('Y-m-d H:i:s', $periodObj->getExpirationTime($from_time));
-            if ($order instanceof Order) {
-                $order->setExpiresAt(new \DateTime($newExpires));
-            } else {
-                $order->expires_at = $newExpires;
-            }
-        }
-
-        if ($order instanceof Order) {
-            $order->setStatus(Order::STATUS_ACTIVE);
-            $order->setActivatedAt(new \DateTime());
-            $order->setSuspendedAt(null);
-            $order->setCanceledAt(null);
-            $order->setUpdatedAt(new \DateTime());
-        } else {
-            $order->status = Order::STATUS_ACTIVE;
-            $order->activated_at = date('Y-m-d H:i:s');
-            $order->suspended_at = null;
-            $order->canceled_at = null;
-            $order->updated_at = date('Y-m-d H:i:s');
-        }
-
-        $this->persistOrder($order);
 
         if ($this->orderProductId($order)) {
             $productService = $this->di['mod_service']('product');
@@ -1429,44 +1450,23 @@ class Service implements InjectionAwareInterface
         $orderId = $this->orderId($order);
 
         if (empty($meta)) {
-            if ($order instanceof Order) {
-                $this->getOrderMetaRepository()->deleteByOrderId($orderId);
-            } else {
-                $this->di['db']->exec('DELETE FROM client_order_meta WHERE client_order_id = :id', [':id' => $orderId]);
-            }
+            $this->getOrderMetaRepository()->deleteByOrderId($orderId);
 
             return 1;
         }
         foreach ($meta as $k => $v) {
-            $mm = $order instanceof Order
-                ? $this->getOrderMetaRepository()->findOneByOrderIdAndName($orderId, $k)
-                : $this->di['db']->findOne('ClientOrderMeta', 'client_order_id = :id AND name = :name', [':id' => $orderId, ':name' => $k]);
+            $mm = $this->getOrderMetaRepository()->findOneByOrderIdAndName($orderId, $k);
             if (!$mm instanceof OrderMeta) {
-                if ($order instanceof Order) {
-                    $mm = new OrderMeta();
-                    $mm->setClientOrderId($orderId);
-                    $mm->setName($k);
-                    $mm->setCreatedAt(new \DateTime());
-                } else {
-                    $mm = $this->di['db']->dispense('ClientOrderMeta');
-                    $mm->client_order_id = $orderId;
-                    $mm->name = $k;
-                    $mm->created_at = date('Y-m-d H:i:s');
-                }
+                $mm = new OrderMeta();
+                $mm->setClientOrderId($orderId);
+                $mm->setName($k);
+                $mm->setCreatedAt(new \DateTime());
             }
-            if ($mm instanceof OrderMeta) {
-                $mm->setValue($v);
-                $mm->setUpdatedAt(new \DateTime());
-                $this->di['em']->persist($mm);
-            } else {
-                $mm->value = $v;
-                $mm->updated_at = date('Y-m-d H:i:s');
-                $this->di['db']->store($mm);
-            }
+            $mm->setValue($v);
+            $mm->setUpdatedAt(new \DateTime());
+            $this->di['em']->persist($mm);
         }
-        if ($order instanceof Order) {
-            $this->di['em']->flush();
-        }
+        $this->di['em']->flush();
 
         return 2;
     }
@@ -1907,7 +1907,7 @@ class Service implements InjectionAwareInterface
             'DELETE FROM invoice_item WHERE rel_id = :rel_id AND status = :status',
             [
                 'rel_id' => (string) $this->orderId($order),
-                'status' => \Model_InvoiceItem::STATUS_PENDING_PAYMENT,
+                'status' => \Box\Mod\Invoice\Entity\InvoiceItem::STATUS_PENDING_PAYMENT,
             ],
         );
     }
@@ -2237,13 +2237,12 @@ class Service implements InjectionAwareInterface
         $orderId = $this->orderId($order);
 
         if ($order instanceof \Model_ClientOrder) {
-            $bean = $this->di['db']->dispense('ClientOrderStatus');
-            $bean->client_order_id = $orderId;
-            $bean->status = $status;
-            $bean->notes = $notes;
-            $bean->created_at = date('Y-m-d H:i:s');
-            $bean->updated_at = date('Y-m-d H:i:s');
-            $this->di['db']->store($bean);
+            $bean = new OrderStatus();
+            $bean->setClientOrderId($orderId);
+            $bean->setStatus($status);
+            $bean->setNotes($notes);
+            $this->di['em']->persist($bean);
+            $this->di['em']->flush();
 
             return true;
         }
@@ -2400,8 +2399,12 @@ class Service implements InjectionAwareInterface
 
     public function exportCSV(array $headers): Response
     {
+        if ($headers) {
+            $headers = array_values(array_intersect(self::EXPORTABLE_COLUMNS, $headers));
+        }
+
         if (!$headers) {
-            $headers = ['id', 'client_id', 'product_id', 'title', 'currency', 'service_type', 'period', 'quantity', 'price', 'discount', 'status', 'reason', 'notes'];
+            $headers = self::DEFAULT_EXPORT_COLUMNS;
         }
 
         return $this->di['csv_response_factory']->create('client_order', 'orders.csv', $headers);

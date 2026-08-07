@@ -179,6 +179,91 @@ test('action create', function (): void {
     expect($result->getTld())->toBe($confArr['tld']);
 });
 
+test('action activate creates the account when it has not been provisioned yet', function (): void {
+    $orderModel = new Model_ClientOrder();
+    $orderModel->loadBean(new Tests\Helpers\DummyBean());
+
+    $model = new ServiceHosting();
+    $model->setServiceHostingServerId(1);
+    $model->setSld('example');
+    $model->setTld('.com');
+
+    $orderServiceMock = Mockery::mock(OrderService::class);
+    $orderServiceMock->shouldReceive('getOrderService')->atLeast()->once()->andReturn($model);
+    $orderServiceMock->shouldReceive('getConfig')->atLeast()->once()->andReturn([]);
+
+    $serverRepo = Mockery::mock(ServiceHostingServerRepository::class)->shouldIgnoreMissing();
+    $serverRepo->shouldReceive('find')->atLeast()->once()->andReturn(new ServiceHostingServer());
+
+    $emMock = Mockery::mock(EntityManagerInterface::class)->shouldIgnoreMissing();
+    $emMock->shouldReceive('getRepository')->with(ServiceHostingServer::class)->andReturn($serverRepo);
+    $emMock->shouldReceive('flush')->atLeast()->once();
+
+    $di = container();
+    $di['em'] = $emMock;
+    $di['mod_service'] = $di->protect(fn (): Mockery\MockInterface => $orderServiceMock);
+
+    $serverManagerMock = Mockery::mock('\Server_Manager_Custom');
+    $serverManagerMock->shouldReceive('getPasswordLength')->atLeast()->once()->andReturn(12);
+    $serverManagerMock->shouldReceive('generateUsername')->atLeast()->once()->with('example.com')->andReturn('example');
+
+    $adapterMock = Mockery::mock('\Server_Manager_Custom');
+    $adapterMock->shouldReceive('createAccount')->once();
+
+    $serviceMock = Mockery::mock(Service::class)->makePartial();
+    $serviceMock->shouldReceive('getServerManager')->atLeast()->once()->andReturn($serverManagerMock);
+    $serviceMock->shouldReceive('_getAM')->once()->andReturn([$adapterMock, new Server_Account()]);
+    $serviceMock->setDi($di);
+
+    $result = $serviceMock->action_activate($orderModel);
+
+    expect($result)->toBe(['username' => 'example'])
+        ->and($model->getUsername())->toBe('example');
+});
+
+test('action activate does not recreate an account that was already provisioned', function (): void {
+    // Regression test: if a previous activation attempt already created the
+    // account on the server (its username was persisted), retrying must not
+    // call createAccount() again - the account already exists remotely and
+    // doing so only fails with a duplicate-account server error.
+    $orderModel = new Model_ClientOrder();
+    $orderModel->loadBean(new Tests\Helpers\DummyBean());
+
+    $model = new ServiceHosting();
+    $model->setServiceHostingServerId(1);
+    $model->setSld('example');
+    $model->setTld('.com');
+    $model->setUsername('example');
+
+    $orderServiceMock = Mockery::mock(OrderService::class);
+    $orderServiceMock->shouldReceive('getOrderService')->atLeast()->once()->andReturn($model);
+    $orderServiceMock->shouldReceive('getConfig')->atLeast()->once()->andReturn([]);
+
+    $serverRepo = Mockery::mock(ServiceHostingServerRepository::class)->shouldIgnoreMissing();
+    $serverRepo->shouldReceive('find')->atLeast()->once()->andReturn(new ServiceHostingServer());
+
+    $emMock = Mockery::mock(EntityManagerInterface::class)->shouldIgnoreMissing();
+    $emMock->shouldReceive('getRepository')->with(ServiceHostingServer::class)->andReturn($serverRepo);
+    $emMock->shouldReceive('flush')->atLeast()->once();
+
+    $di = container();
+    $di['em'] = $emMock;
+    $di['mod_service'] = $di->protect(fn (): Mockery\MockInterface => $orderServiceMock);
+
+    $serverManagerMock = Mockery::mock('\Server_Manager_Custom');
+    $serverManagerMock->shouldReceive('getPasswordLength')->atLeast()->once()->andReturn(12);
+    $serverManagerMock->shouldNotReceive('generateUsername');
+
+    $serviceMock = Mockery::mock(Service::class)->makePartial();
+    $serviceMock->shouldReceive('getServerManager')->atLeast()->once()->andReturn($serverManagerMock);
+    $serviceMock->shouldNotReceive('_getAM');
+    $serviceMock->setDi($di);
+
+    $result = $serviceMock->action_activate($orderModel);
+
+    expect($result)->toBe(['username' => 'example']);
+});
+
 test('action renew', function (): void {
     $service = new Service();
     $orderModel = new Model_ClientOrder();
@@ -1358,4 +1443,23 @@ test('_performOnService accepts one-time active order with null expires_at', fun
     $oneTimeOrder->expires_at = null;
 
     expect($reflection->invoke($service, $oneTimeOrder))->toBeTrue();
+});
+
+test('clientSettableConfigKeys returns the hosting allowlist', function (): void {
+    $service = new Service();
+    $allowed = $service->clientSettableConfigKeys();
+
+    expect($allowed)->toBeArray();
+    // Client may choose billing period, domain options, quantity, and
+    // whether multiple items are allowed in a single cart-add. Admin-
+    // controlled fields (hosting_plan_id, server_id, reseller, ...) are
+    // deliberately absent and will be stripped by the central filter in
+    // Product\Service::prepareCartProductConfig before attachOrderConfig runs.
+    expect($allowed)->toContain('period');
+    expect($allowed)->toContain('domain');
+    expect($allowed)->toContain('quantity');
+    expect($allowed)->toContain('multiple');
+    expect($allowed)->not->toContain('hosting_plan_id');
+    expect($allowed)->not->toContain('server_id');
+    expect($allowed)->not->toContain('reseller');
 });

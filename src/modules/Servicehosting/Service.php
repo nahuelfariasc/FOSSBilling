@@ -186,6 +186,15 @@ class Service implements InjectionAwareInterface
         // Retrieve the server manager for the order
         $serverManager = $this->_getServerManagerForOrder($model);
 
+        // A username is only ever persisted below once the account has
+        // actually been created on the server. If one is already present,
+        // a previous activation attempt already provisioned this account -
+        // most likely the order's status update afterwards failed to save,
+        // and this call is a retry. Re-running createAccount() in that case
+        // would only fail with a "domain/account already exists" server
+        // error, so treat the account as already provisioned instead.
+        $alreadyProvisioned = !empty($model->getUsername());
+
         // Generate a password for the service
         $pass = $this->di['tools']->generatePassword($serverManager->getPasswordLength(), true);
 
@@ -195,7 +204,9 @@ class Service implements InjectionAwareInterface
         }
 
         // Generate a username for the service
-        if (isset($config['username']) && !empty($config['username'])) {
+        if ($alreadyProvisioned) {
+            $username = $model->getUsername();
+        } elseif (isset($config['username']) && !empty($config['username'])) {
             $username = $config['username'];
         } else {
             $username = $serverManager->generateUsername($model->getSld() . $model->getTld());
@@ -206,7 +217,7 @@ class Service implements InjectionAwareInterface
         $model->setPass($pass);
 
         // If the order's configuration does not specify that the service should be imported, create an account for the service on the server
-        if (!isset($config['import']) || !$config['import']) {
+        if (!$alreadyProvisioned && (!isset($config['import']) || !$config['import'])) {
             [$adapter, $account] = $this->_getAM($model);
             $adapter->createAccount($account);
         }
@@ -938,7 +949,7 @@ class Service implements InjectionAwareInterface
         return [$sql, $params];
     }
 
-    public function createServer($name, $ip, $manager, $data)
+    public function createServer($name, $ip, $manager, $data): ?int
     {
         if (!in_array($manager, $this->_getServerManagers(), true)) {
             throw new Exception('Server manager :manager is not a valid server manager', [':manager' => $manager]);
@@ -1202,7 +1213,7 @@ class Service implements InjectionAwareInterface
         return true;
     }
 
-    public function createHp($name, $data)
+    public function createHp($name, $data): ?int
     {
         $model = new ServiceHostingHp();
         $model->setName($name);
@@ -1296,12 +1307,24 @@ class Service implements InjectionAwareInterface
         return $adapter->getLoginUrl($account);
     }
 
+    /**
+     * Top-level cart-config keys a client is authorized to set when ordering
+     * a hosting product. Admin-controlled fields (hosting_plan_id, server_id,
+     * reseller, subdomain_base_domain, etc.) are stripped from client input
+     * before the merge.
+     *
+     * @return list<string>
+     */
+    public function clientSettableConfigKeys(): array
+    {
+        return ['period', 'domain', 'quantity', 'multiple'];
+    }
+
     public function attachOrderConfig(Product $product, array $data): array
     {
         $c = json_decode($product->getConfig() ?? '', true) ?? [];
 
         $data = array_merge($c, $data);
-
         if (($data['domain']['action'] ?? null) === 'subdomain' && array_key_exists('subdomain_base_domain', $c)) {
             $data['subdomain_base_domain'] = $c['subdomain_base_domain'];
         }
