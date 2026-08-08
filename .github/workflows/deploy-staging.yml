@@ -137,4 +137,8 @@ jobs:
             "$DEPLOY/releases/$RELEASE" \
             "$DEPLOY/current"
 
+          # Purge shared cache so stale compiled Twig/Doctrine metadata and
+          # autoload maps from previous code versions don't break the new release.
+          find "$DEPLOY/shared/src/data/cache" -mindepth 1 -delete
+
           EOF
