@@ -114,6 +114,25 @@ jobs:
               "$DEPLOY/releases/$RELEASE/src/config.php"
           fi
 
+          # Persist generated huraga theme settings across releases
+          HURAGA_DIR="$DEPLOY/shared/src/themes/huraga/config"
+          HURAGA_FILE="$HURAGA_DIR/settings_data.json"
+          mkdir -p "$HURAGA_DIR"
+
+          if [ ! -f "$HURAGA_FILE" ]; then
+            for r in $(ls -1 "$DEPLOY/releases" | sort -r); do
+              if [ -f "$DEPLOY/releases/$r/src/themes/huraga/config/settings_data.json" ]; then
+                cp "$DEPLOY/releases/$r/src/themes/huraga/config/settings_data.json" "$HURAGA_FILE"
+                break
+              fi
+            done
+          fi
+
+          mkdir -p "$DEPLOY/releases/$RELEASE/src/themes/huraga/config"
+          rm -f "$DEPLOY/releases/$RELEASE/src/themes/huraga/config/settings_data.json"
+          ln -sfn "$HURAGA_FILE" \
+            "$DEPLOY/releases/$RELEASE/src/themes/huraga/config/settings_data.json"
+
           ln -sfn \
             "$DEPLOY/releases/$RELEASE" \
             "$DEPLOY/current"
