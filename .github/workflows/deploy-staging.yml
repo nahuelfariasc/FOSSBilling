@@ -88,9 +88,11 @@ jobs:
 
           mkdir -p "$DEPLOY/shared/src/data/cache"
           mkdir -p "$DEPLOY/shared/src/data/log"
+          mkdir -p "$DEPLOY/shared/src/data/uploads"
 
           rm -rf "$DEPLOY/releases/$RELEASE/src/data/cache"
           rm -rf "$DEPLOY/releases/$RELEASE/src/data/log"
+          rm -rf "$DEPLOY/releases/$RELEASE/src/data/uploads"
 
           ln -sfn \
             "$DEPLOY/shared/src/data/cache" \
@@ -99,6 +101,17 @@ jobs:
           ln -sfn \
             "$DEPLOY/shared/src/data/log" \
             "$DEPLOY/releases/$RELEASE/src/data/log"
+
+          ln -sfn \
+            "$DEPLOY/shared/src/data/uploads" \
+            "$DEPLOY/releases/$RELEASE/src/data/uploads"
+
+          if [ -f "$DEPLOY/shared/src/config.php" ]; then
+            rm -f "$DEPLOY/releases/$RELEASE/src/config.php"
+            ln -sfn \
+              "$DEPLOY/shared/src/config.php" \
+              "$DEPLOY/releases/$RELEASE/src/config.php"
+          fi
 
           ln -sfn \
             "$DEPLOY/releases/$RELEASE" \
