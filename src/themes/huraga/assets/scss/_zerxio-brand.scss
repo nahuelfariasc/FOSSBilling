@@ -1,0 +1,184 @@
+// Zerxio brand overrides for the huraga theme.
+// This file only redefines Bootstrap CSS custom properties — it does not
+// touch any existing selectors in huraga.scss or the Bootstrap source.
+//
+// Palette:
+//   Background dark  #0c0d0f / #111318
+//   Cyan primary     #00bfff
+//   Cyan bright      #00d4ff
+//   Cyan glow        rgba(0, 191, 255, ...)
+
+// ─── Dark mode: Zerxio palette ───────────────────────────────────────────────
+[data-bs-theme="dark"] {
+    --bs-primary:             #00bfff;
+    --bs-primary-rgb:         0, 191, 255;
+    --bs-link-color:          #00bfff;
+    --bs-link-hover-color:    #00d4ff;
+
+    --bs-body-bg:             #0c0d0f;
+    --bs-body-bg-rgb:         12, 13, 15;
+
+    --bs-secondary-bg:        #111318;
+    --bs-tertiary-bg:         #161820;
+
+    --bs-border-color:        rgba(0, 191, 255, 0.12);
+    --bs-border-color-translucent: rgba(0, 191, 255, 0.08);
+
+    // Cards
+    .card,
+    .card-blesta {
+        border-color: rgba(0, 191, 255, 0.12);
+        background-color: #111318;
+    }
+
+    .card-header {
+        background-color: #161820;
+        border-bottom-color: rgba(0, 191, 255, 0.1);
+    }
+
+    // Navbar
+    .navbar {
+        background-color: #111318 !important;
+        border-bottom: 1px solid rgba(0, 191, 255, 0.1);
+    }
+
+    // Sidebar / offcanvas
+    .offcanvas-item.active {
+        background: rgba(0, 191, 255, 0.07);
+    }
+
+    .offcanvas-item.active > .nav-link {
+        color: #00bfff !important;
+    }
+
+    // Buttons
+    .btn-primary {
+        --bs-btn-bg:           #00bfff;
+        --bs-btn-border-color: #00bfff;
+        --bs-btn-color:        #000;
+        --bs-btn-hover-bg:     #00d4ff;
+        --bs-btn-hover-border-color: #00d4ff;
+        --bs-btn-hover-color:  #000;
+        --bs-btn-active-bg:    #00aadd;
+        --bs-btn-active-border-color: #00aadd;
+        --bs-btn-active-color: #000;
+    }
+
+    .btn-outline-primary {
+        --bs-btn-color:              #00bfff;
+        --bs-btn-border-color:       #00bfff;
+        --bs-btn-hover-bg:           #00bfff;
+        --bs-btn-hover-border-color: #00bfff;
+        --bs-btn-hover-color:        #000;
+        --bs-btn-active-bg:          #00aadd;
+        --bs-btn-active-border-color: #00aadd;
+        --bs-btn-active-color:       #000;
+    }
+
+    // Forms
+    .form-control,
+    .form-select {
+        background-color: #161820;
+        border-color: rgba(0, 191, 255, 0.15);
+        color: #e8eaf0;
+
+        &:focus {
+            border-color: #00bfff;
+            box-shadow: 0 0 0 0.2rem rgba(0, 191, 255, 0.15);
+            background-color: #161820;
+        }
+    }
+
+    // Tables
+    .table {
+        --bs-table-bg:           transparent;
+        --bs-table-striped-bg:   rgba(0, 191, 255, 0.04);
+        --bs-table-hover-bg:     rgba(0, 191, 255, 0.07);
+        --bs-table-border-color: rgba(0, 191, 255, 0.1);
+        color: #e8eaf0;
+    }
+
+    // Alerts
+    .alert-info {
+        --bs-alert-bg:           rgba(0, 191, 255, 0.08);
+        --bs-alert-border-color: rgba(0, 191, 255, 0.2);
+        --bs-alert-color:        #00bfff;
+    }
+
+    // Pagination / active
+    .page-item.active .page-link {
+        background-color: #00bfff;
+        border-color:     #00bfff;
+        color:            #000;
+    }
+
+    .page-link {
+        background-color: #111318;
+        border-color:     rgba(0, 191, 255, 0.15);
+        color:            #e8eaf0;
+
+        &:hover {
+            background-color: rgba(0, 191, 255, 0.1);
+            border-color:     rgba(0, 191, 255, 0.3);
+            color:            #00bfff;
+        }
+    }
+
+    // Nav pills
+    .nav-pills {
+        .nav-link.active {
+            background-color: #00bfff;
+            color: #000 !important;
+        }
+    }
+
+    // Dropdowns
+    .dropdown-menu {
+        background-color: #161820;
+        border-color:     rgba(0, 191, 255, 0.12);
+    }
+
+    .dropdown-item:hover,
+    .dropdown-item:focus {
+        background-color: rgba(0, 191, 255, 0.07);
+        color: #00bfff;
+    }
+
+    // Invoice gateway card hover
+    .invoice-gateway:hover,
+    .invoice-gateway:has(.btn-check:checked) {
+        border-color: #00bfff;
+    }
+}
+
+// ─── Light mode: keep Bootstrap default but tune primary to Zerxio cyan ──────
+[data-bs-theme="light"] {
+    --bs-primary:          #0099cc;
+    --bs-primary-rgb:      0, 153, 204;
+    --bs-link-color:       #0099cc;
+    --bs-link-hover-color: #007aa3;
+
+    .btn-primary {
+        --bs-btn-bg:           #0099cc;
+        --bs-btn-border-color: #0099cc;
+        --bs-btn-hover-bg:     #007aa3;
+        --bs-btn-hover-border-color: #007aa3;
+    }
+
+    .btn-outline-primary {
+        --bs-btn-color:        #0099cc;
+        --bs-btn-border-color: #0099cc;
+        --bs-btn-hover-bg:     #0099cc;
+        --bs-btn-hover-border-color: #0099cc;
+        --bs-btn-hover-color:  #fff;
+    }
+
+    .nav-link:hover {
+        color: #0099cc !important;
+    }
+
+    .nav-link.active,
+    .offcanvas-item.active > .nav-link {
+        color: #0099cc !important;
+    }
+}
