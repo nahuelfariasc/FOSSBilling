@@ -96,7 +96,7 @@
                             </tr>
                         {% endif %}
 
-                        {% if order.notes %}
+                        {% if order.notes is defined and order.notes %}
                             <tr>
                                 <td><label>{{ 'Order Notes'|trans }}</label></td>
                                 <td>{{ (order.notes ?? '')|markdown_to_html }}</td>
