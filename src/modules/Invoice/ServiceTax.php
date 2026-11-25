@@ -11,9 +11,11 @@ declare(strict_types=1);
 
 namespace Box\Mod\Invoice;
 
+use Box\Mod\Client\Entity\Client;
+use Box\Mod\Invoice\Entity\Invoice;
 use Box\Mod\Invoice\Entity\Tax;
 use Box\Mod\Invoice\Repository\TaxRepository;
-use FOSSBilling\InjectionAwareInterface;
+use FOSSBilling\Core\Container\InjectionAwareInterface;
 
 class ServiceTax implements InjectionAwareInterface
 {
@@ -37,14 +39,14 @@ class ServiceTax implements InjectionAwareInterface
         return $this->taxRepository;
     }
 
-    public function getTaxRateForClient(\Model_Client $model, &$title = null)
+    public function getTaxRateForClient(?Client $model, &$title = null)
     {
         $clientService = $this->di['mod_service']('client');
         if (!$clientService->isClientTaxable($model)) {
             return 0;
         }
 
-        $tax = $this->taxRepository->findOneByStateAndCountry($model->state, $model->country);
+        $tax = $this->taxRepository->findOneByStateAndCountry($model?->getState(), $model?->getCountry());
         // find rate which matches clients country and state
 
         if ($tax instanceof Tax) {
@@ -54,7 +56,7 @@ class ServiceTax implements InjectionAwareInterface
         }
 
         // find rate which matches clients country
-        $tax = $this->taxRepository->findOneByCountry($model->country);
+        $tax = $this->taxRepository->findOneByCountry($model?->getCountry());
         if ($tax instanceof Tax) {
             $title = $tax->getName();
 
@@ -72,20 +74,33 @@ class ServiceTax implements InjectionAwareInterface
         return 0;
     }
 
-    public function getTax(\Model_Invoice $invoice)
+    public function getTax(Invoice $invoice)
     {
-        if ($invoice->taxrate <= 0) {
+        if ($invoice->getTaxrate() <= 0) {
             return 0;
         }
 
-        $tax = 0;
-        $invoiceItems = $this->di['em']->getRepository(Entity\InvoiceItem::class)->findByInvoiceId((int) $invoice->id);
-        $invoiceItemService = $this->di['mod_service']('Invoice', 'InvoiceItem');
-        foreach ($invoiceItems as $item) {
-            $tax += $invoiceItemService->getTax($item) * ($item->getQuantity() ?? 1);
+        $items = $this->di['em']->getRepository(Entity\InvoiceItem::class)->findByInvoiceId((int) $invoice->getId());
+
+        return self::calculateInvoiceTax($invoice, $items);
+    }
+
+    /** @param iterable<Entity\InvoiceItem> $items */
+    public static function calculateInvoiceTax(Invoice $invoice, iterable $items): int|float
+    {
+        // Round once on the taxable subtotal, rather than on each unit.
+        $taxableSubtotal = 0.0;
+        foreach ($items as $item) {
+            if ($item->getTaxed()) {
+                $taxableSubtotal += (($item->getPrice() ?? 0) * ($item->getQuantity() ?? 1));
+            }
         }
 
-        return $tax;
+        if ($taxableSubtotal == 0) {
+            return 0;
+        }
+
+        return round($taxableSubtotal * (float) $invoice->getTaxrate() / 100, 2);
     }
 
     public function delete(Tax $model): bool
@@ -93,7 +108,7 @@ class ServiceTax implements InjectionAwareInterface
         $name = $model->getName();
         $this->di['em']->remove($model);
         $this->di['em']->flush();
-        $this->di['logger']->info('Deleted tax rule %s', $name);
+        $this->di['logger']->info('Deleted tax rule {name}', ['name' => $name]);
 
         return true;
     }
@@ -109,7 +124,7 @@ class ServiceTax implements InjectionAwareInterface
         $this->di['em']->persist($model);
         $this->di['em']->flush();
 
-        $this->di['logger']->info('Created new tax rule %s', $model->getName());
+        $this->di['logger']->info('Created new tax rule {model_name}', ['model_name' => $model->getName()]);
 
         return $model->getId();
     }
@@ -122,7 +137,7 @@ class ServiceTax implements InjectionAwareInterface
         $model->setTaxrate($data['taxrate']);
         $this->di['em']->flush();
 
-        $this->di['logger']->info('Updated tax rule %s', $model->getName());
+        $this->di['logger']->info('Updated tax rule {model_name}', ['model_name' => $model->getName()]);
 
         return true;
     }

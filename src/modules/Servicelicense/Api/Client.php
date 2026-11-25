@@ -16,7 +16,7 @@ use Box\Mod\Servicelicense\Entity\ServiceLicense;
 /**
  *License Service management.
  */
-class Client extends \FOSSBilling\Api\AbstractApi
+class Client extends \FOSSBilling\Core\Api\AbstractApi
 {
     /**
      * Reset license validation rules.
@@ -39,23 +39,23 @@ class Client extends \FOSSBilling\Api\AbstractApi
 
         $order = $this->getDi()['em']->getRepository(\Box\Mod\Order\Entity\Order::class)->findOneBy([
             'id' => $data['order_id'],
-            'clientId' => $client->id,
+            'clientId' => $client->getId(),
         ]);
 
         if (!$order instanceof \Box\Mod\Order\Entity\Order) {
-            throw new \FOSSBilling\InformationException('Order not found');
+            throw new \FOSSBilling\Core\Exception\InformationException('Order not found');
         }
 
         $orderService = $this->getDi()['mod_service']('order');
         $orderService->assertOrderUsable($order);
 
         if ($order->getStatus() !== \Box\Mod\Order\Entity\Order::STATUS_ACTIVE) {
-            throw new \FOSSBilling\InformationException('Order is not activated');
+            throw new \FOSSBilling\Core\Exception\InformationException('Order is not activated');
         }
 
         $s = $orderService->getOrderService($order);
         if (!$s instanceof ServiceLicense) {
-            throw new \FOSSBilling\Exception('Order is not activated');
+            throw new \FOSSBilling\Core\Exception\BaseException('Order is not activated');
         }
 
         return $s;

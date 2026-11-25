@@ -11,9 +11,10 @@ declare(strict_types=1);
 
 namespace Box\Mod\Theme\Controller;
 
+use Box\Mod\Theme\Event\BeforeAdminThemeSettingsSaveEvent;
 use Symfony\Component\HttpFoundation\Response;
 
-class Admin implements \FOSSBilling\InjectionAwareInterface
+class Admin implements \FOSSBilling\Core\Container\InjectionAwareInterface
 {
     protected ?\Pimple\Container $di = null;
 
@@ -27,21 +28,33 @@ class Admin implements \FOSSBilling\InjectionAwareInterface
         return $this->di;
     }
 
-    public function register(\Box_App &$app): void
+    public function register(\FOSSBilling\Core\Http\App &$app): void
     {
-        $app->get('/theme/:theme', 'get_theme', ['theme' => '[a-z0-9-_]+'], static::class);
-        $app->post('/theme/:theme', 'save_theme_settings', ['theme' => '[a-z0-9-_]+'], static::class);
+        // Allows '/' so package-shaped theme codes (e.g. 'default/admin') match.
+        $app->get('/theme/:theme', 'get_theme', ['theme' => '[a-zA-Z0-9_\-/]+'], static::class);
+        $app->post('/theme/:theme', 'save_theme_settings', ['theme' => '[a-zA-Z0-9_\-/]+'], static::class);
     }
 
     /**
      * Save theme settings.
      */
-    public function save_theme_settings(\Box_App $app, $theme): Response
+    public function save_theme_settings(\FOSSBilling\Core\Http\App $app, $theme): Response
     {
-        $body = $app->getRequest()->request->all();
-        $this->di['events_manager']->fire(['event' => 'onBeforeThemeSettingsSave', 'params' => $body]);
-
         $api = $this->di['api_admin'];
+        $this->di['mod_service']('Staff')->checkPermissionsAndThrowException('theme', 'manage_settings');
+
+        $body = $app->getRequest()->request->all();
+        $token = $body['CSRFToken'] ?? null;
+        $sessionToken = $this->di['session']->get('csrf_token');
+        if (!is_string($token) || !is_string($sessionToken) || $sessionToken === '' || !hash_equals($sessionToken, $token)) {
+            throw new \FOSSBilling\Core\Exception\InformationException('CSRF token invalid', null, 403);
+        }
+        unset($body['CSRFToken']);
+        $settingNames = array_values(array_diff(
+            array_map(static fn (int|string $key): string => (string) $key, array_keys($body)),
+            ['save-current-setting', 'save-current-setting-preset'],
+        ));
+        $this->di['event_dispatcher']->dispatch(new BeforeAdminThemeSettingsSaveEvent((string) $theme, $settingNames));
 
         $mod = $this->di['mod']('theme');
         $service = $mod->getService();
@@ -61,20 +74,20 @@ class Admin implements \FOSSBilling\InjectionAwareInterface
 
         try {
             if (!$t->isAssetsPathWritable()) {
-                throw new \FOSSBilling\Exception('Theme ":name" assets folder is not writable. Files cannot be uploaded and settings cannot be saved. Set folder permissions to 755', [':name' => $t->getName()]);
+                throw new \FOSSBilling\Core\Exception\BaseException('Theme ":name" assets folder is not writable. Files cannot be uploaded and settings cannot be saved. Set folder permissions to 755', [':name' => $t->getName()]);
             }
             $service->updateSettings($t, $preset, $body);
             $service->regenerateThemeCssAndJsFiles($t, $preset, $api);
         } catch (\Exception $e) {
             $error = $e->getMessage();
-            error_log($e->getMessage());
+            $this->di['logger']->error($e->getMessage());
         }
 
         // optional data file
         try {
             $service->regenerateThemeSettingsDataFile($t);
         } catch (\Exception $e) {
-            error_log($e->getMessage());
+            $this->di['logger']->error($e->getMessage());
         }
 
         $red_url = '/theme/' . $theme;
@@ -85,9 +98,10 @@ class Admin implements \FOSSBilling\InjectionAwareInterface
         return $app->redirect($red_url);
     }
 
-    public function get_theme(\Box_App $app, $theme): string
+    public function get_theme(\FOSSBilling\Core\Http\App $app, $theme): string
     {
         $this->di['is_admin_logged'];
+        $this->di['mod_service']('Staff')->checkPermissionsAndThrowException('theme', 'view');
 
         $mod = $this->di['mod']('theme');
         $service = $mod->getService();
@@ -98,7 +112,7 @@ class Admin implements \FOSSBilling\InjectionAwareInterface
 
         try {
             $html = $service->renderThemeSettingsPageHtml($t, $settings);
-        } catch (\FOSSBilling\InformationException $e) {
+        } catch (\FOSSBilling\Core\Exception\InformationException $e) {
             $html = '';
             $error ??= $e->getMessage();
         }

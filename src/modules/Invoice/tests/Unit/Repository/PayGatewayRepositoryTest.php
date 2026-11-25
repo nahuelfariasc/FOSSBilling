@@ -14,16 +14,45 @@ use Box\Mod\Invoice\Entity\PayGateway;
 use Doctrine\DBAL\DriverManager;
 use Doctrine\ORM\EntityManager;
 use Doctrine\ORM\ORMSetup;
+use Doctrine\ORM\Tools\SchemaTool;
+use FOSSBilling\Core\Doctrine\SchemaSynchronizer;
 use Symfony\Component\Filesystem\Path;
 
 function payGatewayEntityManager(): EntityManager
 {
     $config = ORMSetup::createAttributeMetadataConfig([Path::join(__DIR__, '..', '..', '..', 'Entity')], true);
+    $config->setUseSchemaEditorApi(true);
     $config->setProxyDir(sys_get_temp_dir());
-    $config->setProxyNamespace('FOSSBilling\\Tests\\DoctrineProxies');
+    $config->setProxyNamespace('FOSSBilling\\Core\\Tests\\DoctrineProxies');
 
     return new EntityManager(DriverManager::getConnection(['driver' => 'pdo_sqlite', 'memory' => true]), $config);
 }
+
+test('custom gateway image persists independently of adapter credentials', function (): void {
+    $em = payGatewayEntityManager();
+    (new SchemaTool($em))->createSchema([$em->getClassMetadata(PayGateway::class)]);
+    $gateway = (new PayGateway())->setGateway('Custom')->setConfig(['api_key' => 'secret'])->setCustomLogo(str_repeat('a', 64) . '.png');
+    $em->persist($gateway);
+    $em->flush();
+    $id = $gateway->getId();
+    $em->clear();
+
+    $stored = $em->find(PayGateway::class, $id);
+    expect($stored->getCustomLogo())->toBe(str_repeat('a', 64) . '.png')
+        ->and($stored->getConfig())->toBe(['api_key' => 'secret']);
+});
+
+test('schema synchronization adds custom images to existing gateways', function (): void {
+    $em = payGatewayEntityManager();
+    (new SchemaTool($em))->createSchema([$em->getClassMetadata(PayGateway::class)]);
+    $em->getConnection()->executeStatement('ALTER TABLE pay_gateway DROP COLUMN custom_logo');
+    $em->getConnection()->insert('pay_gateway', ['name' => 'Existing', 'enabled' => 1, 'allow_single' => 1, 'allow_recurrent' => 0, 'test_mode' => 0]);
+
+    SchemaSynchronizer::syncEntities($em, [PayGateway::class]);
+
+    $row = $em->getConnection()->fetchAssociative('SELECT name, custom_logo FROM pay_gateway');
+    expect($row)->toBe(['name' => 'Existing', 'custom_logo' => null]);
+});
 
 test('getSearchQueryBuilder orders by gateway ascending by default', function (): void {
     $repository = payGatewayEntityManager()->getRepository(PayGateway::class);
@@ -83,3 +112,21 @@ test('boolean filters normalize truthy representations to true', function (): vo
         }
     }
 });
+
+test('getSearchQueryBuilder sorts by allowlisted columns', function (array $data, string $expectedOrderBy, bool $expectsTieBreak): void {
+    $dql = payGatewayEntityManager()->getRepository(PayGateway::class)->getSearchQueryBuilder($data)->getDQL();
+
+    expect($dql)->toContain($expectedOrderBy);
+    if ($expectsTieBreak) {
+        expect($dql)->toContain(', pg.id');
+    } else {
+        expect($dql)->not->toContain(', pg.id');
+    }
+})->with([
+    'id ascending' => [['sort' => 'id'], 'ORDER BY pg.id ASC', false],
+    'id descending' => [['sort' => 'id', 'direction' => 'DESC'], 'ORDER BY pg.id DESC', false],
+    'title' => [['sort' => 'title'], 'ORDER BY pg.name ASC, pg.id ASC', true],
+    'code' => [['sort' => 'code', 'direction' => 'desc'], 'ORDER BY pg.gateway DESC, pg.id DESC', true],
+    'invalid sort falls back to default' => [['sort' => 'pg.gateway; DROP TABLE pay_gateway'], 'ORDER BY pg.gateway ASC', false],
+    'invalid direction falls back to ascending' => [['sort' => 'title', 'direction' => 'sideways'], 'ORDER BY pg.name ASC, pg.id ASC', true],
+]);

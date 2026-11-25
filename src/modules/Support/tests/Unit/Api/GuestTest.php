@@ -84,7 +84,30 @@ test('ticket create message too short exception', function (): void {
         'content' => '',
     ];
 
-    expect(fn (): string => $guestApi->ticket_create($data))->toThrow(FOSSBilling\Exception::class);
+    expect(fn (): string => $guestApi->ticket_create($data))->toThrow(FOSSBilling\Core\Exception\BaseException::class);
+});
+
+test('ticket create consumes the rate limit before validating the email', function (): void {
+    $guestApi = apiEndpoint(new Box\Mod\Support\Api\Guest());
+    $di = container();
+
+    $rateLimiterMock = Mockery::mock(FOSSBilling\Core\Security\RateLimiter::class);
+    $rateLimiterMock->shouldReceive('consumeOrThrow')
+        ->once()
+        ->with('guest_ticket_create', '');
+
+    $di['rate_limiter'] = $rateLimiterMock;
+    $guestApi->setDi($di);
+
+    $data = [
+        'name' => 'Name',
+        'email' => 'not-an-email',
+        'subject' => 'Subject',
+        'content' => 'Message',
+    ];
+
+    expect(fn (): string => $guestApi->ticket_create($data))
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class, 'Email address is invalid');
 });
 
 test('ticket get', function (): void {
@@ -120,7 +143,7 @@ test('ticket close', function (): void {
     $guestApi->setDi($di);
 
     $guestApi->setService($serviceMock);
-    $guestApi->setIdentity(new Model_Guest());
+    $guestApi->setIdentity(new FOSSBilling\Core\Identity\Guest());
 
     $data = [
         'hash' => sha1(uniqid()),
@@ -171,7 +194,7 @@ test('kb article get list', function (): void {
     $repo = Mockery::mock(KbArticleRepository::class);
     $repo->shouldReceive('getSearchQueryBuilder')
         ->once()
-        ->with(KbArticle::ACTIVE, null, null)
+        ->with(['status' => KbArticle::ACTIVE, 'search' => null, 'kb_article_category_id' => null, 'exclude_category_ids' => []])
         ->andReturn($qb);
 
     $supportService = guestSupportServiceMock();
@@ -180,10 +203,10 @@ test('kb article get list', function (): void {
         ->andReturn($repo);
     $guestApi->setService($supportService);
 
-    $pager = Mockery::mock(FOSSBilling\Pagination::class);
+    $pager = Mockery::mock(FOSSBilling\Core\Pagination\Service::class);
     $pager->shouldReceive('paginateDoctrineQuery')
         ->once()
-        ->with($qb, Mockery::type(FOSSBilling\PaginationOptions::class), null, false, true)
+        ->with($qb, Mockery::type(FOSSBilling\Core\Pagination\Options::class), Mockery::any(), false, true)
         ->andReturn($willReturn);
 
     $di = container();
@@ -296,7 +319,7 @@ test('kb article get id and slug not set exception', function (): void {
 
     $guestApi->setService(guestSupportServiceMock());
 
-    expect(fn (): array => $guestApi->kb_article_get([]))->toThrow(FOSSBilling\Exception::class);
+    expect(fn (): array => $guestApi->kb_article_get([]))->toThrow(FOSSBilling\Core\Exception\BaseException::class);
 });
 
 test('kb article get list disabled exception', function (): void {
@@ -306,7 +329,7 @@ test('kb article get list disabled exception', function (): void {
     $service->shouldReceive('kbEnabled')->andReturn(false);
     $guestApi->setService($service);
 
-    expect(fn (): array => $guestApi->kb_article_get_list([]))->toThrow(FOSSBilling\Exception::class);
+    expect(fn (): array => $guestApi->kb_article_get_list([]))->toThrow(FOSSBilling\Core\Exception\BaseException::class);
 });
 
 test('kb article get not found by id', function (): void {
@@ -331,7 +354,7 @@ test('kb article get not found by id', function (): void {
     $di = container();
 
     $guestApi->setDi($di);
-    expect(fn (): array => $guestApi->kb_article_get($data))->toThrow(FOSSBilling\Exception::class);
+    expect(fn (): array => $guestApi->kb_article_get($data))->toThrow(FOSSBilling\Core\Exception\BaseException::class);
 });
 
 test('kb article get not found by slug', function (): void {
@@ -357,7 +380,7 @@ test('kb article get not found by slug', function (): void {
 
     $guestApi->setDi($di);
 
-    expect(fn (): array => $guestApi->kb_article_get($data))->toThrow(FOSSBilling\Exception::class);
+    expect(fn (): array => $guestApi->kb_article_get($data))->toThrow(FOSSBilling\Core\Exception\BaseException::class);
 });
 
 test('kb category get list', function (): void {
@@ -381,7 +404,7 @@ test('kb category get list', function (): void {
         ->once()
         ->andReturn($repo);
 
-    $pager = Mockery::mock(FOSSBilling\Pagination::class)->makePartial();
+    $pager = Mockery::mock(FOSSBilling\Core\Pagination\Service::class)->makePartial();
 
     $pager
     ->shouldReceive('paginateDoctrineQuery')
@@ -456,7 +479,7 @@ test('kb category get id and slug not set exception', function (): void {
 
     $guestApi->setService(guestSupportServiceMock());
 
-    expect(fn (): array => $guestApi->kb_category_get([]))->toThrow(FOSSBilling\Exception::class);
+    expect(fn (): array => $guestApi->kb_category_get([]))->toThrow(FOSSBilling\Core\Exception\BaseException::class);
 });
 
 test('kb category get not found by id', function (): void {
@@ -482,7 +505,7 @@ test('kb category get not found by id', function (): void {
 
     $guestApi->setDi($di);
 
-    expect(fn (): array => $guestApi->kb_category_get($data))->toThrow(FOSSBilling\Exception::class);
+    expect(fn (): array => $guestApi->kb_category_get($data))->toThrow(FOSSBilling\Core\Exception\BaseException::class);
 });
 
 test('kb category get not found by slug', function (): void {
@@ -508,5 +531,25 @@ test('kb category get not found by slug', function (): void {
 
     $guestApi->setDi($di);
 
-    expect(fn (): array => $guestApi->kb_category_get($data))->toThrow(FOSSBilling\Exception::class);
+    expect(fn (): array => $guestApi->kb_category_get($data))->toThrow(FOSSBilling\Core\Exception\BaseException::class);
+});
+
+test('guest ticket reply on a closed ticket is refused', function (): void {
+    $guestApi = apiEndpoint(new Box\Mod\Support\Api\Guest());
+    $serviceMock = guestSupportServiceMock();
+    $ticket = new Box\Mod\Support\Entity\SupportTicket();
+    Tests\Helpers\setEntityId($ticket, 1);
+    $serviceMock->shouldReceive('findOneByHash')->atLeast()->once()
+        ->andReturn($ticket);
+    $serviceMock->shouldReceive('canBeReopened')->atLeast()->once()
+        ->andReturn(false);
+    $serviceMock->shouldNotReceive('ticketReply');
+
+    $di = container();
+    $guestApi->setDi($di);
+
+    $guestApi->setService($serviceMock);
+
+    expect(fn (): int => $guestApi->ticket_reply(['hash' => sha1('closed'), 'content' => 'Message']))
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class, 'reopened');
 });

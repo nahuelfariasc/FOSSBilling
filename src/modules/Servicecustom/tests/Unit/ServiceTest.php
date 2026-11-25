@@ -11,6 +11,8 @@
 declare(strict_types=1);
 
 use Box\Mod\Formbuilder\Service as FormbuilderService;
+use Box\Mod\Order\Entity\Order;
+use Box\Mod\Order\Repository\OrderRepository;
 use Box\Mod\Order\Service as OrderService;
 use Box\Mod\Product\Entity\Product;
 use Box\Mod\Product\Service as ProductService;
@@ -155,7 +157,7 @@ test('validate custom form invalid url exception', function (): void {
     ];
 
     expect(fn () => $service->validateCustomForm($data, $product))
-        ->toThrow(FOSSBilling\InformationException::class, 'Field Website must be a valid URL with a TLD (e.g., https://example.com)');
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class, 'Field Website must be a valid URL with a TLD (e.g., https://example.com)');
 });
 
 test('validate custom form valid url', function (): void {
@@ -227,20 +229,20 @@ test('validate custom form url array input throws information exception', functi
     ];
 
     expect(fn () => $service->validateCustomForm($data, $product))
-        ->toThrow(FOSSBilling\InformationException::class, 'Field Website must be a valid URL with a TLD (e.g., https://example.com)');
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class, 'Field Website must be a valid URL with a TLD (e.g., https://example.com)');
 });
 
 test('action create', function (): void {
     $service = new Service();
-    $order = new Model_ClientOrder();
-    $order->loadBean(new Tests\Helpers\DummyBean());
-    $order->product_id = 1;
-    $order->client_id = 1;
-    $order->config = 'config';
+    $order = createEntity(Order::class, [
+        'product_id' => 1,
+        'client_id' => 1,
+        'config' => ['setting' => 'value'],
+    ]);
 
     $product = new Product();
     $product->setPlugin('plugin');
-    $product->setPluginConfig('plugin_config');
+    $product->setPluginConfig(['endpoint' => 'plugin.example']);
 
     $em = Mockery::mock(Doctrine\ORM\EntityManagerInterface::class);
     $em->shouldReceive('persist')->atLeast()->once();
@@ -261,15 +263,16 @@ test('action create', function (): void {
     $service->setDi($di);
 
     $result = $service->action_create($order);
-    expect($result)->toBeInstanceOf(ServiceCustom::class);
+    expect($result)->toBeInstanceOf(ServiceCustom::class)
+        ->and($result->getPluginConfig())->toBe(['endpoint' => 'plugin.example']);
 });
 
 test('action activate', function (): void {
     $service = new Service();
-    $order = new Model_ClientOrder();
-    $order->loadBean(new Tests\Helpers\DummyBean());
-    $order->client_id = 1;
-    $order->config = 'config';
+    $order = createEntity(Order::class, [
+        'client_id' => 1,
+        'config' => ['setting' => 'value'],
+    ]);
 
     $serviceCustomModel = new ServiceCustom();
     $serviceCustomModel->setPlugin('');
@@ -287,10 +290,10 @@ test('action activate', function (): void {
 
 test('action activate order service not created exception', function (): void {
     $service = new Service();
-    $order = new Model_ClientOrder();
-    $order->loadBean(new Tests\Helpers\DummyBean());
-    $order->client_id = 1;
-    $order->config = 'config';
+    $order = createEntity(Order::class, [
+        'client_id' => 1,
+        'config' => ['setting' => 'value'],
+    ]);
 
     $serviceMock = Mockery::mock(OrderService::class);
     $serviceMock->shouldReceive('getOrderService')->atLeast()->once()->andReturn(null);
@@ -305,10 +308,10 @@ test('action activate order service not created exception', function (): void {
 
 test('action renew', function (): void {
     $service = new Service();
-    $order = new Model_ClientOrder();
-    $order->loadBean(new Tests\Helpers\DummyBean());
-    $order->client_id = 1;
-    $order->config = 'config';
+    $order = createEntity(Order::class, [
+        'client_id' => 1,
+        'config' => ['setting' => 'value'],
+    ]);
 
     $serviceCustomModel = new ServiceCustom();
     $serviceCustomModel->setPlugin('');
@@ -330,11 +333,11 @@ test('action renew', function (): void {
 
 test('active service not found exception', function (): void {
     $service = new Service();
-    $order = new Model_ClientOrder();
-    $order->loadBean(new Tests\Helpers\DummyBean());
-    $order->id = 1;
-    $order->client_id = 1;
-    $order->config = 'config';
+    $order = createEntity(Order::class, [
+        'id' => 1,
+        'client_id' => 1,
+        'config' => ['setting' => 'value'],
+    ]);
 
     $serviceMock = Mockery::mock(OrderService::class);
     $serviceMock->shouldReceive('getOrderService')->atLeast()->once()->andReturn(null);
@@ -349,10 +352,10 @@ test('active service not found exception', function (): void {
 
 test('action suspend', function (): void {
     $service = new Service();
-    $order = new Model_ClientOrder();
-    $order->loadBean(new Tests\Helpers\DummyBean());
-    $order->client_id = 1;
-    $order->config = 'config';
+    $order = createEntity(Order::class, [
+        'client_id' => 1,
+        'config' => ['setting' => 'value'],
+    ]);
 
     $serviceCustomModel = new ServiceCustom();
     $serviceCustomModel->setPlugin('');
@@ -374,10 +377,10 @@ test('action suspend', function (): void {
 
 test('action unsuspend', function (): void {
     $service = new Service();
-    $order = new Model_ClientOrder();
-    $order->loadBean(new Tests\Helpers\DummyBean());
-    $order->client_id = 1;
-    $order->config = 'config';
+    $order = createEntity(Order::class, [
+        'client_id' => 1,
+        'config' => ['setting' => 'value'],
+    ]);
 
     $serviceCustomModel = new ServiceCustom();
     $serviceCustomModel->setPlugin('');
@@ -399,10 +402,10 @@ test('action unsuspend', function (): void {
 
 test('action cancel', function (): void {
     $service = new Service();
-    $order = new Model_ClientOrder();
-    $order->loadBean(new Tests\Helpers\DummyBean());
-    $order->client_id = 1;
-    $order->config = 'config';
+    $order = createEntity(Order::class, [
+        'client_id' => 1,
+        'config' => ['setting' => 'value'],
+    ]);
 
     $serviceCustomModel = new ServiceCustom();
     $serviceCustomModel->setPlugin('');
@@ -424,10 +427,10 @@ test('action cancel', function (): void {
 
 test('action uncancel', function (): void {
     $service = new Service();
-    $order = new Model_ClientOrder();
-    $order->loadBean(new Tests\Helpers\DummyBean());
-    $order->client_id = 1;
-    $order->config = 'config';
+    $order = createEntity(Order::class, [
+        'client_id' => 1,
+        'config' => ['setting' => 'value'],
+    ]);
 
     $serviceCustomModel = new ServiceCustom();
     $serviceCustomModel->setPlugin('');
@@ -449,10 +452,10 @@ test('action uncancel', function (): void {
 
 test('action delete', function (): void {
     $service = new Service();
-    $order = new Model_ClientOrder();
-    $order->loadBean(new Tests\Helpers\DummyBean());
-    $order->client_id = 1;
-    $order->config = 'config';
+    $order = createEntity(Order::class, [
+        'client_id' => 1,
+        'config' => ['setting' => 'value'],
+    ]);
 
     $serviceCustomModel = new ServiceCustom();
     $serviceCustomModel->setPlugin('');
@@ -484,7 +487,7 @@ test('get config', function (): void {
     $service->setDi($di);
 
     $model = new ServiceCustom();
-    $model->setConfig(json_encode($decoded));
+    $model->setConfig($decoded);
 
     $result = $service->getConfig($model);
 
@@ -496,11 +499,10 @@ test('to api array', function (): void {
     $di = container();
     $service->setDi($di);
 
-    $model = createEntity(ServiceCustom::class);
-    $model->id = 1;
+    $model = createEntity(ServiceCustom::class, ['id' => 1]);
     $model->setClientId(1);
     $model->setPlugin('plugin');
-    $model->setConfig('{"config_param":"config_value"}');
+    $model->setConfig(['config_param' => 'config_value']);
     $model->onPrePersist();
 
     $result = $service->toApiArray($model);
@@ -512,23 +514,23 @@ test('to api array', function (): void {
     expect($result['created_at'])->toEqual($model->getCreatedAt()?->format('Y-m-d H:i:s'));
 });
 
-test('custom call forbidden method exception', function (): void {
+test('custom call forbidden method exception', function (string $method): void {
     $service = new Service();
 
-    expect(fn () => $service->customCall(new ServiceCustom(), 'delete'))
+    expect(fn () => $service->customCall(new ServiceCustom(), $method))
         ->toThrow(Exception::class);
-});
+})->with(['delete', 'Delete', 'RENEW', 'Activate', 'uncancel']);
 
 test('get service custom by order id', function (): void {
     $service = new Service();
-    $dbMock = Mockery::mock(Box_Database::class);
-    $dbMock->shouldReceive('getExistingModelById')->atLeast()->once()->andReturn(new Model_ClientOrder());
+    $orderRepoMock = Mockery::mock(OrderRepository::class);
+    $orderRepoMock->shouldReceive('find')->atLeast()->once()->andReturn(createEntity(Order::class));
 
     $orderService = Mockery::mock(OrderService::class);
     $orderService->shouldReceive('getOrderService')->atLeast()->once()->andReturn(new ServiceCustom());
 
     $di = container();
-    $di['db'] = $dbMock;
+    $di['em']->shouldReceive('getRepository')->with(Order::class)->andReturn($orderRepoMock);
     $di['mod_service'] = $di->protect(fn (): Mockery\MockInterface => $orderService);
     $service->setDi($di);
 
@@ -539,32 +541,32 @@ test('get service custom by order id', function (): void {
 
 test('get service custom by order id rejects order owned by another client', function (): void {
     $service = new Service();
-    $dbMock = Mockery::mock(Box_Database::class);
-    $dbMock->shouldReceive('findOne')->once()->with('ClientOrder', 'id = ? AND client_id = ?', [1, 42])->andReturn(null);
-    $dbMock->shouldNotReceive('getExistingModelById');
+    $orderRepoMock = Mockery::mock(OrderRepository::class);
+    $orderRepoMock->shouldReceive('findOneBy')->once()->with(['id' => 1, 'clientId' => 42])->andReturn(null);
+    $orderRepoMock->shouldNotReceive('find');
 
     $orderService = Mockery::mock(OrderService::class);
     $orderService->shouldNotReceive('assertOrderUsable');
 
     $di = container();
-    $di['db'] = $dbMock;
+    $di['em']->shouldReceive('getRepository')->with(Order::class)->andReturn($orderRepoMock);
     $di['mod_service'] = $di->protect(fn (): Mockery\MockInterface => $orderService);
     $service->setDi($di);
 
     expect(fn (): ?\Box\Mod\Servicecustom\Entity\ServiceCustom => $service->getServiceCustomByOrderId(1, 42))
-        ->toThrow(FOSSBilling\InformationException::class, 'Order not found');
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class, 'Order not found');
 });
 
 test('get service custom by order id order service not found exception', function (): void {
     $service = new Service();
-    $dbMock = Mockery::mock(Box_Database::class);
-    $dbMock->shouldReceive('getExistingModelById')->atLeast()->once()->andReturn(new Model_ClientOrder());
+    $orderRepoMock = Mockery::mock(OrderRepository::class);
+    $orderRepoMock->shouldReceive('find')->atLeast()->once()->andReturn(createEntity(Order::class));
 
     $orderService = Mockery::mock(OrderService::class);
     $orderService->shouldReceive('getOrderService')->atLeast()->once()->andReturn(null);
 
     $di = container();
-    $di['db'] = $dbMock;
+    $di['em']->shouldReceive('getRepository')->with(Order::class)->andReturn($orderRepoMock);
     $di['mod_service'] = $di->protect(fn (): Mockery\MockInterface => $orderService);
     $service->setDi($di);
 
@@ -575,37 +577,36 @@ test('get service custom by order id order service not found exception', functio
 test('get service custom by order id rejects expired order for client context', function (): void {
     $service = new Service();
 
-    $expiredOrder = new Model_ClientOrder();
-    $expiredOrder->loadBean(new Tests\Helpers\DummyBean());
-    $expiredOrder->status = Model_ClientOrder::STATUS_ACTIVE;
-    $expiredOrder->expires_at = date('Y-m-d H:i:s', time() - 3600);
+    $expiredOrder = createEntity(Order::class, [
+        'status' => Order::STATUS_ACTIVE,
+        'expires_at' => date('Y-m-d H:i:s', time() - 3600),
+    ]);
 
-    $dbMock = Mockery::mock(Box_Database::class);
-    $dbMock->shouldReceive('findOne')
+    $orderRepoMock = Mockery::mock(OrderRepository::class);
+    $orderRepoMock->shouldReceive('findOneBy')
         ->once()
-        ->with('ClientOrder', 'id = ? AND client_id = ?', [1, 42])
+        ->with(['id' => 1, 'clientId' => 42])
         ->andReturn($expiredOrder);
-    $dbMock->shouldNotReceive('getExistingModelById');
+    $orderRepoMock->shouldNotReceive('find');
 
     $orderService = Mockery::mock(OrderService::class);
     $orderService->shouldReceive('assertOrderUsable')
         ->once()
         ->with($expiredOrder)
-        ->andThrow(new FOSSBilling\InformationException('Subscription expired'));
+        ->andThrow(new FOSSBilling\Core\Exception\InformationException('Subscription expired'));
     $orderService->shouldNotReceive('getOrderService');
 
     $di = container();
-    $di['db'] = $dbMock;
+    $di['em']->shouldReceive('getRepository')->with(Order::class)->andReturn($orderRepoMock);
     $di['mod_service'] = $di->protect(fn (): Mockery\MockInterface => $orderService);
     $service->setDi($di);
 
     expect(fn (): ?\Box\Mod\Servicecustom\Entity\ServiceCustom => $service->getServiceCustomByOrderId(1, 42))
-        ->toThrow(FOSSBilling\InformationException::class, 'Subscription expired');
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class, 'Subscription expired');
 });
 
 test('update config', function (): void {
-    $model = createEntity(ServiceCustom::class);
-    $model->id = 1;
+    $model = createEntity(ServiceCustom::class, ['id' => 1]);
 
     $serviceMock = Mockery::mock(Service::class)->makePartial()->shouldAllowMockingProtectedMethods();
     $serviceMock->shouldReceive('getServiceCustomByOrderId')->atLeast()->once()->andReturn($model);
@@ -615,7 +616,7 @@ test('update config', function (): void {
 
     $di = container();
     $di['em'] = $em;
-    $di['logger'] = new Box_Log();
+    $di['logger'] = new FOSSBilling\Core\Logging\Logger();
     $serviceMock->setDi($di);
 
     $config = ['param1' => 'value1'];
@@ -624,8 +625,7 @@ test('update config', function (): void {
 });
 
 test('update config not array exception', function (): void {
-    $model = createEntity(ServiceCustom::class);
-    $model->id = 1;
+    $model = createEntity(ServiceCustom::class, ['id' => 1]);
 
     $serviceMock = Mockery::mock(Service::class)->makePartial()->shouldAllowMockingProtectedMethods();
     $serviceMock->shouldNotReceive('getServiceCustomByOrderId');
@@ -635,7 +635,7 @@ test('update config not array exception', function (): void {
 
     $di = container();
     $di['em'] = $em;
-    $di['logger'] = new Box_Log();
+    $di['logger'] = new FOSSBilling\Core\Logging\Logger();
     $serviceMock->setDi($di);
 
     $config = '';

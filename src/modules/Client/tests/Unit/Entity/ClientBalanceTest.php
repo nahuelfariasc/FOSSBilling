@@ -12,26 +12,27 @@ use Symfony\Component\Filesystem\Path;
 
 beforeEach(function (): void {
     $config = ORMSetup::createAttributeMetadataConfig([Path::join(__DIR__, '..', '..', '..', 'Entity')], true);
+    $config->setUseSchemaEditorApi(true);
     $config->setProxyDir(sys_get_temp_dir());
-    $config->setProxyNamespace('FOSSBilling\\Tests\\DoctrineProxies');
+    $config->setProxyNamespace('FOSSBilling\\Core\\Tests\\DoctrineProxies');
     $this->entityManager = new EntityManager(DriverManager::getConnection(['driver' => 'pdo_sqlite', 'memory' => true]), $config);
     $metadata = $this->entityManager->getClassMetadata(ClientBalance::class);
     (new SchemaTool($this->entityManager))->createSchema([$metadata]);
 });
 
 test('rejects duplicate invoice_item_id credits', function (): void {
-    $first = (new ClientBalance())->setClientId(1)->setType('invoice')->setInvoiceItemId(42)->setAmount('-10.00');
+    $first = (new ClientBalance())->setType('invoice')->setInvoiceItemId(42)->setAmount('-10.00');
     $this->entityManager->persist($first);
     $this->entityManager->flush();
 
-    $duplicate = (new ClientBalance())->setClientId(1)->setType('invoice')->setInvoiceItemId(42)->setAmount('-10.00');
+    $duplicate = (new ClientBalance())->setType('invoice')->setInvoiceItemId(42)->setAmount('-10.00');
     $this->entityManager->persist($duplicate);
     $this->entityManager->flush();
 })->throws(UniqueConstraintViolationException::class);
 
 test('allows multiple rows with NULL invoice_item_id', function (): void {
-    $first = (new ClientBalance())->setClientId(1)->setType('default')->setAmount('-5.00');
-    $second = (new ClientBalance())->setClientId(1)->setType('transaction')->setAmount('15.00');
+    $first = (new ClientBalance())->setType('default')->setAmount('-5.00');
+    $second = (new ClientBalance())->setType('transaction')->setAmount('15.00');
     $this->entityManager->persist($first);
     $this->entityManager->persist($second);
     $this->entityManager->flush();
@@ -40,8 +41,8 @@ test('allows multiple rows with NULL invoice_item_id', function (): void {
 });
 
 test('allows distinct invoice_item_id values', function (): void {
-    $first = (new ClientBalance())->setClientId(1)->setType('invoice')->setInvoiceItemId(10)->setAmount('-10.00');
-    $second = (new ClientBalance())->setClientId(1)->setType('invoice')->setInvoiceItemId(20)->setAmount('-20.00');
+    $first = (new ClientBalance())->setType('invoice')->setInvoiceItemId(10)->setAmount('-10.00');
+    $second = (new ClientBalance())->setType('invoice')->setInvoiceItemId(20)->setAmount('-20.00');
     $this->entityManager->persist($first);
     $this->entityManager->persist($second);
     $this->entityManager->flush();

@@ -3,7 +3,7 @@
 declare(strict_types=1);
 
 use Box\Mod\Extension\Entity\ExtensionMeta;
-use FOSSBilling\PaginationOptions;
+use FOSSBilling\Core\Pagination\Options;
 
 use function Tests\Helpers\moduleService;
 
@@ -13,9 +13,9 @@ test('get list uses doctrine pagination', function (): void {
     $service = Mockery::mock(Box\Mod\Notification\Service::class);
     $service->shouldReceive('getSearchQueryBuilder')->with(['per_page' => 10])->once()->andReturn($queryBuilder);
 
-    $pager = Mockery::mock(FOSSBilling\Pagination::class);
+    $pager = Mockery::mock(FOSSBilling\Core\Pagination\Service::class);
     $pager->shouldReceive('paginateDoctrineQuery')->once()->andReturnUsing(
-        function ($qb, PaginationOptions $pagination) use ($queryBuilder) {
+        function ($qb, Options $pagination) use ($queryBuilder) {
             expect($qb)->toBe($queryBuilder);
             expect($pagination->perPage)->toBe(10);
 
@@ -58,4 +58,18 @@ test('delete delegates to service', function (): void {
     $api->setService($service);
 
     expect($api->delete(['id' => 9]))->toBeTrue();
+});
+
+test('add stores the raw message without HTML-encoding it', function (): void {
+    $service = Mockery::mock(Box\Mod\Notification\Service::class);
+    $service->shouldReceive('create')->with('A & B <note>')->once()->andReturn(7);
+
+    $di = new Pimple\Container();
+    $di['mod_service'] = $di->protect(moduleService());
+
+    $api = apiEndpoint(new Box\Mod\Notification\Api\Admin());
+    $api->setDi($di);
+    $api->setService($service);
+
+    expect($api->add(['message' => 'A & B <note>']))->toBe(7);
 });

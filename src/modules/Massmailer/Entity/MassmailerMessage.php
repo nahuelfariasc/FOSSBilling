@@ -13,19 +13,24 @@ declare(strict_types=1);
 namespace Box\Mod\Massmailer\Entity;
 
 use Doctrine\ORM\Mapping as ORM;
-use FOSSBilling\Interfaces\ApiArrayInterface;
+use FOSSBilling\Core\Api\ArrayInterface;
+use FOSSBilling\Core\Doctrine\TimestampInterface;
+use FOSSBilling\Core\Doctrine\TimestampTrait;
 
 #[ORM\Entity(repositoryClass: \Box\Mod\Massmailer\Repository\MassmailerMessageRepository::class)]
 #[ORM\Table(name: 'mod_massmailer')]
-class MassmailerMessage implements ApiArrayInterface
+#[ORM\HasLifecycleCallbacks]
+class MassmailerMessage implements ArrayInterface, TimestampInterface
 {
+    use TimestampTrait;
+
     public const STATUS_DRAFT = 'draft';
     public const STATUS_SENT = 'sent';
 
     public function __construct(
         #[ORM\Id]
         #[ORM\GeneratedValue]
-        #[ORM\Column(type: \Doctrine\DBAL\Types\Types::INTEGER)]
+        #[ORM\Column(type: \Doctrine\DBAL\Types\Types::BIGINT)]
         private ?int $id = null,
     ) {
     }
@@ -42,20 +47,14 @@ class MassmailerMessage implements ApiArrayInterface
     #[ORM\Column(type: \Doctrine\DBAL\Types\Types::TEXT, nullable: true)]
     private ?string $content = null;
 
-    #[ORM\Column(type: \Doctrine\DBAL\Types\Types::TEXT, nullable: true)]
-    private ?string $filter = null;
+    #[ORM\Column(type: \Doctrine\DBAL\Types\Types::JSON, nullable: true)]
+    private ?array $filter = null;
 
     #[ORM\Column(type: \Doctrine\DBAL\Types\Types::STRING, length: 255, nullable: true)]
     private ?string $status = self::STATUS_DRAFT;
 
-    #[ORM\Column(name: 'sent_at', type: \Doctrine\DBAL\Types\Types::STRING, length: 35, nullable: true)]
-    private ?string $sentAt = null;
-
-    #[ORM\Column(name: 'created_at', type: \Doctrine\DBAL\Types\Types::STRING, length: 35, nullable: true)]
-    private ?string $createdAt = null;
-
-    #[ORM\Column(name: 'updated_at', type: \Doctrine\DBAL\Types\Types::STRING, length: 35, nullable: true)]
-    private ?string $updatedAt = null;
+    #[ORM\Column(name: 'sent_at', type: \Doctrine\DBAL\Types\Types::DATETIME_IMMUTABLE, nullable: true)]
+    private ?\DateTimeImmutable $sentAt = null;
 
     public function toApiArray(): array
     {
@@ -65,11 +64,11 @@ class MassmailerMessage implements ApiArrayInterface
             'from_name' => $this->fromName,
             'subject' => $this->subject,
             'content' => $this->content,
-            'filter' => json_decode($this->filter ?? '', true) ?? [],
+            'filter' => $this->getFilter() ?? [],
             'status' => $this->status,
-            'sent_at' => $this->sentAt,
-            'created_at' => $this->createdAt,
-            'updated_at' => $this->updatedAt,
+            'sent_at' => $this->sentAt?->format('Y-m-d H:i:s'),
+            'created_at' => $this->createdAt?->format('Y-m-d H:i:s'),
+            'updated_at' => $this->updatedAt?->format('Y-m-d H:i:s'),
         ];
     }
 
@@ -126,12 +125,12 @@ class MassmailerMessage implements ApiArrayInterface
         return $this;
     }
 
-    public function getFilter(): ?string
+    public function getFilter(): ?array
     {
         return $this->filter;
     }
 
-    public function setFilter(?string $filter): self
+    public function setFilter(?array $filter): self
     {
         $this->filter = $filter;
 
@@ -150,38 +149,14 @@ class MassmailerMessage implements ApiArrayInterface
         return $this;
     }
 
-    public function getSentAt(): ?string
+    public function getSentAt(): ?\DateTimeImmutable
     {
         return $this->sentAt;
     }
 
-    public function setSentAt(?string $sentAt): self
+    public function setSentAt(?\DateTimeImmutable $sentAt): self
     {
         $this->sentAt = $sentAt;
-
-        return $this;
-    }
-
-    public function getCreatedAt(): ?string
-    {
-        return $this->createdAt;
-    }
-
-    public function setCreatedAt(?string $createdAt): self
-    {
-        $this->createdAt = $createdAt;
-
-        return $this;
-    }
-
-    public function getUpdatedAt(): ?string
-    {
-        return $this->updatedAt;
-    }
-
-    public function setUpdatedAt(?string $updatedAt): self
-    {
-        $this->updatedAt = $updatedAt;
 
         return $this;
     }

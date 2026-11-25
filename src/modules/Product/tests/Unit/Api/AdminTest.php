@@ -28,7 +28,7 @@ test('gets dependency injection container', function (): void {
 test('gets product list', function (): void {
     $api = apiEndpoint(new Admin());
     $serviceMock = Mockery::mock(Service::class);
-    $serviceMock->shouldReceive('getPaginatedProducts')->once()->with([], null)->andReturn(['list' => []]);
+    $serviceMock->shouldReceive('getPaginatedProducts')->once()->with([], Mockery::type('object'))->andReturn(['list' => []]);
 
     $api->setService($serviceMock);
     $api->setDi(container());
@@ -78,7 +78,7 @@ test('throws exception when preparing domain product already created', function 
     $api->setService($serviceMock);
 
     expect(fn (): int => $api->prepare($data))
-        ->toThrow(FOSSBilling\Exception::class, 'You have already created domain product');
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class, 'You have already created domain product');
 });
 
 test('throws exception when preparing unrecognized product type', function (): void {
@@ -92,7 +92,7 @@ test('throws exception when preparing unrecognized product type', function (): v
     $api->setService($serviceMock);
 
     expect(fn (): int => $api->prepare($data))
-        ->toThrow(FOSSBilling\Exception::class, "Product type {$data['type']} is not registered.");
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class, "Product type {$data['type']} is not registered.");
 });
 
 test('prepares a product', function (): void {
@@ -125,12 +125,28 @@ test('updates a product', function (): void {
     expect($api->update($data))->toBeTrue();
 });
 
+test('product mutations reject missing IDs during API validation', function (string $method, string $message, array $data): void {
+    $dispatcher = new FOSSBilling\Core\Api\Dispatcher();
+
+    expect(fn () => $dispatcher->validateRequiredParams(new Admin(), $method, $data))
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class, $message);
+})->with([
+    ['update', 'Product ID was not passed'],
+    ['update_config', 'Product ID was not passed'],
+    ['delete', 'Product ID was not passed'],
+    ['addon_delete', 'Addon ID was not passed'],
+])->with([
+    'omitted' => [[]],
+    'null' => [['id' => null]],
+    'blank' => [['id' => '   ']],
+]);
+
 test('throws exception when updating priority without priority param', function (): void {
     $api = apiEndpoint(new Admin());
     $api->setDi(container());
 
     expect(fn () => $api->update_priority([]))
-        ->toThrow(FOSSBilling\Exception::class, 'priority params is missing');
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class, 'priority params is missing');
 });
 
 test('updates priority', function (): void {
@@ -212,7 +228,7 @@ test('updates an addon', function (): void {
     $serviceMock->shouldReceive('findProductById')->once()->with(1)->andReturn($model);
 
     $di = container();
-    $di['logger'] = new Box_Log();
+    $di['logger'] = new FOSSBilling\Core\Logging\Logger();
 
     $apiMock->setService($serviceMock);
     $apiMock->setDi($di);
@@ -264,6 +280,34 @@ test('updates a category', function (): void {
     $api->setDi(container());
 
     expect($api->category_update($data))->toBeTrue();
+});
+
+test('gets category list', function (): void {
+    $api = apiEndpoint(new Admin());
+    $serviceMock = Mockery::mock(Service::class);
+    $serviceMock->shouldReceive('getAdminCategoryList')->once()->andReturn([]);
+
+    $api->setService($serviceMock);
+    $api->setDi(container());
+
+    expect($api->category_get_list([]))->toBeArray();
+});
+
+test('throws exception when updating category priority without priority param', function (): void {
+    $api = apiEndpoint(new Admin());
+    $api->setDi(container());
+
+    expect(fn () => $api->category_update_priority([]))
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class, 'priority params is missing');
+});
+
+test('updates category priority', function (): void {
+    $api = apiEndpoint(new Admin());
+    $serviceMock = Mockery::mock(Service::class);
+    $serviceMock->shouldReceive('updateCategoryPriority')->atLeast()->once()->andReturn(true);
+
+    $api->setService($serviceMock);
+    expect($api->category_update_priority(['priority' => []]))->toBeTrue();
 });
 
 test('gets a category', function (): void {
@@ -319,7 +363,7 @@ test('gets promo list', function (): void {
     $serviceMock->shouldReceive('getPromoSearchQueryBuilder')->atLeast()->once()->andReturn($qbMock);
     $serviceMock->shouldReceive('enrichPromoApiArray')->once()->with($promo)->andReturn(['id' => 1]);
 
-    $pagerMock = Mockery::mock(FOSSBilling\Pagination::class);
+    $pagerMock = Mockery::mock(FOSSBilling\Core\Pagination\Service::class);
     $pagerMock->shouldReceive('paginateDoctrineQuery')->atLeast()->once()->andReturn(['list' => [$promo]]);
 
     $di = container();
@@ -379,6 +423,21 @@ test('gets a promo', function (): void {
     expect($api->promo_get($data))->toBeArray();
 });
 
+test('duplicates a promo', function (): void {
+    $api = apiEndpoint(new Admin());
+    $data = ['id' => 1];
+    $model = new Promo();
+    $newPromoId = 2;
+
+    $serviceMock = Mockery::mock(Service::class);
+    $serviceMock->shouldReceive('findPromoById')->atLeast()->once()->with(1)->andReturn($model);
+    $serviceMock->shouldReceive('duplicatePromo')->atLeast()->once()->with($model)->andReturn($newPromoId);
+
+    $api->setDi(container());
+    $api->setService($serviceMock);
+    expect($api->promo_duplicate($data))->toBe($newPromoId);
+});
+
 test('gets promo redemption list', function (): void {
     $api = apiEndpoint(new Admin());
     $qbMock = Mockery::mock(Doctrine\ORM\QueryBuilder::class);
@@ -390,16 +449,50 @@ test('gets promo redemption list', function (): void {
     $serviceMock->shouldReceive('getPromoRedemptionRepository')->atLeast()->once()->andReturn($repoMock);
     $serviceMock->shouldReceive('enrichPromoRedemptionApiArray')->atLeast()->once()->andReturn([]);
 
-    $pagerMock = Mockery::mock(FOSSBilling\Pagination::class);
+    $pagerMock = Mockery::mock(FOSSBilling\Core\Pagination\Service::class);
     $pagerMock->shouldReceive('paginateDoctrineQuery')->atLeast()->once()->andReturn(['list' => [[]]]);
 
     $di = container();
     $di['pager'] = $pagerMock;
+    $staffServiceMock = $di['mod_service']('staff');
+    foreach ([
+        ['product', 'view'],
+        ['client', 'view'],
+        ['order', 'view'],
+        ['invoice', 'view'],
+    ] as [$module, $permission]) {
+        $staffServiceMock->shouldReceive('checkPermissionsAndThrowException')
+            ->once()
+            ->with($module, $permission, null, Mockery::any())
+            ->andReturn(true)
+            ->ordered();
+    }
 
     $api->setService($serviceMock);
     $api->setDi($di);
 
     expect($api->promo_redemption_get_list(['promo_id' => 1]))->toBeArray();
+});
+
+test('promo redemption list requires permission to view enriched client data', function (): void {
+    $api = apiEndpoint(new Admin());
+
+    $serviceMock = Mockery::mock(Service::class);
+    $serviceMock->shouldReceive('getPromoRedemptionRepository')->never();
+
+    $di = container();
+    $staffServiceMock = $di['mod_service']('staff');
+    $staffServiceMock->shouldReceive('checkPermissionsAndThrowException')->byDefault()->andReturn(true);
+    $staffServiceMock->shouldReceive('checkPermissionsAndThrowException')
+        ->once()
+        ->with('client', 'view', null, Mockery::any())
+        ->andThrow(new FOSSBilling\Core\Exception\InformationException('You need the "client.view" permission to perform this action', [], 403));
+
+    $api->setDi($di);
+    $api->setService($serviceMock);
+
+    expect(fn () => $api->promo_redemption_get_list(['promo_id' => 1]))
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class);
 });
 
 test('updates a promo', function (): void {

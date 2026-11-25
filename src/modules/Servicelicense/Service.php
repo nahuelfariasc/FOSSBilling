@@ -15,8 +15,10 @@ use Box\Mod\Client\Entity\Client;
 use Box\Mod\Order\Entity\Order;
 use Box\Mod\Product\Entity\Product;
 use Box\Mod\Servicelicense\Entity\ServiceLicense;
+use Box\Mod\Servicelicense\Event\AfterServiceLicenseResetEvent;
+use Box\Mod\Servicelicense\Event\BeforeServiceLicenseResetEvent;
 use Box\Mod\Servicelicense\Repository\ServiceLicenseRepository;
-use FOSSBilling\InjectionAwareInterface;
+use FOSSBilling\Core\Container\InjectionAwareInterface;
 use Symfony\Component\Filesystem\Path;
 use Symfony\Component\Finder\Finder;
 
@@ -62,7 +64,7 @@ class Service implements InjectionAwareInterface
      */
     public function attachOrderConfig(Product $product, array $data): array
     {
-        $config = json_decode($product->getConfig() ?? '', true) ?? [];
+        $config = $product->getConfig() ?? [];
 
         return array_merge($config, $data);
     }
@@ -70,7 +72,7 @@ class Service implements InjectionAwareInterface
     /**
      * Method is called before adding product to cart.
      */
-    public function validateOrderData(array &$data): bool
+    public function validateOrderData(array &$data, ?Product $product = null): bool
     {
         return true;
     }
@@ -91,14 +93,14 @@ class Service implements InjectionAwareInterface
         return $files;
     }
 
-    public function action_create(\Model_ClientOrder $order): ServiceLicense
+    public function action_create(Order $order): ServiceLicense
     {
         $orderService = $this->di['mod_service']('order');
         $c = $orderService->getConfig($order);
         $this->validateOrderData($c);
 
         $model = new ServiceLicense();
-        $model->setClientId((int) $order->client_id);
+        $model->setClientId((int) $order->getClientId());
         $model->setValidateIp((bool) ($c['validate_ip'] ?? false));
         $model->setValidateHost((bool) ($c['validate_host'] ?? false));
         $model->setValidatePath((bool) ($c['validate_path'] ?? false));
@@ -111,7 +113,7 @@ class Service implements InjectionAwareInterface
         return $model;
     }
 
-    public function action_activate(\Model_ClientOrder $order): bool
+    public function action_activate(Order $order): bool
     {
         $orderService = $this->di['mod_service']('order');
         $c = $orderService->getConfig($order);
@@ -121,11 +123,11 @@ class Service implements InjectionAwareInterface
         $plugin = $this->_getPlugin($model);
 
         if (!is_object($plugin)) {
-            throw new \FOSSBilling\Exception('License plugin :plugin was not found.', [':plugin' => $model->getPlugin()]);
+            throw new \FOSSBilling\Core\Exception\BaseException('License plugin :plugin was not found.', [':plugin' => $model->getPlugin()]);
         }
 
         if (!method_exists($plugin, 'generate')) {
-            throw new \FOSSBilling\Exception('License plugin does not have generate method');
+            throw new \FOSSBilling\Core\Exception\BaseException('License plugin does not have generate method');
         }
 
         if (method_exists($plugin, 'setDi')) {
@@ -136,9 +138,9 @@ class Service implements InjectionAwareInterface
         do {
             $licenseKey = $plugin->generate($model, $order, $c);
             if ($i++ >= $iterations) {
-                throw new \FOSSBilling\Exception('Maximum number of iterations reached while generating license key');
+                throw new \FOSSBilling\Core\Exception\BaseException('Maximum number of iterations reached while generating license key');
             }
-        } while ($this->getRepository()->findByLicenseKey($licenseKey) !== null);
+        } while ($this->getRepository()->findByLicenseKey($licenseKey) instanceof ServiceLicense);
 
         $model->setLicenseKey($licenseKey);
         $this->di['em']->flush();
@@ -149,7 +151,7 @@ class Service implements InjectionAwareInterface
     /**
      * @todo
      */
-    public function action_renew(\Model_ClientOrder $order): bool
+    public function action_renew(Order $order): bool
     {
         return true;
     }
@@ -157,7 +159,7 @@ class Service implements InjectionAwareInterface
     /**
      * @todo
      */
-    public function action_suspend(\Model_ClientOrder $order): bool
+    public function action_suspend(Order $order): bool
     {
         return true;
     }
@@ -165,7 +167,7 @@ class Service implements InjectionAwareInterface
     /**
      * @todo
      */
-    public function action_unsuspend(\Model_ClientOrder $order): bool
+    public function action_unsuspend(Order $order): bool
     {
         return true;
     }
@@ -173,7 +175,7 @@ class Service implements InjectionAwareInterface
     /**
      * @todo
      */
-    public function action_cancel(\Model_ClientOrder $order): bool
+    public function action_cancel(Order $order): bool
     {
         return true;
     }
@@ -181,12 +183,12 @@ class Service implements InjectionAwareInterface
     /**
      * @todo
      */
-    public function action_uncancel(\Model_ClientOrder $order): bool
+    public function action_uncancel(Order $order): bool
     {
         return true;
     }
 
-    public function action_delete(\Model_ClientOrder $order): void
+    public function action_delete(Order $order, bool $forceDelete = false): void
     {
         $model = $this->_getOrderService($order, false);
         if ($model instanceof ServiceLicense) {
@@ -197,29 +199,16 @@ class Service implements InjectionAwareInterface
 
     public function reset(ServiceLicense $model): bool
     {
-        $data = [
-            'id' => $model->getId(),
-            'ips' => $model->getIps(),
-            'hosts' => $model->getHosts(),
-            'paths' => $model->getPaths(),
-            'versions' => $model->getVersions(),
-            'client_id' => $model->getClientId(),
-        ];
-        $this->di['events_manager']->fire(['event' => 'onBeforeServicelicenseReset', 'params' => $data]);
+        $this->di['event_dispatcher']->dispatch(new BeforeServiceLicenseResetEvent($model->getId(), $model->getClientId()));
 
-        $model->setIps(json_encode([]));
-        $model->setHosts(json_encode([]));
-        $model->setPaths(json_encode([]));
-        $model->setVersions(json_encode([]));
+        $model->setIps([]);
+        $model->setHosts([]);
+        $model->setPaths([]);
+        $model->setVersions([]);
         $this->di['em']->flush();
-        $this->di['logger']->info('Reset license %s information', $model->getId());
+        $this->di['logger']->info('Reset license {model_id} information', ['model_id' => $model->getId()]);
 
-        $data = [
-            'id' => $model->getId(),
-            'client_id' => $model->getClientId(),
-            'updated_at' => $model->getUpdatedAt()?->format('Y-m-d H:i:s'),
-        ];
-        $this->di['events_manager']->fire(['event' => 'onAfterServicelicenseReset', 'params' => $data]);
+        $this->di['event_dispatcher']->dispatch(new AfterServiceLicenseResetEvent($model->getId(), $model->getClientId()));
 
         return true;
     }
@@ -244,7 +233,7 @@ class Service implements InjectionAwareInterface
         return true;
     }
 
-    public function isValidIp(ServiceLicense $model, $value)
+    public function isValidIp(ServiceLicense $model, $value): bool
     {
         $defined = $model->getAllowedIps();
         if (empty($defined)) {
@@ -262,7 +251,7 @@ class Service implements InjectionAwareInterface
         return in_array($value, $defined);
     }
 
-    public function isValidVersion(ServiceLicense $model, $value)
+    public function isValidVersion(ServiceLicense $model, $value): bool
     {
         $defined = $model->getAllowedVersions();
         if (empty($defined)) {
@@ -280,7 +269,7 @@ class Service implements InjectionAwareInterface
         return in_array($value, $defined);
     }
 
-    public function isValidPath(ServiceLicense $model, $value)
+    public function isValidPath(ServiceLicense $model, $value): bool
     {
         $defined = $model->getAllowedPaths();
         if (empty($defined)) {
@@ -298,7 +287,7 @@ class Service implements InjectionAwareInterface
         return in_array($value, $defined);
     }
 
-    public function isValidHost(ServiceLicense $model, $value)
+    public function isValidHost(ServiceLicense $model, $value): bool
     {
         $defined = $model->getAllowedHosts();
         if (empty($defined)) {
@@ -341,7 +330,7 @@ class Service implements InjectionAwareInterface
         return $client instanceof Client ? $client->getFullName() : '';
     }
 
-    public function getExpirationDate(ServiceLicense $model)
+    public function getExpirationDate(ServiceLicense $model): ?string
     {
         $orderService = $this->di['mod_service']('order');
         $o = $orderService->getServiceOrder($model);
@@ -366,7 +355,7 @@ class Service implements InjectionAwareInterface
             'versions' => $model->getAllowedVersions(),
             'pinged_at' => $model->getPingedAt()?->format('Y-m-d H:i:s'),
         ];
-        if ($identity instanceof \Model_Admin) {
+        if ($identity instanceof \Box\Mod\Staff\Entity\Admin) {
             $result['plugin'] = $model->getPlugin();
         }
 
@@ -386,13 +375,13 @@ class Service implements InjectionAwareInterface
             default => throw new \InvalidArgumentException("Unknown list key: {$key}"),
         };
         $allowed[] = $value;
-        $json = json_encode(array_unique($allowed));
+        $allowed = array_values(array_unique($allowed));
 
         match ($key) {
-            'ips' => $model->setIps($json),
-            'hosts' => $model->setHosts($json),
-            'paths' => $model->setPaths($json),
-            default => $model->setVersions($json),
+            'ips' => $model->setIps($allowed),
+            'hosts' => $model->setHosts($allowed),
+            'paths' => $model->setPaths($allowed),
+            default => $model->setVersions($allowed),
         };
         $this->di['em']->flush();
     }
@@ -409,7 +398,7 @@ class Service implements InjectionAwareInterface
             }
         }
         if (isset($this->di['logger'])) {
-            $this->di['logger']->info('License #%s plugin %s is invalid.', $model->getId(), $model->getPlugin());
+            $this->di['logger']->info('License #{model_id} plugin {model_plugin} is invalid.', ['model_id' => $model->getId(), 'model_plugin' => $model->getPlugin()]);
         }
 
         return null;
@@ -431,12 +420,12 @@ class Service implements InjectionAwareInterface
                 $array = explode(PHP_EOL, $data[$key]);
                 $array = array_map(trim(...), $array);
                 $array = array_diff($array, ['']);
-                $json = json_encode(array_values($array));
+                $allowed = array_values($array);
                 match ($key) {
-                    'ips' => $s->setIps($json),
-                    'hosts' => $s->setHosts($json),
-                    'paths' => $s->setPaths($json),
-                    default => $s->setVersions($json),
+                    'ips' => $s->setIps($allowed),
+                    'hosts' => $s->setHosts($allowed),
+                    'paths' => $s->setPaths($allowed),
+                    default => $s->setVersions($allowed),
                 };
             }
         }
@@ -452,7 +441,7 @@ class Service implements InjectionAwareInterface
     public function checkLicenseDetails(array $data)
     {
         $result = [];
-        $log = $this->di['logger']->setChannel('license');
+        $log = $this->di['logger']->withChannel('license');
         // @phpstan-ignore if.alwaysFalse (DEBUG is a runtime constant that may be true during debugging)
         if (DEBUG) {
             $log->debug(print_r($data, true));
@@ -488,13 +477,13 @@ class Service implements InjectionAwareInterface
         return $server->process($data);
     }
 
-    private function _getOrderService(\Model_ClientOrder $order, bool $required = true): ?ServiceLicense
+    private function _getOrderService(Order $order, bool $required = true): ?ServiceLicense
     {
         $orderService = $this->di['mod_service']('order');
         $model = $orderService->getOrderService($order);
         if (!$model instanceof ServiceLicense) {
             if ($required) {
-                throw new \FOSSBilling\Exception('Could not find associated service license');
+                throw new \FOSSBilling\Core\Exception\BaseException('Could not find associated service license');
             }
 
             return null;

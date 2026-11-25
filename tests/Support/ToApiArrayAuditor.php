@@ -13,6 +13,7 @@ declare(strict_types=1);
 namespace Tests\Support;
 
 use PhpParser\Node;
+use PhpParser\Node\Expr\Array_;
 use PhpParser\Node\Expr\ArrayDimFetch;
 use PhpParser\Node\Expr\Assign;
 use PhpParser\Node\Expr\Variable;
@@ -26,22 +27,14 @@ use Symfony\Component\Finder\Finder;
  * that are assigned to `$data['xxx']` only inside conditional blocks. The
  * toApiArray method is the canonical bridge between a service-layer model
  * and the JSON returned to the API; if a template reads a key that is only
- * set inside an `if ($identity instanceof \Model_Admin)` branch, the
+ * set inside an `if ($identity instanceof \Box\Mod\Staff\Entity\Admin)` branch, the
  * template raises `Key "xxx" does not exist` under strict_variables, or
  * returns a silent empty value under permissive rendering, when the
  * response is consumed by a non-admin caller.
  *
- * Findings shape:
- * <code>
- * [
- *     'modules/Foo/Service.php' => [
- *         'top' => ['config', 'total', ...],   // assigned unconditionally
- *         'conditional' => [
- *             'plugin' => ['if/else', 'if/else'],  // never assigned at the top
- *         ],
- *     ],
- * ]
- * </code>
+ * Only fields that are never assigned at the top level are reported. These
+ * fields need an explicit review because their absence is part of the API
+ * contract, rather than an accidental omission.
  */
 final readonly class ToApiArrayAuditor
 {
@@ -61,7 +54,7 @@ final readonly class ToApiArrayAuditor
     }
 
     /**
-     * @return array<string, array{top: list<string>, conditional: array<string, list<string>>}>
+     * @return array<string, array<string, list<string>>>
      */
     public function audit(): array
     {
@@ -94,29 +87,14 @@ final readonly class ToApiArrayAuditor
                 $relPath = str_replace($this->srcDir . '/', '', $file->getPathName());
                 $fields = $this->auditMethodBody($method->stmts);
 
-                $top = [];
                 $conditional = [];
                 foreach ($fields as $name => $locations) {
-                    $hasTop = false;
-                    $conditionalLocs = [];
-                    foreach ($locations as $loc) {
-                        if ($loc === 'top') {
-                            $hasTop = true;
-                        } else {
-                            $conditionalLocs[] = $loc;
-                        }
-                    }
-                    if ($hasTop) {
-                        $top[] = $name;
-                    } elseif (!empty($conditionalLocs)) {
-                        $conditional[$name] = $conditionalLocs;
+                    if (!in_array('top', $locations, true)) {
+                        $conditional[$name] = array_values(array_unique($locations));
                     }
                 }
-                if (!empty($conditional)) {
-                    $findings[$relPath] = [
-                        'top' => $top,
-                        'conditional' => $conditional,
-                    ];
+                if ($conditional !== []) {
+                    $findings[$relPath] = $conditional;
                 }
             }
         }
@@ -195,12 +173,19 @@ final readonly class ToApiArrayAuditor
         }
 
         if ($node instanceof Node\Stmt\TryCatch) {
-            $this->collectAssignments($node->try, $result, $where);
+            // The try body is `stmts`; catch and finally nodes have no branch
+            // of their own here, so walk their bodies directly.
+            $blocks = [$node->stmts];
             foreach ($node->catches as $catch) {
-                $this->collectAssignments($catch, $result, $where);
+                $blocks[] = $catch->stmts;
             }
             if ($node->finally !== null) {
-                $this->collectAssignments($node->finally, $result, $where);
+                $blocks[] = $node->finally->stmts;
+            }
+            foreach ($blocks as $stmts) {
+                foreach ($stmts as $child) {
+                    $this->collectAssignments($child, $result, $where);
+                }
             }
 
             return;
@@ -221,6 +206,14 @@ final readonly class ToApiArrayAuditor
         }
 
         if ($node instanceof Assign) {
+            if ($node->var instanceof Variable && $node->var->name === 'data' && $node->expr instanceof Array_) {
+                foreach ($node->expr->items as $item) {
+                    if ($item?->key instanceof Node\Scalar\String_) {
+                        $result[$item->key->value][] = $where;
+                    }
+                }
+            }
+
             $field = $this->extractDataFieldName($node->var);
             if ($field !== null) {
                 $result[$field][] = $where;

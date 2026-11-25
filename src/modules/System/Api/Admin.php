@@ -15,11 +15,18 @@ declare(strict_types=1);
 
 namespace Box\Mod\System\Api;
 
-use FOSSBilling\Config;
-use FOSSBilling\Tools;
-use FOSSBilling\Validation\Api\RequiredParams;
+use Box\Mod\System\Event\AfterAdminManualUpdateEvent;
+use Box\Mod\System\Event\AfterAdminUpdateCoreEvent;
+use Box\Mod\System\Event\BeforeAdminManualUpdateEvent;
+use Box\Mod\System\Event\BeforeAdminUpdateCoreEvent;
+use FOSSBilling\Core\Cache\CacheFactory;
+use FOSSBilling\Core\Cache\Driver;
+use FOSSBilling\Core\Doctrine\DbCompat;
+use FOSSBilling\Core\Doctrine\EntityManagerFactory;
+use FOSSBilling\Core\System\Config;
+use FOSSBilling\Core\Validation\Api\RequiredParams;
 
-class Admin extends \FOSSBilling\Api\AbstractApi
+class Admin extends \FOSSBilling\Core\Api\AbstractApi
 {
     /**
      * Get all defined system params.
@@ -42,7 +49,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
 
         return [
             'locale' => (string) Config::getProperty('i18n.locale', 'en_US'),
-            'auto_detect_locale' => Tools::normalizeBoolean(Config::getProperty('i18n.auto_detect_locale', true), true),
+            'auto_detect_locale' => \FOSSBilling\Core\Utils\Normalizer::normalizeBoolean(Config::getProperty('i18n.auto_detect_locale', true), true),
         ];
     }
 
@@ -63,7 +70,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
     /**
      * Updates localization settings stored in the FOSSBilling config file.
      *
-     * @throws \FOSSBilling\Exception
+     * @throws \FOSSBilling\Core\Exception\BaseException
      */
     public function update_localization_settings($data): bool
     {
@@ -73,7 +80,105 @@ class Admin extends \FOSSBilling\Api\AbstractApi
             Config::setProperty('i18n.locale', $data['locale']);
         }
 
-        Config::setProperty('i18n.auto_detect_locale', Tools::normalizeBoolean($data['auto_detect_locale'] ?? true, true));
+        Config::setProperty('i18n.auto_detect_locale', \FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($data['auto_detect_locale'] ?? true, true));
+
+        return true;
+    }
+
+    /**
+     * Returns the cache backend settings stored in the FOSSBilling config file.
+     * The Redis password, if set, is never returned.
+     */
+    public function cache_settings(): array
+    {
+        $this->checkPermissions('system', 'manage_settings');
+
+        return [
+            'driver' => (string) Config::getProperty('cache.driver', 'filesystem'),
+            'redis_host' => (string) Config::getProperty('cache.redis.host', '127.0.0.1'),
+            'redis_port' => (int) Config::getProperty('cache.redis.port', 6379),
+            'redis_password_set' => Config::getProperty('cache.redis.password') !== null,
+            'redis_database' => (int) Config::getProperty('cache.redis.database', 0),
+            'redis_tls_enabled' => \FOSSBilling\Core\Utils\Normalizer::normalizeBoolean(Config::getProperty('cache.redis.tls.enabled', false), false),
+            'redis_tls_verify_peer' => \FOSSBilling\Core\Utils\Normalizer::normalizeBoolean(Config::getProperty('cache.redis.tls.verify_peer', true), true),
+            'redis_tls_verify_peer_name' => \FOSSBilling\Core\Utils\Normalizer::normalizeBoolean(Config::getProperty('cache.redis.tls.verify_peer_name', true), true),
+            'redis_tls_allow_self_signed' => \FOSSBilling\Core\Utils\Normalizer::normalizeBoolean(Config::getProperty('cache.redis.tls.allow_self_signed', false), false),
+            'redis_tls_cafile' => (string) Config::getProperty('cache.redis.tls.cafile', ''),
+            'memcached_host' => (string) Config::getProperty('cache.memcached.host', '127.0.0.1'),
+            'memcached_port' => (int) Config::getProperty('cache.memcached.port', 11211),
+        ];
+    }
+
+    /**
+     * Updates the cache backend settings stored in the FOSSBilling config file.
+     *
+     * The new settings are validated by attempting to connect to the configured backend before
+     * anything is saved, so a mistyped host/port/password is rejected with a clear reason rather
+     * than being written and silently falling back to the filesystem cache later. That same
+     * validation also rejects a Redis password on a non-loopback host with TLS disabled, since
+     * that combination would send the password in plain text (see CacheFactory).
+     *
+     * @throws \FOSSBilling\Core\Exception\BaseException
+     */
+    public function update_cache_settings($data): bool
+    {
+        $this->checkPermissions('system', 'update_params');
+
+        $rawDriver = $data['driver'] ?? 'filesystem';
+        $driver = Driver::tryFrom($rawDriver);
+        if (!$driver instanceof Driver) {
+            throw new \FOSSBilling\Core\Exception\BaseException('Unsupported cache driver: :driver', [':driver' => $rawDriver], 5001);
+        }
+
+        // Keep the existing password when the admin leaves the field blank, so re-saving the
+        // other Redis fields doesn't require re-entering it. The explicit "clear" checkbox is
+        // what lets an admin actually remove a previously-set password.
+        $redisPassword = $data['redis_password'] ?? '';
+        if ($redisPassword === '' && !\FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($data['redis_password_clear'] ?? false, false)) {
+            $redisPassword = Config::getProperty('cache.redis.password');
+        }
+
+        $newCacheConfig = [
+            'driver' => $driver->value,
+            'redis' => [
+                'host' => $data['redis_host'] ?? '127.0.0.1',
+                'port' => \FOSSBilling\Core\Utils\Normalizer::normalizePort($data['redis_port'] ?? null, 6379),
+                'password' => $redisPassword ?: null,
+                'database' => (int) ($data['redis_database'] ?? 0),
+                'tls' => [
+                    'enabled' => \FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($data['redis_tls_enabled'] ?? false, false),
+                    'verify_peer' => \FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($data['redis_tls_verify_peer'] ?? true, true),
+                    'verify_peer_name' => \FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($data['redis_tls_verify_peer_name'] ?? true, true),
+                    'allow_self_signed' => \FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($data['redis_tls_allow_self_signed'] ?? false, false),
+                    'cafile' => ($data['redis_tls_cafile'] ?? '') !== '' ? $data['redis_tls_cafile'] : null,
+                ],
+            ],
+            'memcached' => [
+                'host' => $data['memcached_host'] ?? '127.0.0.1',
+                'port' => \FOSSBilling\Core\Utils\Normalizer::normalizePort($data['memcached_port'] ?? null, 11211),
+            ],
+        ];
+
+        // Filesystem can't fail to connect, so only redis/memcached need the eager check.
+        if ($driver !== Driver::Filesystem) {
+            CacheFactory::createFromConfig($newCacheConfig, CacheFactory::NAMESPACE_CONNECTION_TEST, 60, fallbackOnFailure: false);
+        }
+
+        // Config::setConfig() below clears the pools for the new driver (it reads the live
+        // config, which by then already points at the new one). Capture the outgoing config
+        // now so its backend can be cleared too, after the switch - otherwise entries left
+        // behind there (e.g. a Redis database the admin is switching away from) could reappear
+        // if this setting is ever reverted.
+        $oldCacheConfig = Config::getProperty('cache', []);
+
+        $config = Config::getConfig();
+        $config['cache'] = $newCacheConfig;
+        Config::setConfig($config);
+
+        if (is_array($oldCacheConfig)) {
+            CacheFactory::clearAll($oldCacheConfig);
+            CacheFactory::clearNamespace(EntityManagerFactory::metadataCacheNamespace(), $oldCacheConfig);
+        }
 
         return true;
     }
@@ -114,18 +219,21 @@ class Admin extends \FOSSBilling\Api\AbstractApi
 
     /**
      * Check if passed file name template exists for admin area.
-     *
-     * @return bool
      */
-    public function template_exists($data)
+    public function template_exists($data): bool
     {
         $this->checkPermissions('system', 'manage_settings');
 
-        if (!isset($data['file'])) {
+        if (!isset($data['file']) || !is_string($data['file'])) {
             return false;
         }
 
-        return $this->getService()->templateExists($data['file'], $this->getIdentity());
+        $file = trim($data['file']);
+        if ($file === '' || str_contains($file, "\0")) {
+            return false;
+        }
+
+        return $this->getService()->templateExists($file, $this->getIdentity());
     }
 
     /**
@@ -137,7 +245,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
     {
         $this->checkPermissions('system', 'manage_settings');
 
-        $fetchExternalIp = Tools::normalizeBoolean($data['ip'] ?? false);
+        $fetchExternalIp = \FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($data['ip'] ?? false);
 
         return $this->getService()->getEnv($fetchExternalIp);
     }
@@ -149,7 +257,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
      *
      * @return bool
      *
-     * @throws \FOSSBilling\Exception
+     * @throws \FOSSBilling\Core\Exception\BaseException
      */
     #[RequiredParams(['mod' => '"mod" key is missing'])]
     public function is_allowed($data)
@@ -223,13 +331,13 @@ class Admin extends \FOSSBilling\Api\AbstractApi
     /**
      * Update FOSSBilling core.
      *
-     * @throws \FOSSBilling\Exception
+     * @throws \FOSSBilling\Core\Exception\BaseException
      */
     public function update_core($data): bool
     {
         $updater = $this->getDi()['updater'];
         if ($updater->getUpdateBranch() !== 'preview' && !$updater->isUpdateAvailable()) {
-            throw new \FOSSBilling\InformationException('You have the latest version of FOSSBilling. You do not need to update.');
+            throw new \FOSSBilling\Core\Exception\InformationException('You have the latest version of FOSSBilling. You do not need to update.');
         }
 
         $this->checkPermissions('system', 'system_update');
@@ -239,10 +347,10 @@ class Admin extends \FOSSBilling\Api\AbstractApi
         }
 
         $new_version = $updater->getLatestVersion();
-        $this->getDi()['events_manager']->fire(['event' => 'onBeforeAdminUpdateCore']);
+        $this->getDi()['event_dispatcher']->dispatch(new BeforeAdminUpdateCoreEvent());
         $updater->performUpdate();
 
-        $this->getDi()['logger']->info('Installed FOSSBilling update files from %s to %s. Update finalization is pending.', \FOSSBilling\Version::VERSION, $new_version);
+        $this->getDi()['logger']->info('Installed FOSSBilling update files from {previous_version} to {new_version}. Update finalization is pending.', ['previous_version' => \FOSSBilling\Core\System\Version::VERSION, 'new_version' => $new_version]);
 
         return true;
     }
@@ -263,8 +371,8 @@ class Admin extends \FOSSBilling\Api\AbstractApi
         }
 
         $this->getDi()['update_finalization']->finalizeUpdate();
-        $this->getDi()['events_manager']->fire(['event' => 'onAfterAdminUpdateCore']);
-        $this->getDi()['logger']->info('Finalized FOSSBilling update to %s.', \FOSSBilling\Version::VERSION);
+        $this->getDi()['event_dispatcher']->dispatch(new AfterAdminUpdateCoreEvent());
+        $this->getDi()['logger']->info('Finalized FOSSBilling update to {version}.', ['version' => \FOSSBilling\Core\System\Version::VERSION]);
 
         return true;
     }
@@ -274,7 +382,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
         $this->checkUpdateFinalizationPermissions();
 
         $this->getDi()['update_finalization']->completeFinalization();
-        $this->getDi()['logger']->info('Completed FOSSBilling update finalization for %s.', \FOSSBilling\Version::VERSION);
+        $this->getDi()['logger']->info('Completed FOSSBilling update finalization for {version}.', ['version' => \FOSSBilling\Core\System\Version::VERSION]);
 
         return true;
     }
@@ -287,30 +395,31 @@ class Admin extends \FOSSBilling\Api\AbstractApi
             return;
         }
 
-        if ($this->identity instanceof \Model_Admin) {
+        if ($this->identity instanceof \Box\Mod\Staff\Entity\Admin) {
             try {
-                if ($this->getDi()['mod_service']('Staff')->isSuperAdministrator($this->identity->id)) {
+                if ($this->getDi()['mod_service']('Staff')->isSuperAdministrator($this->identity->getId())) {
                     return;
                 }
             } catch (\Doctrine\DBAL\Exception) {
                 // If the installation hasn't migrated to the new group structure yet,
                 // Manually look for the old "admin" role
+                $connection = $this->getDi()['em']->getConnection();
                 if (
-                    $this->getDi()['db']->getCell("SHOW COLUMNS FROM `admin` LIKE 'role'")
-                    && $this->getDi()['db']->getCell('SELECT role FROM admin WHERE id = :id', ['id' => (int) $this->identity->id]) === 'admin'
+                    DbCompat::tableHasColumn($connection, 'admin', 'role')
+                    && $connection->fetchOne('SELECT role FROM admin WHERE id = :id', ['id' => (int) $this->identity->getId()]) === 'admin'
                 ) {
                     return;
                 }
             }
         }
 
-        throw new \FOSSBilling\InformationException('You need to be a Super Administrator to finalize this update.', [], 403);
+        throw new \FOSSBilling\Core\Exception\InformationException('You need to be a Super Administrator to finalize this update.', [], 403);
     }
 
     /**
      * Update FOSSBilling config.
      *
-     * @throws \FOSSBilling\Exception
+     * @throws \FOSSBilling\Core\Exception\BaseException
      */
     public function manual_update(): bool
     {
@@ -321,9 +430,9 @@ class Admin extends \FOSSBilling\Api\AbstractApi
         }
 
         $updater = $this->getDi()['updater'];
-        $this->getDi()['events_manager']->fire(['event' => 'onBeforeAdminManualUpdate']);
+        $this->getDi()['event_dispatcher']->dispatch(new BeforeAdminManualUpdateEvent());
         $updater->performManualUpdate();
-        $this->getDi()['events_manager']->fire(['event' => 'onAfterAdminManualUpdate']);
+        $this->getDi()['event_dispatcher']->dispatch(new AfterAdminManualUpdateEvent());
         $this->getDi()['logger']->info('Updated FOSSBilling - applied patches and updated configuration file.');
 
         return true;
@@ -381,14 +490,14 @@ class Admin extends \FOSSBilling\Api\AbstractApi
     {
         $this->checkPermissions('system', 'view');
 
-        return \FOSSBilling\SentryHelper::last_change;
+        return \FOSSBilling\Core\SentryHelper::last_change;
     }
 
     public function get_interface_ips(): array
     {
         $this->checkPermissions('system', 'manage_network_interface');
 
-        return $this->di['tools']->listHttpInterfaces();
+        return $this->di['network']->listHttpInterfaces();
     }
 
     public function set_interface_ip($data): bool
@@ -399,15 +508,15 @@ class Admin extends \FOSSBilling\Api\AbstractApi
         if (isset($data['interface'])) {
             $interface = $data['interface'];
             if ($interface !== '0' && !filter_var($interface, FILTER_VALIDATE_IP)) {
-                throw new \FOSSBilling\Exception('Invalid interface IP address');
+                throw new \FOSSBilling\Core\Exception\BaseException('Invalid interface IP address');
             }
             $config['interface_ip'] = $interface;
         }
 
         if (isset($data['custom_interface'])) {
             $custom = $data['custom_interface'];
-            if ($custom !== '' && !Tools::isValidHttpInterface($custom)) {
-                throw new \FOSSBilling\Exception('Invalid custom interface. Must be a valid IP address or hostname.');
+            if ($custom !== '' && !\FOSSBilling\Core\Utils\Network::isValidHttpInterface($custom)) {
+                throw new \FOSSBilling\Core\Exception\BaseException('Invalid custom interface. Must be a valid IP address or hostname.');
             }
             $config['custom_interface_ip'] = $custom;
         }

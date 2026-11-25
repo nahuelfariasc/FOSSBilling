@@ -1,7 +1,7 @@
 /*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;
 /*!40101 SET @OLD_CHARACTER_SET_RESULTS=@@CHARACTER_SET_RESULTS */;
 /*!40101 SET @OLD_COLLATION_CONNECTION=@@COLLATION_CONNECTION */;
-/*!40101 SET NAMES utf8 */;
+/*!40101 SET NAMES utf8mb4 */;
 /*!40014 SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0 */;
 /*!40101 SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO' */;
 /*!40111 SET @OLD_SQL_NOTES=@@SQL_NOTES, SQL_NOTES=0 */;
@@ -128,9 +128,9 @@ LOCK TABLES `extension` WRITE;
 
 INSERT INTO `extension` (`id`, `type`, `name`, `status`, `version`)
 VALUES
-	(1,'mod','news','installed','1.0.0'),
-	(2,'mod','branding','installed','0.0.1'),
-	(3,'mod','redirect','installed','1.0.0');
+	(1,'module','news','installed','0.8.9'),
+	(2,'module','branding','installed','0.8.9'),
+	(3,'module','redirect','installed','0.8.9');
 
 /*!40000 ALTER TABLE `extension` ENABLE KEYS */;
 UNLOCK TABLES;
@@ -161,6 +161,21 @@ UNLOCK TABLES;
 
 
 
+# Dump of table support_kb_article_category
+# ------------------------------------------------------------
+
+LOCK TABLES `support_kb_article_category` WRITE;
+/*!40000 ALTER TABLE `support_kb_article_category` DISABLE KEYS */;
+
+INSERT INTO `support_kb_article_category` (`id`, `title`, `description`, `slug`, `created_at`, `updated_at`)
+VALUES
+	(1,'Frequently asked questions','Section for common issues','faq',NOW(),NOW()),
+	(2,'How to''s','Section dedicated for tutorials','how-to',NOW(),NOW());
+
+/*!40000 ALTER TABLE `support_kb_article_category` ENABLE KEYS */;
+UNLOCK TABLES;
+
+
 # Dump of table support_kb_article
 # ------------------------------------------------------------
 
@@ -174,21 +189,6 @@ VALUES
 	(3,2,0,'Example article','Example article heading\n------------------------------------------------------------\n\nThis is a placeholder article. Replace with helpful content for clients, such as guides, tutorials, or FAQs.','example-article','active',NOW(),NOW());
 
 /*!40000 ALTER TABLE `support_kb_article` ENABLE KEYS */;
-UNLOCK TABLES;
-
-
-# Dump of table support_kb_article_category
-# ------------------------------------------------------------
-
-LOCK TABLES `support_kb_article_category` WRITE;
-/*!40000 ALTER TABLE `support_kb_article_category` DISABLE KEYS */;
-
-INSERT INTO `support_kb_article_category` (`id`, `title`, `description`, `slug`, `created_at`, `updated_at`)
-VALUES
-	(1,'Frequently asked questions','Section for common issues','faq',NOW(),NOW()),
-	(2,'How to''s','Section dedicated for tutorials','how-to',NOW(),NOW());
-
-/*!40000 ALTER TABLE `support_kb_article_category` ENABLE KEYS */;
 UNLOCK TABLES;
 
 
@@ -217,9 +217,23 @@ INSERT INTO `post` (`id`, `admin_id`, `title`, `description`, `content`, `slug`,
 VALUES
 	(1,1,'FOSSBilling needs your donations','Donations are crucial for the success and sustainability of FOSSBilling and other open-source projects. We need your help.','Donations are crucial for the success and sustainability of FOSSBilling and other open-source projects. Without financial support from users and the broader community, it is difficult for these projects to continue to grow and evolve.\nDonations help to cover the costs of development and maintenance. Developing and maintaining software requires time and resources, and without financial support, it can be challenging for open-source projects to sustain their efforts.\n\nThe FOSSBilling project has expenses such as hosting, hardware, software, and other costs associated with developing and maintaining FOSSBilling and other open-source projects. Your donations also help cover some of the maintainers'' expenses.\nClick [here](https://fossbilling.org/donate) to donate to the FOSSBilling project.','fossbilling-needs-your-donations','active',NULL,NULL,NULL,NULL,NULL,NOW(),NOW()),
 	(2,1,'Check out great features of FOSSBilling','FOSSBilling supports automated billing, invoicing, product provisioning', '* Supports automated billing, invoicing, product provisioning\n* Automatically create accounts as soon as the payment is received, suspend when account becomes overdue, terminate when a specified amount of time passes.\n* FOSSBilling is perfectly created to sell shared and reseller hosting accounts, software licenses and downloadable products.\n* Integrated helpdesk, knowledgebase, news and announcements system.\n','great-features-of-fossbilling','active',NULL,NULL,NULL,NULL,NULL,NOW(),NOW()),
-	(3,1,'FOSSBilling is customizable','You can create your own simple or advanced hooks on FOSSBilling events.','* You can create your own simple or advanced hooks on FOSSBilling events. For example, send notification via sms when new client signs up.\n* Create custom theme for your client interface\n','fossbilling-is-customizable','active',NULL,NULL,NULL,NULL,NULL,NOW(),NOW());
+	(3,1,'FOSSBilling is customizable','You can extend FOSSBilling with typed event listeners.','* You can extend FOSSBilling with typed event listeners. For example, send an SMS notification when a new client signs up.\n* Create custom theme for your client interface\n','fossbilling-is-customizable','active',NULL,NULL,NULL,NULL,NULL,NOW(),NOW());
 
 /*!40000 ALTER TABLE `post` ENABLE KEYS */;
+UNLOCK TABLES;
+
+
+# Dump of table product_category
+# ------------------------------------------------------------
+
+LOCK TABLES `product_category` WRITE;
+/*!40000 ALTER TABLE `product_category` DISABLE KEYS */;
+
+INSERT INTO `product_category` (`id`, `title`, `description`, `icon_url`, `priority`, `created_at`, `updated_at`)
+VALUES
+	(1,'Default category',NULL,NULL,10,NOW(),NOW());
+
+/*!40000 ALTER TABLE `product_category` ENABLE KEYS */;
 UNLOCK TABLES;
 
 
@@ -234,20 +248,6 @@ VALUES
 	(1,1,NULL,NULL,'Domains registration and transfer','domain-checker',NULL,'product',1,'enabled',0,0,'after_payment',NULL,NULL,0,0,0,NULL,NULL,NULL,1,NULL,NOW(),NOW(),'domain');
 
 /*!40000 ALTER TABLE `product` ENABLE KEYS */;
-UNLOCK TABLES;
-
-
-# Dump of table product_category
-# ------------------------------------------------------------
-
-LOCK TABLES `product_category` WRITE;
-/*!40000 ALTER TABLE `product_category` DISABLE KEYS */;
-
-INSERT INTO `product_category` (`id`, `title`, `description`, `icon_url`, `created_at`, `updated_at`)
-VALUES
-	(1,'Default category',NULL,NULL,NOW(),NOW());
-
-/*!40000 ALTER TABLE `product_category` ENABLE KEYS */;
 UNLOCK TABLES;
 
 
@@ -304,11 +304,11 @@ LOCK TABLES `setting` WRITE;
 
 INSERT INTO `setting` (`id`, `param`, `value`, `public`, `category`, `hash`, `created_at`, `updated_at`)
 VALUES
-	(1,'last_patch','98',0,NULL,NULL,NOW(),NOW()),
+	(1,'last_patch','164',0,NULL,NULL,NOW(),NOW()),
 	(2,'company_name','Company Name',0,NULL,NULL,NOW(),NOW()),
 	(3,'company_email','support@yourcompany.com',0,NULL,NULL,NOW(),NOW()),
 	(4,'company_signature','FOSSBilling.org - Client Management, Invoicing and Support Software',0,NULL,NULL,NOW(),NOW()),
-	(5,'company_logo','public/branding/logo.svg',0,NULL,NULL,NOW(),NOW()),
+	(5,'company_logo','public/branding/logo-light.svg',0,NULL,NULL,NOW(),NOW()),
 	(6,'company_logo_dark','public/branding/logo-dark.svg',0,NULL,NULL,NOW(),NOW()),
 	(7,'company_address_1','Demo address line 1',0,NULL,NULL,NOW(),NOW()),
 	(8,'company_address_2','Demo address line 2',0,NULL,NULL,NOW(),NOW()),
@@ -319,23 +319,25 @@ VALUES
 	(13,'company_note','This is a placeholder for your About Us page. It will be available in /about-us.\nReplace this with information about your company, such as:\n- Your company history and mission\n- Services offered\n- Values and vision\n- Contact or support information\n- Any other details you want your clients to know about your business',0,NULL,NULL,NOW(),NOW()),
 	(14,'invoice_series','FOSS',0,NULL,NULL,NOW(),NOW()),
 	(15,'invoice_due_days','5',0,NULL,NULL,NOW(),NOW()),
-	(16,'invoice_auto_approval','1',0,NULL,NULL,NOW(),NOW()),
+	(16,'invoice_auto_issue','1',0,NULL,NULL,NOW(),NOW()),
 	(17,'invoice_issue_days_before_expire','14',0,NULL,NULL,NOW(),NOW()),
-	(18,'theme','huraga',0,NULL,NULL,NOW(),NOW()),
+	(18,'theme','default/client',0,NULL,NULL,NOW(),NOW()),
 	(19,'issue_invoice_days_before_expire','7',0,NULL,NULL,NOW(),NOW()),
 	(20,'invoice_refund_logic','credit_note',0,NULL,NULL,NOW(),NOW()),
 	(21,'invoice_cn_series','CN-',0,NULL,NULL,NOW(),NOW()),
 	(22,'invoice_cn_starting_number','1',0,NULL,NULL,NOW(),NOW()),
-	(23,'invoice_starting_number','1',0,NULL,NULL,NOW(),NOW()),
-	(24,'nameserver_1',NULL,0,NULL,NULL,NOW(),NOW()),
-	(25,'nameserver_2',NULL,0,NULL,NULL,NOW(),NOW()),
-	(26,'nameserver_3',NULL,0,NULL,NULL,NOW(),NOW()),
-	(27,'nameserver_4',NULL,0,NULL,NULL,NOW(),NOW()),
-	(28,'funds_min_amount','10',0,NULL,NULL,NOW(),NOW()),
-	(29,'funds_max_amount','200',0,NULL,NULL,NOW(),NOW()),
-	(30,'company_favicon','public/branding/favicon.ico',0,NULL,NULL,NOW(),NOW()),
-	(31,'hide_company_public',1,0,NULL,NULL,NOW(), NOW()),
-	(32,'invoice_hash_lifetime_days','90',0,NULL,NULL,NOW(),NOW());
+	(23,'invoice_dn_series','DN-',0,NULL,NULL,NOW(),NOW()),
+	(24,'invoice_dn_starting_number','1',0,NULL,NULL,NOW(),NOW()),
+	(25,'invoice_starting_number','1',0,NULL,NULL,NOW(),NOW()),
+	(26,'nameserver_1',NULL,0,NULL,NULL,NOW(),NOW()),
+	(27,'nameserver_2',NULL,0,NULL,NULL,NOW(),NOW()),
+	(28,'nameserver_3',NULL,0,NULL,NULL,NOW(),NOW()),
+	(29,'nameserver_4',NULL,0,NULL,NULL,NOW(),NOW()),
+	(30,'funds_min_amount','10',0,NULL,NULL,NOW(),NOW()),
+	(31,'funds_max_amount','200',0,NULL,NULL,NOW(),NOW()),
+	(32,'company_favicon','public/branding/favicon.svg',0,NULL,NULL,NOW(),NOW()),
+	(33,'hide_company_public','1',0,NULL,NULL,NOW(),NOW()),
+	(34,'invoice_hash_lifetime_days','90',0,NULL,NULL,NOW(),NOW());
 
 /*!40000 ALTER TABLE `setting` ENABLE KEYS */;
 UNLOCK TABLES;
@@ -357,6 +359,26 @@ VALUES
 	(1,'General','info@yourcompany.com',24,0,'Always a pleasure to help. Wishing you a great day!',NOW(),NOW());
 
 /*!40000 ALTER TABLE `support_helpdesk` ENABLE KEYS */;
+UNLOCK TABLES;
+
+
+# Dump of table support_pr_category
+# ------------------------------------------------------------
+
+LOCK TABLES `support_pr_category` WRITE;
+/*!40000 ALTER TABLE `support_pr_category` DISABLE KEYS */;
+
+INSERT INTO `support_pr_category` (`id`, `title`, `created_at`, `updated_at`)
+VALUES
+	(1, 'Greetings', NOW(), NOW()),
+	(2, 'General Support', NOW(), NOW()),
+	(3, 'Billing & Payments', NOW(), NOW()),
+	(4, 'Account Management', NOW(), NOW()),
+	(5, 'Technical Issues', NOW(), NOW()),
+	(6, 'Notices & Maintenance', NOW(), NOW()),
+	(7, 'Domain & SSL', NOW(), NOW());
+
+/*!40000 ALTER TABLE `support_pr_category` ENABLE KEYS */;
 UNLOCK TABLES;
 
 
@@ -390,26 +412,6 @@ VALUES
 UNLOCK TABLES;
 
 
-# Dump of table support_pr_category
-# ------------------------------------------------------------
-
-LOCK TABLES `support_pr_category` WRITE;
-/*!40000 ALTER TABLE `support_pr_category` DISABLE KEYS */;
-
-INSERT INTO `support_pr_category` (`id`, `title`, `created_at`, `updated_at`)
-VALUES
-	(1, 'Greetings', NOW(), NOW()),
-	(2, 'General Support', NOW(), NOW()),
-	(3, 'Billing & Payments', NOW(), NOW()),
-	(4, 'Account Management', NOW(), NOW()),
-	(5, 'Technical Issues', NOW(), NOW()),
-	(6, 'Notices & Maintenance', NOW(), NOW()),
-	(7, 'Domain & SSL', NOW(), NOW());
-
-/*!40000 ALTER TABLE `support_pr_category` ENABLE KEYS */;
-UNLOCK TABLES;
-
-
 # Dump of table support_ticket
 # ------------------------------------------------------------
 
@@ -430,20 +432,6 @@ UNLOCK TABLES;
 
 
 
-# Dump of table tld
-# ------------------------------------------------------------
-
-LOCK TABLES `tld` WRITE;
-/*!40000 ALTER TABLE `tld` DISABLE KEYS */;
-
-INSERT INTO `tld` (`id`, `tld_registrar_id`, `tld`, `price_registration`, `price_renew`, `price_transfer`, `allow_register`, `allow_transfer`, `active`, `min_years`, `created_at`, `updated_at`)
-VALUES
-	(1,1,'.com',11.99,11.99,11.99,1,1,1,1,NOW(),NOW());
-
-/*!40000 ALTER TABLE `tld` ENABLE KEYS */;
-UNLOCK TABLES;
-
-
 # Dump of table tld_registrar
 # ------------------------------------------------------------
 
@@ -457,6 +445,20 @@ VALUES
 	(3,'Internet.bs','Internetbs',0,NULL);
 
 /*!40000 ALTER TABLE `tld_registrar` ENABLE KEYS */;
+UNLOCK TABLES;
+
+
+# Dump of table tld
+# ------------------------------------------------------------
+
+LOCK TABLES `tld` WRITE;
+/*!40000 ALTER TABLE `tld` DISABLE KEYS */;
+
+INSERT INTO `tld` (`id`, `tld_registrar_id`, `tld`, `price_registration`, `price_renew`, `price_transfer`, `allow_register`, `allow_transfer`, `active`, `min_years`, `created_at`, `updated_at`)
+VALUES
+	(1,1,'.com',11.99,11.99,11.99,1,1,1,1,NOW(),NOW());
+
+/*!40000 ALTER TABLE `tld` ENABLE KEYS */;
 UNLOCK TABLES;
 
 

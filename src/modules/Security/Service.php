@@ -11,10 +11,11 @@ declare(strict_types=1);
 
 namespace Box\Mod\Security;
 
-use FOSSBilling\GeoIP\IncompleteRecord;
-use FOSSBilling\GeoIP\Reader;
-use FOSSBilling\InformationException;
-use FOSSBilling\Interfaces\SecurityCheckInterface;
+use FOSSBilling\Core\Exception\InformationException;
+use FOSSBilling\Core\GeoIP\IncompleteRecord;
+use FOSSBilling\Core\GeoIP\Reader;
+use FOSSBilling\Core\Security\CheckInterface;
+use FOSSBilling\Core\SortOptions;
 use Symfony\Component\Filesystem\Path;
 use Symfony\Component\Finder\Finder;
 
@@ -56,7 +57,7 @@ class Service
     /**
      * Returns a list of all security checks.
      *
-     * @return SecurityCheckInterface[]
+     * @return CheckInterface[]
      */
     public function getAllChecks(): array
     {
@@ -75,10 +76,10 @@ class Service
             if (method_exists($newCheck, 'setDi')) {
                 $newCheck->setDi($this->di);
             }
-            if ($newCheck instanceof SecurityCheckInterface) {
+            if ($newCheck instanceof CheckInterface) {
                 $checks[$checkID] = $newCheck;
             } else {
-                error_log("{$className} does not implement the SecurityCheckInterface interface.");
+                $this->di['logger']->withChannel('security')->error("{$className} does not implement the CheckInterface interface.");
             }
         }
 
@@ -125,7 +126,7 @@ class Service
         if (method_exists($check, 'setDi')) {
             $check->setDi($this->di);
         }
-        if (!$check instanceof SecurityCheckInterface) {
+        if (!$check instanceof CheckInterface) {
             throw new InformationException('The check :checkName: does not seem to be a valid check.', [':checkName:' => $checkID]);
         }
 
@@ -195,11 +196,43 @@ class Service
         ));
     }
 
+    /**
+     * Sort rate limiter counters by an allowlisted key (ip, policy,
+     * retry_after, last_seen). Unknown sort keys keep the default
+     * ip/policy ordering produced by the rate limiter.
+     */
+    public function sortRateLimitCounters(array $counters, array $data): array
+    {
+        $sort = SortOptions::fromArray($data, [
+            'ip' => 'ip',
+            'policy' => 'policy',
+            'retry_after' => 'retry_after',
+            'last_seen' => 'last_seen',
+        ]);
+
+        if (!$sort->isSorted()) {
+            return $counters;
+        }
+
+        $key = $sort->expression;
+        $direction = $sort->direction;
+        usort($counters, static function (array $a, array $b) use ($key, $direction): int {
+            $comparison = ((string) ($a[$key] ?? '')) <=> ((string) ($b[$key] ?? ''));
+            if ($comparison === 0) {
+                $comparison = [$a['ip'] ?? '', $a['policy'] ?? ''] <=> [$b['ip'] ?? '', $b['policy'] ?? ''];
+            }
+
+            return $direction === \SortDirection::Descending ? -$comparison : $comparison;
+        });
+
+        return $counters;
+    }
+
     public function resetRateLimitIp(string $ip, ?string $policy = null): array
     {
         $removed = $this->di['rate_limiter']->resetIp($ip, $policy);
 
-        $this->di['logger']->setChannel('security')->info('Rate limiter counters reset for IP %s%s', $ip, $policy ? " and policy {$policy}" : '');
+        $this->di['logger']->withChannel('security')->info('Rate limiter counters reset for IP {ip}{policy}', ['ip' => $ip, 'policy' => $policy ? " and policy {$policy}" : '']);
 
         return [
             'ip' => $ip,
@@ -212,7 +245,7 @@ class Service
     {
         $cleared = $this->di['rate_limiter']->resetAll();
 
-        $this->di['logger']->setChannel('security')->warning('All rate limiter counters were reset');
+        $this->di['logger']->withChannel('security')->warning('All rate limiter counters were reset');
 
         return [
             'cleared' => $cleared,

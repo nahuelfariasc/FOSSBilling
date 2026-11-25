@@ -2,19 +2,18 @@
 
 declare(strict_types=1);
 /**
- * Copyright 2022-2025 FOSSBilling
+ * Copyright 2022-2026 FOSSBilling
  * SPDX-License-Identifier: Apache-2.0.
  *
  * @copyright FOSSBilling (https://www.fossbilling.org)
  * @license http://www.apache.org/licenses/LICENSE-2.0 Apache-2.0
  */
 
-use FOSSBilling\Config;
-use FOSSBilling\Environment;
-use FOSSBilling\Http\ExceptionResponseFactory;
-use FOSSBilling\Http\RequestFactory;
-use FOSSBilling\SentryHelper;
-use FOSSBilling\Tools;
+use FOSSBilling\Core\Http\ExceptionResponseFactory;
+use FOSSBilling\Core\Http\RequestFactory;
+use FOSSBilling\Core\SentryHelper;
+use FOSSBilling\Core\System\Config;
+use FOSSBilling\Core\System\Environment;
 use Symfony\Component\Filesystem\Filesystem;
 use Symfony\Component\Filesystem\Path;
 use Symfony\Component\HttpFoundation\RedirectResponse;
@@ -29,7 +28,12 @@ function emitResponse(Response $response): never
 
 function sendResponse(Response $response): void
 {
-    global $request;
+    global $request, $di;
+
+    // Queued cookies (session rotation, locale detection) must ride every emission path, including error responses.
+    if (isset($di) && $di instanceof Pimple\Container) {
+        $di['cookie_queue']->applyToResponse($response);
+    }
 
     $currentRequest = $request instanceof Request ? $request : Request::createFromGlobals();
     $response->prepare($currentRequest)->send();
@@ -47,17 +51,10 @@ function checkInstaller(): void
         return;
     }
 
-    // Check if /install directory still exists after installation has been completed.
-    if ($filesystem->exists(PATH_CONFIG) && $filesystem->exists(Path::join('install', 'install.php'))) {
-        // Throw exception only if debug mode is NOT enabled.
-        if (!empty(Config::getProperty('debug_and_monitoring.debug'))) {
-            throw new Exception('For security reasons, you have to delete the install directory before you can use FOSSBilling.', 2);
-        }
-    }
-
-    // If the config file exists and not install.php, but the install folder does, perform some cleanup.
-    // @phpstan-ignore booleanNot.alwaysTrue (DEBUG is a runtime constant)
-    if ($filesystem->exists(PATH_CONFIG) && $filesystem->exists(Path::normalize('install')) && !DEBUG) {
+    // If the config file and install directory both exist, installation has completed.
+    if ($filesystem->exists(PATH_CONFIG) && $filesystem->exists(Path::normalize('install'))) {
+        // Bootstrap runs before the DI logger and PHP error log are configured.
+        error_log('Removing the install directory now that installation is complete.');
         $filesystem->remove('install');
     }
 }
@@ -93,34 +90,83 @@ function checkWebServer(): void
 }
 
 /*
+ * Builds a raw PDO DSN (and credentials) to probe the configured database, before Doctrine/the
+ * DI container is available. Returns null when the driver isn't one we can probe, or required
+ * config is missing, so the caller can fall back to "assume tables exist".
+ */
+function buildDatabaseProbeDsn(string $driver, array $dbConfig): ?array
+{
+    if ($driver === 'pdo_sqlite') {
+        $path = $dbConfig['path'] ?? $dbConfig['name'] ?? '';
+
+        return $path === '' ? null : ['sqlite:' . $path, null, null];
+    }
+
+    $host = $dbConfig['host'] ?? '';
+    $database = $dbConfig['name'] ?? '';
+    if ($host === '' || $database === '') {
+        return null;
+    }
+
+    return match ($driver) {
+        'pdo_mysql' => [
+            sprintf('mysql:host=%s;port=%s;dbname=%s;charset=utf8mb4', $host, FOSSBilling\Core\Utils\Normalizer::normalizePort($dbConfig['port'] ?? null, 3306), $database),
+            $dbConfig['user'] ?? '',
+            $dbConfig['password'] ?? '',
+        ],
+        'pdo_pgsql' => [
+            sprintf('pgsql:host=%s;port=%s;dbname=%s', $host, FOSSBilling\Core\Utils\Normalizer::normalizePort($dbConfig['port'] ?? null, 5432), $database),
+            $dbConfig['user'] ?? '',
+            $dbConfig['password'] ?? '',
+        ],
+        default => null,
+    };
+}
+
+/*
  * Check whether the configured database has existing tables.
  */
 function hasDatabaseTables(): bool
 {
     $dbConfig = Config::getProperty('db', []);
-    if (!is_array($dbConfig) || ($dbConfig['driver'] ?? '') !== 'pdo_mysql') {
+    $driver = is_array($dbConfig) ? ($dbConfig['driver'] ?? '') : '';
+    if (!is_array($dbConfig) || !in_array($driver, ['pdo_mysql', 'pdo_pgsql', 'pdo_sqlite'], true)) {
         return true;
     }
 
-    $host = $dbConfig['host'] ?? '';
-    $database = $dbConfig['name'] ?? '';
-    $port = Tools::normalizePort($dbConfig['port'] ?? null, 3306);
-    if ($host === '' || $database === '') {
+    // A SQLite database that doesn't exist on disk yet unambiguously has no tables. An in-memory
+    // SQLite database (never written by the installer's own SQLite config output, but a real,
+    // documented config.php option - see config-sample.php) is the same case: it's always empty
+    // on every process start, so it can never be "already installed" either. Handled explicitly
+    // here rather than falling through to buildDatabaseProbeDsn(), which returns null for both
+    // (no path to probe) - null is elsewhere treated as "assume already installed", the opposite
+    // of what's actually true for either of these.
+    if ($driver === 'pdo_sqlite' && !empty($dbConfig['memory'])) {
+        return false;
+    }
+    if ($driver === 'pdo_sqlite' && !empty($dbConfig['path']) && !is_file($dbConfig['path'])) {
+        return false;
+    }
+
+    $probe = buildDatabaseProbeDsn($driver, $dbConfig);
+    if ($probe === null) {
         return true;
     }
+    [$dsn, $user, $password] = $probe;
 
     try {
-        $pdo = new PDO(
-            sprintf('mysql:host=%s;port=%s;dbname=%s;charset=utf8mb4', $host, $port, $database),
-            $dbConfig['user'] ?? '',
-            $dbConfig['password'] ?? '',
-            [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION],
-        );
-        $statement = $pdo->query('SHOW TABLES');
+        $pdo = new PDO($dsn, $user, $password, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        $tableListQuery = match ($driver) {
+            'pdo_mysql' => 'SHOW TABLES',
+            'pdo_pgsql' => "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
+            'pdo_sqlite' => "SELECT name FROM sqlite_master WHERE type = 'table'",
+        };
+        $statement = $pdo->query($tableListQuery);
 
         return $statement !== false && $statement->fetchColumn() !== false;
     } catch (Throwable $e) {
         if ((bool) Config::getProperty('debug', false)) {
+            // Database inspection happens before the DI container is available.
             error_log(sprintf(
                 'hasDatabaseTables() failed to inspect configured database tables: %s in %s on line %d',
                 $e->getMessage(),
@@ -158,10 +204,82 @@ function exceptionHandler(Exception|Error $e): void
         @file_put_contents(Path::join(PATH_LOG, 'exception_handler.log'), date('c') . ' ' . $msg, FILE_APPEND);
         @file_put_contents(Path::join(PATH_ROOT, 'data', 'log', 'exception_handler.log'), date('c') . ' ' . $msg, FILE_APPEND);
     } else {
+        // The exception handler must also work when initialization itself fails.
         error_log("{$e->getMessage()} at {$e->getFile()} : {$e->getLine()}");
     }
 
     emitResponse($exceptionResponseFactory->create($e));
+}
+
+/*
+ * Refuse to serve this request while FOSSBilling\Core\Update\Updater::performUpdate() is
+ * actively writing files to PATH_ROOT.
+ *
+ * This intentionally runs before the Composer autoloader is loaded, and
+ * before any FOSSBilling class is referenced: while a core update is
+ * extracting a release archive on top of the live codebase, a concurrent
+ * request that starts autoloading classes mid-swap can see a torn mix of old
+ * and new files and fatal out with an "incompatible declaration" error.
+ * See https://github.com/FOSSBilling/FOSSBilling/issues/4159.
+ *
+ * The lock filename below is duplicated as a literal (see
+ * Update::LOCK_FILENAME) because this check has to run before that class -
+ * or anything else - can be autoloaded. Keep both copies in sync if it
+ * changes. A live writer holds an advisory lock regardless of duration.
+ * Unlocked markers left by older updaters or killed processes expire after
+ * 600 seconds. performUpdate() removes its marker in a finally block.
+ */
+function isCoreUpdateLockActive(?int $now = null): bool
+{
+    // Unlike the transient writer marker, this never expires: extracted files
+    // may be mixed until a complete verified release has been restored.
+    if (file_exists(PATH_ROOT . '/.update-extraction-pending')) {
+        return true;
+    }
+
+    $path = PATH_ROOT . DIRECTORY_SEPARATOR . '.update-lock';
+    $mtime = @filemtime($path);
+    $handle = @fopen($path, 'r');
+    if ($handle !== false) {
+        try {
+            if (!flock($handle, LOCK_SH | LOCK_NB)) {
+                return true;
+            }
+            flock($handle, LOCK_UN);
+        } finally {
+            fclose($handle);
+        }
+    }
+    $now ??= time();
+
+    // A marker with no live owner retains the legacy recovery window.
+    return $mtime !== false && ($now - $mtime) <= 600;
+}
+
+function blockWhileCoreUpdateIsRunning(bool $runtimeBusy = false): void
+{
+    if (!$runtimeBusy && !isCoreUpdateLockActive()) {
+        return;
+    }
+
+    $recovery = file_exists(PATH_ROOT . '/.update-extraction-pending')
+        ? ' Update extraction has not completed. If the updater has stopped, restore a complete verified release before clearing .update-extraction-pending.' : '';
+    if (PHP_SAPI === 'cli') {
+        fwrite(STDERR, 'FOSSBilling is currently applying a core update. Please try again in a few moments.' . $recovery . "\n");
+        exit(1);
+    }
+
+    http_response_code(503);
+    header('Retry-After: 5');
+    header('Content-Type: text/html; charset=utf-8');
+    echo '<!doctype html><html><head><meta charset="utf-8"><title>Updating&hellip;</title></head>'
+        . '<body style="font-family:sans-serif;text-align:center;padding:4rem 1rem;">'
+        . '<h1>FOSSBilling is updating</h1>'
+        . '<p>This installation is being updated and will be back in a moment. This page will retry automatically.</p>'
+        . ($recovery !== '' ? '<p>' . $recovery . '</p>' : '')
+        . '<script>setTimeout(function () { location.reload(); }, 5000);</script>'
+        . '</body></html>';
+    exit;
 }
 
 /*
@@ -172,6 +290,31 @@ function preInit(): void
     // Define root path.
     define('PATH_ROOT', __DIR__);
 
+    blockWhileCoreUpdateIsRunning();
+    // Lock before loading even the helper: an update may replace its API too.
+    // Keep this bootstrap-safe literal in sync with RuntimeLock::FILENAME.
+    $bootstrapLock = null;
+    if (getenv('APP_ENV') !== 'test') {
+        $bootstrapLock = @fopen(PATH_ROOT . '/data/uploads/.update-runtime.lock', 'c');
+        if ($bootstrapLock === false) {
+            throw new RuntimeException('Unable to acquire the application update lock.');
+        }
+        if (!flock($bootstrapLock, LOCK_SH | LOCK_NB, $wouldBlock)) {
+            if ($wouldBlock) {
+                // Retry from a fresh bootstrap after extraction, rather than
+                // resuming functions compiled from the previous release.
+                blockWhileCoreUpdateIsRunning(true);
+            }
+
+            throw new RuntimeException('Unable to acquire the application update lock.');
+        }
+        blockWhileCoreUpdateIsRunning();
+    }
+    require_once PATH_ROOT . '/core/Update/RuntimeLock.php';
+    if (is_resource($bootstrapLock)) {
+        FOSSBilling\Core\Update\RuntimeLock::acquire(PATH_ROOT, $bootstrapLock);
+    }
+
     // Check vendor folder exists and load Composer autoloader.
     define('PATH_VENDOR', PATH_ROOT . DIRECTORY_SEPARATOR . 'vendor');
     if (!file_exists(PATH_VENDOR)) {
@@ -181,32 +324,31 @@ function preInit(): void
 
     // Define global paths.
     define('PATH_LIBRARY', Path::join(PATH_ROOT, 'library'));
+    require Path::join(PATH_LIBRARY, 'TranslationFunctions.php');
+    define('PATH_CORE', Path::join(PATH_ROOT, 'core'));
     define('PATH_THEMES', Path::join(PATH_ROOT, 'themes'));
     define('PATH_MODS', Path::join(PATH_ROOT, 'modules'));
     define('PATH_LANGS', Path::join(PATH_ROOT, 'locale'));
     $pathUploads = Path::join(PATH_ROOT, 'data', 'uploads');
     if (getenv('APP_ENV') === 'test') {
         $pathUploads = Path::join(sys_get_temp_dir(), 'fossbilling_test_data', 'uploads');
-        if (!is_dir($pathUploads) && !mkdir($pathUploads, 0o755, true) && !is_dir($pathUploads)) {
-            throw new Exception(sprintf('Unable to create uploads directory for tests: "%s".', $pathUploads));
-        }
+        (new Filesystem())->mkdir($pathUploads, 0o755);
     }
     define('PATH_UPLOADS', $pathUploads);
     define('PATH_CONFIG', Path::join(PATH_ROOT, 'config.php'));
 
     // Load required FOSSBilling libraries.
-    require Path::join(PATH_LIBRARY, 'FOSSBilling', 'ErrorPage.php');
-    require Path::join(PATH_LIBRARY, 'FOSSBilling', 'SentryHelper.php');
-    require Path::join(PATH_LIBRARY, 'FOSSBilling', 'Environment.php');
-    require Path::join(PATH_LIBRARY, 'FOSSBilling', 'Http', 'ApiResponseFactory.php');
-    require Path::join(PATH_LIBRARY, 'FOSSBilling', 'Http', 'ExceptionResponseFactory.php');
-    require Path::join(PATH_LIBRARY, 'FOSSBilling', 'Http', 'RequestFactory.php');
-    require Path::join(PATH_LIBRARY, 'FOSSBilling', 'Http', 'ResponseFactory.php');
-    require Path::join(PATH_LIBRARY, 'FOSSBilling', 'Http', 'RouteDefinition.php');
-    require Path::join(PATH_LIBRARY, 'FOSSBilling', 'Http', 'RouteMatch.php');
-    require Path::join(PATH_LIBRARY, 'FOSSBilling', 'Http', 'RouteMatcher.php');
-    require Path::join(PATH_LIBRARY, 'FOSSBilling', 'Config.php');
-    require Path::join(PATH_LIBRARY, 'FOSSBilling', 'Tools.php');
+    require Path::join(PATH_CORE, 'Http', 'ErrorPage.php');
+    require Path::join(PATH_CORE, 'SentryHelper.php');
+    require Path::join(PATH_CORE, 'System', 'Environment.php');
+    require Path::join(PATH_CORE, 'Http', 'ApiResponseFactory.php');
+    require Path::join(PATH_CORE, 'Http', 'ExceptionResponseFactory.php');
+    require Path::join(PATH_CORE, 'Http', 'RequestFactory.php');
+    require Path::join(PATH_CORE, 'Http', 'ResponseFactory.php');
+    require Path::join(PATH_CORE, 'Http', 'RouteDefinition.php');
+    require Path::join(PATH_CORE, 'Http', 'RouteMatch.php');
+    require Path::join(PATH_CORE, 'Http', 'RouteMatcher.php');
+    require Path::join(PATH_CORE, 'System', 'Config.php');
 }
 
 /*
@@ -267,14 +409,15 @@ function init(): void
     define('SYSTEM_URL', $scheme . $url);
 
     // Set the default interface.
-    define('BIND_TO', Tools::getDefaultInterface());
+    define('BIND_TO', FOSSBilling\Core\Utils\Network::getDefaultInterface());
 
     // Load the DI container.
     global $di;
     $di = require Path::join(PATH_ROOT, 'di.php');
 
     if (!Environment::isCLI() && !Environment::isTesting()) {
-        $di['update_finalization']->ensureCurrentVersionFinalization();
+        $di['update_finalization']->finalizePendingUpdate();
+        $di['update_finalization']->acquireRuntimeLock();
     }
 
     // Now that the config file is loaded, we can enable Sentry.

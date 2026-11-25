@@ -9,16 +9,56 @@ declare(strict_types=1);
  * @license http://www.apache.org/licenses/LICENSE-2.0 Apache-2.0
  */
 
+use Box\Mod\Client\Entity\Client;
+use Box\Mod\Invoice\Entity\Invoice;
+use Box\Mod\Invoice\Entity\PayGateway;
+use Box\Mod\Invoice\Entity\PayGatewayCustomer;
+use Box\Mod\Invoice\Entity\PayGatewayProduct;
 use Box\Mod\Invoice\Entity\Subscription;
 use Box\Mod\Invoice\Entity\Transaction;
+use Box\Mod\Invoice\Exception\RetryableCallbackException;
+use Doctrine\DBAL\Exception\UniqueConstraintViolationException;
+use FOSSBilling\Core\Doctrine\DriverManagerFactory;
+use FOSSBilling\Core\Doctrine\EntityManagerFactory;
+use FOSSBilling\Core\Doctrine\NamedLock;
+use FOSSBilling\Core\Period;
 use Stripe\StripeClient;
-use Symfony\Component\Intl\Currencies;
 
-class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
+class Payment_Adapter_Stripe implements FOSSBilling\Core\Container\InjectionAwareInterface, FOSSBilling\Core\Payment\JsonWebhookAuthenticatorInterface
 {
+    /** The bank debit clients can save for each currency, besides cards (Stripe needs it on in the dashboard). */
+    private const array BANK_DEBITS = ['aud' => 'au_becs_debit', 'eur' => 'sepa_debit', 'gbp' => 'bacs_debit'];
+
+    /**
+     * Stripe's zero-decimal currencies for charges (https://docs.stripe.com/currencies).
+     * UGX is on Stripe's published zero-decimal list, but its special-case row requires charge amounts ×100,
+     * so it is deliberately excluded here. ISK was never on the list and likewise uses two decimals for
+     * charges; HUF and TWD are zero-decimal for payouts only, so they stay ×100 here. This helper is
+     * charge-side only (PaymentIntents, Prices) and must not be reused for payouts.
+     */
+    private const array STRIPE_ZERO_DECIMAL_CHARGE_CURRENCIES = ['BIF', 'CLP', 'DJF', 'GNF', 'JPY', 'KMF', 'KRW', 'MGA', 'PYG', 'RWF', 'VND', 'VUV', 'XAF', 'XOF', 'XPF'];
+
+    /**
+     * Stripe's three-decimal currencies for charges (https://docs.stripe.com/currencies).
+     */
+    private const array STRIPE_THREE_DECIMAL_CURRENCIES = ['BHD', 'JOD', 'KWD', 'OMR', 'TND'];
+
     protected ?Pimple\Container $di = null;
 
     private StripeClient $stripe;
+
+    /**
+     * Overrides how newIsolatedEntityManager() obtains its EntityManager -
+     * null in production. Tests substitute a mock via reflection instead of
+     * exercising the real factory.
+     */
+    /** @phpstan-ignore property.unusedType (only ever set via reflection, from tests) */
+    private ?Closure $entityManagerFactory = null;
+
+    /**
+     * Memoized isolated EntityManager - see newIsolatedEntityManager().
+     */
+    private ?Doctrine\ORM\EntityManagerInterface $isolatedEntityManager = null;
 
     /**
      * Stripe webhook event types that this adapter processes.
@@ -31,13 +71,13 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
         'customer.subscription.deleted',
         'invoice.payment_succeeded',
         'invoice.paid',
-        'invoice.payment_failed',
         'invoice_payment.paid',
-        'invoice_payment.failed',
         'payment_intent.succeeded',
         'payment_intent.payment_failed',
         'setup_intent.succeeded',
         'setup_intent.setup_failed',
+        'charge.refunded',
+        'refund.created',
     ];
 
     public function setDi(Pimple\Container $di): void
@@ -48,6 +88,51 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
     public function getDi(): ?Pimple\Container
     {
         return $this->di;
+    }
+
+    public static function requiresManualApproval(): bool
+    {
+        return false;
+    }
+
+    /**
+     * Building this opens a genuinely separate database connection - see
+     * cacheGatewayCustomer() for why isolation from $this->di['em'] is
+     * needed. DriverManagerFactory only isolates callers that ask for their
+     * own connection via getConnection(), rather than the process-wide
+     * shared one every other caller reuses via getSharedConnection().
+     *
+     * Memoized per adapter instance (one request each) so that resolving
+     * both a customer and a product/price on the same checkout - the common
+     * case for a client's first invoice - doesn't pay for that connection,
+     * and EntityManagerFactory::create()'s metadata/cache bootstrap, twice.
+     * A flush() that hits a unique constraint violation leaves Doctrine's
+     * EntityManager closed (it does this itself, regardless of what callers
+     * do), so the memoized instance is discarded and rebuilt once that
+     * happens rather than reused into an unusable state.
+     */
+    private function newIsolatedEntityManager(): Doctrine\ORM\EntityManagerInterface
+    {
+        if ($this->entityManagerFactory === null && FOSSBilling\Core\Payment\ProcessingFence::claims() !== []
+            && $this->di['em']->getConnection()->isTransactionActive()) {
+            // A second session would wait on this session's own fence row lock.
+            return EntityManagerFactory::create($this->di['em']->getConnection());
+        }
+        if ($this->isolatedEntityManager !== null && $this->isolatedEntityManager->isOpen()) {
+            return $this->isolatedEntityManager;
+        }
+
+        return $this->isolatedEntityManager = $this->entityManagerFactory !== null
+            ? ($this->entityManagerFactory)()
+            : EntityManagerFactory::create(DriverManagerFactory::getConnection());
+    }
+
+    private function debugLog(string $message): void
+    {
+        // @phpstan-ignore if.alwaysFalse (DEBUG is a runtime constant that may be true during debugging)
+        if (DEBUG) {
+            $this->di['logger']->debug($message);
+        }
     }
 
     public function __construct(private $config)
@@ -92,15 +177,17 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
                     ],
                 ],
                 'api_key' => [
-                    'text', [
+                    'password', [
                         'label' => 'Live Secret Key:',
                         'required_when' => ['enabled' => true, 'test_mode' => false],
+                        'secret' => true,
                     ],
                 ],
                 'webhook_secret' => [
-                    'text', [
+                    'password', [
                         'label' => 'Live Webhook signing secret:',
                         'required_when' => ['enabled' => true, 'test_mode' => false],
+                        'secret' => true,
                     ],
                 ],
                 'test_pub_key' => [
@@ -110,30 +197,54 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
                     ],
                 ],
                 'test_api_key' => [
-                    'text', [
+                    'password', [
                         'label' => 'Test Secret Key:',
                         'required_when' => ['enabled' => true, 'test_mode' => true],
+                        'secret' => true,
                     ],
                 ],
                 'test_webhook_secret' => [
-                    'text', [
+                    'password', [
                         'label' => 'Test Webhook signing secret:',
                         'required_when' => ['enabled' => true, 'test_mode' => true],
+                        'secret' => true,
+                    ],
+                ],
+                'bank_debits' => [
+                    'radio', [
+                        'label' => 'Saved bank accounts:',
+                        'description' => 'Besides cards, clients can save a bank account for automatic payments: BECS Direct Debit for AUD, SEPA Direct Debit for EUR and Bacs Direct Debit for GBP. Turn the method on in your Stripe dashboard first. A bank payment takes a few days to clear: meanwhile the invoice shows "Payment pending".',
+                        'multiOptions' => ['1' => __trans('On'), '0' => __trans('Off')],
                     ],
                 ],
             ],
         ];
     }
 
-    public function getHtml(FOSSBilling\Api\Proxy $api_admin, int $invoice_id, bool $subscription): string
+    public function getHtml(FOSSBilling\Core\Api\Proxy $api_admin, int $invoice_id, bool $subscription): string
     {
-        $invoiceModel = $this->di['db']->load('Invoice', $invoice_id);
+        $invoiceModel = $this->di['em']->getRepository(Invoice::class)->find($invoice_id);
+        if (!$invoiceModel instanceof Invoice) {
+            throw new FOSSBilling\Core\Exception\BaseException('Invoice not found');
+        }
 
         if ($subscription) {
             return $this->_generateSubscriptionForm($invoiceModel);
         }
 
         return $this->_generateForm($invoiceModel);
+    }
+
+    /**
+     * Encode a value as a JS string literal for the inline checkout forms.
+     * The HEX flags keep it safe inside a <script> block (including
+     * `</script>` breakouts) while preserving the exact value.
+     */
+    private static function encodeJsString(string $value): string
+    {
+        $encoded = json_encode($value, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP | JSON_UNESCAPED_UNICODE);
+
+        return is_string($encoded) ? $encoded : "''";
     }
 
     public function cancelSubscription(string $subscriptionId): void
@@ -156,18 +267,213 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
         $this->stripe->subscriptions->update($subscriptionId, ['cancel_at_period_end' => true]);
     }
 
-    public function getAmountInCents(Model_Invoice $invoice): int
+    public static function supportsRefunds(): bool
     {
-        return $this->getAmountInMinorUnits($invoice);
+        return true;
     }
 
-    public function getAmountInMinorUnits(Model_Invoice $invoice): int
+    /**
+     * Issue a refund in Stripe for a previous payment.
+     *
+     * @param string               $txnId    PaymentIntent (pi_), charge (ch_), or Stripe invoice (in_) ID
+     * @param float                $amount   Refund amount in major units
+     * @param string               $currency ISO currency code of the original payment
+     * @param array<string,string> $metadata Stamped onto the Stripe refund
+     *
+     * @return string The created Stripe refund ID (re_...)
+     */
+    public function refundPayment(string $txnId, float $amount, string $currency, array $metadata = []): string
     {
-        $invoiceService = $this->di['mod_service']('Invoice');
-        $amount = $invoiceService->getTotalWithTax($invoice);
-        $multiplier = 10 ** $this->getCurrencyFractionDigits($invoice->currency);
+        $txnId = trim($txnId);
+        if ($txnId === '') {
+            throw new Payment_Exception('Cannot issue a Stripe refund without the original Stripe transaction ID.');
+        }
 
-        return (int) round($amount * $multiplier);
+        $fractionDigits = $this->getCurrencyFractionDigits($currency);
+        $minorUnits = (int) round($amount * (10 ** $fractionDigits));
+        if ($minorUnits <= 0) {
+            throw new Payment_Exception('Refund amount must be greater than zero.');
+        }
+
+        $params = [
+            'amount' => $minorUnits,
+            'metadata' => array_map(strval(...), $metadata),
+            'reason' => 'requested_by_customer',
+        ];
+
+        $params += $this->resolveRefundTarget($txnId);
+
+        $idempotencyKey = 'refund_' . hash('sha256', implode('|', [$txnId, (string) $minorUnits, strtoupper($currency), json_encode($params['metadata'])]));
+
+        try {
+            $refund = $this->stripe->refunds->create($params, ['idempotency_key' => $idempotencyKey]);
+        } catch (Stripe\Exception\ApiErrorException $e) {
+            $this->debugLog('Stripe refund failed for ' . $txnId . ': ' . $e->getMessage());
+
+            throw new Payment_Exception('Stripe refund failed: :error', [':error' => $e->getMessage()]);
+        }
+
+        if (empty($refund->id)) {
+            throw new Payment_Exception('Stripe did not return a refund ID.');
+        }
+
+        return $refund->id;
+    }
+
+    /**
+     * List refunds Stripe holds against the same charge or payment intent.
+     * Used to spot money a previous FOSSBilling attempt already moved before
+     * its credit note was recorded, so a retry reuses it instead of refunding
+     * twice. Only actionable refunds (succeeded or pending) are returned.
+     *
+     * @return list<array{id: string, amount: float, invoice_id: ?string, lines: ?string}>
+     */
+    public function listRefundsForTransaction(string $txnId, string $currency): array
+    {
+        $filter = $this->resolveRefundTarget($txnId);
+        $filter['limit'] = 100;
+
+        $result = [];
+        $cursors = [];
+        while (true) {
+            try {
+                $refunds = $this->stripe->refunds->all($filter);
+            } catch (Stripe\Exception\ApiErrorException $e) {
+                throw new Payment_Exception('Could not list Stripe refunds: :error', [':error' => $e->getMessage()]);
+            }
+
+            $page = $refunds->data ?? [];
+            foreach ($page as $refund) {
+                if (in_array($refund->status ?? '', ['failed', 'canceled'], true)) {
+                    continue;
+                }
+                if (!is_string($refund->id ?? null) || $refund->id === '') {
+                    continue;
+                }
+                $lines = $refund->metadata->lines ?? null;
+                $result[] = [
+                    'id' => $refund->id,
+                    'amount' => $this->getAmountFromMinorUnits((int) ($refund->amount ?? 0), $currency),
+                    'invoice_id' => is_string($refund->metadata->invoice_id ?? null) ? $refund->metadata->invoice_id : null,
+                    'lines' => is_string($lines) && $lines !== '' ? $lines : null,
+                ];
+            }
+            if (!($refunds->has_more ?? false)) {
+                break;
+            }
+            $last = end($page);
+            $cursor = is_object($last) ? ($last->id ?? null) : null;
+            if (!is_string($cursor) || $cursor === '' || isset($cursors[$cursor])) {
+                throw new Payment_Exception('Could not list Stripe refunds: invalid pagination cursor.');
+            }
+            $cursors[$cursor] = true;
+            $filter['starting_after'] = $cursor;
+        }
+
+        return $result;
+    }
+
+    /**
+     * Map a stored transaction ID onto the charge or payment intent a Stripe
+     * refund must target.
+     *
+     * @return array{payment_intent?: string, charge?: string}
+     */
+    private function resolveRefundTarget(string $txnId): array
+    {
+        if (str_starts_with($txnId, 'pi_')) {
+            return ['payment_intent' => $txnId];
+        }
+        if (str_starts_with($txnId, 'ch_')) {
+            return ['charge' => $txnId];
+        }
+        if (str_starts_with($txnId, 'in_')) {
+            return $this->resolveRefundTargetForStripeInvoice($txnId);
+        }
+
+        throw new Payment_Exception('Stripe transaction :txn cannot be refunded automatically. Refund it in the Stripe dashboard instead.', [':txn' => $txnId]);
+    }
+
+    /**
+     * Resolve a Stripe invoice (in_...) to a charge/payment_intent refund target.
+     *
+     * @return array{payment_intent?: string, charge?: string}
+     */
+    private function resolveRefundTargetForStripeInvoice(string $stripeInvoiceId): array
+    {
+        try {
+            // Newer Stripe API versions only populate the payments list, so
+            // expand it; legacy payment_intent/charge fields are checked first
+            // for accounts that still return them.
+            $stripeInvoice = $this->stripe->invoices->retrieve($stripeInvoiceId, ['expand' => ['payments']]);
+        } catch (Stripe\Exception\ApiErrorException $e) {
+            throw new Payment_Exception('Could not load the Stripe invoice :invoice: :error', [':invoice' => $stripeInvoiceId, ':error' => $e->getMessage()]);
+        }
+
+        $candidates = [$stripeInvoice->payment_intent ?? null, $stripeInvoice->charge ?? null];
+        foreach ($stripeInvoice->payments->data ?? [] as $payment) {
+            // Entries that never completed carry no usable refund target, but
+            // entries without a status predate it, so only skip known misses.
+            $status = $payment->status ?? null;
+            if ($status !== null && $status !== 'paid') {
+                continue;
+            }
+            $nested = $payment->payment ?? null;
+            if (!is_object($nested)) {
+                continue;
+            }
+            // The payment reference is wrapped: the charge or payment intent
+            // sits under its own key, either as an ID or an expanded object.
+            foreach (['payment_intent', 'charge'] as $field) {
+                $ref = $nested->{$field} ?? null;
+                $candidates[] = is_object($ref) ? ($ref->id ?? null) : $ref;
+            }
+            // Fallback for a directly expanded payment object.
+            $candidates[] = $nested->id ?? null;
+        }
+        foreach ($candidates as $candidate) {
+            $target = $this->refundTargetFromId($candidate);
+            if ($target !== null) {
+                return $target;
+            }
+        }
+
+        throw new Payment_Exception('Stripe invoice :invoice has no refundable payment. Refund it in the Stripe dashboard instead.', [':invoice' => $stripeInvoiceId]);
+    }
+
+    /**
+     * Map a Stripe object ID onto the charge or payment intent a refund
+     * targets, using the ID prefix. Anything else (setup intents, invoice
+     * IDs) cannot be refunded directly.
+     *
+     * @return array{payment_intent?: string, charge?: string}|null
+     */
+    private function refundTargetFromId(mixed $candidate): ?array
+    {
+        if (!is_string($candidate) || $candidate === '') {
+            return null;
+        }
+        if (str_starts_with($candidate, 'pi_')) {
+            return ['payment_intent' => $candidate];
+        }
+        if (str_starts_with($candidate, 'ch_')) {
+            return ['charge' => $candidate];
+        }
+
+        return null;
+    }
+
+    // The subscription price: the full invoice total.
+    public function getAmountInCents(Invoice $invoice): int
+    {
+        return (int) round($this->di['mod_service']('Invoice')->getTotalWithTax($invoice) * 10 ** $this->getCurrencyFractionDigits((string) $invoice->getCurrency()));
+    }
+
+    // A one-time payment charges the balance due: received payments and
+    // applied credit are already on the invoice.
+    public function getAmountInMinorUnits(Invoice $invoice): int
+    {
+        return (int) round($this->di['mod_service']('Invoice')->getBalanceDue($invoice) * 10 ** $this->getCurrencyFractionDigits((string) $invoice->getCurrency()));
     }
 
     private function getAmountFromMinorUnits(int $amount, string $currency): float
@@ -177,28 +483,48 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
         return $amount / $divisor;
     }
 
+    /**
+     * Stripe's own decimal rules, not CLDR's: the currencies in STRIPE_ZERO_DECIMAL_CHARGE_CURRENCIES are sent
+     * as-is, the ones in STRIPE_THREE_DECIMAL_CURRENCIES keep three digits, and every other currency
+     * (including COP, HUF, IDR, ISK, PKR and UGX, which CLDR lists with no decimals) is sent ×100.
+     * See https://docs.stripe.com/currencies.
+     */
     private function getCurrencyFractionDigits(string $currency): int
     {
         $currency = strtoupper($currency);
+        if (in_array($currency, self::STRIPE_ZERO_DECIMAL_CHARGE_CURRENCIES, true)) {
+            return 0;
+        }
+        if (in_array($currency, self::STRIPE_THREE_DECIMAL_CURRENCIES, true)) {
+            return 3;
+        }
 
-        return Currencies::exists($currency) ? Currencies::getFractionDigits($currency) : 2;
+        return 2;
     }
 
-    public function getInvoiceTitle(Model_Invoice $invoice): string
+    public function getInvoiceTitle(Invoice $invoice): string
     {
-        $invoiceItems = $this->di['db']->getAll('SELECT title FROM invoice_item WHERE invoice_id = :invoice_id', [':invoice_id' => $invoice->id]);
+        $invoiceItems = $this->getInvoiceItemTitles($invoice);
 
         $params = [
-            ':id' => sprintf('%05s', $invoice->nr),
-            ':serie' => $invoice->serie,
+            ':id' => sprintf('%05s', $invoice->getNr()),
+            ':serie' => $invoice->getSerie(),
             ':title' => $invoiceItems[0]['title'] ?? '',
         ];
         $title = __trans('Payment for invoice :serie:id [:title]', $params);
-        if (FOSSBilling\Tools::safeCount($invoiceItems) > 1) {
+        if (FOSSBilling\Core\Utils\Arr::safeCount($invoiceItems) > 1) {
             $title = __trans('Payment for invoice :serie:id', $params);
         }
 
         return $title;
+    }
+
+    private function getInvoiceItemTitles(Invoice $invoice): array
+    {
+        return $this->di['em']->getConnection()->fetchAllAssociative(
+            'SELECT title FROM invoice_item WHERE invoice_id = :invoice_id',
+            ['invoice_id' => $invoice->getId()]
+        );
     }
 
     public function logError($e, Transaction $tx): void
@@ -208,22 +534,19 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
         $tx->setTxnStatus($err['type']);
         $tx->setError($err['message']);
         $tx->setStatus(Transaction::STATUS_ERROR);
-        $tx->setUpdatedAt(new DateTime());
+        $tx->setUpdatedAt(new DateTimeImmutable());
         $this->di['em']->flush();
 
-        // @phpstan-ignore if.alwaysFalse (DEBUG is a runtime constant that may be true during debugging)
-        if (DEBUG) {
-            error_log(json_encode($e->getJsonBody()));
-        }
+        $this->debugLog((string) json_encode($e->getJsonBody()));
 
         throw new Exception($tx->getError());
     }
 
-    public function processTransaction(FOSSBilling\Api\Proxy $api_admin, int $id, array $data, int $gateway_id): void
+    public function processTransaction(FOSSBilling\Core\Api\Proxy $api_admin, int $id, array $data, int $gateway_id): void
     {
         $tx = $this->di['em']->getRepository(Transaction::class)->find($id);
         if (!$tx instanceof Transaction) {
-            throw new FOSSBilling\Exception('Transaction not found');
+            throw new FOSSBilling\Core\Exception\BaseException('Transaction not found');
         }
 
         if ($this->isStripeWebhook($data)) {
@@ -234,6 +557,10 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
 
         $invoice = $this->resolveInvoice($tx, $data);
 
+        if (!isset($data['get']['payment_intent']) && !isset($data['get']['setup_intent'])) {
+            throw new Payment_Exception('Stripe payment data is missing.', [], 7020);
+        }
+
         try {
             if (isset($data['get']['payment_intent'])) {
                 $this->processPaymentIntent($tx, $invoice, $data);
@@ -243,18 +570,22 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
         } catch (Stripe\Exception\CardException|Stripe\Exception\InvalidRequestException|Stripe\Exception\AuthenticationException|Stripe\Exception\ApiConnectionException|Stripe\Exception\ApiErrorException $e) {
             $this->logError($e, $tx);
 
-            throw new FOSSBilling\Exception('There was an error when processing the transaction');
+            throw new FOSSBilling\Core\Exception\BaseException('There was an error when processing the transaction');
         }
     }
 
-    private function resolveInvoice(Transaction $tx, array $data): ?Model_Invoice
+    private function resolveInvoice(Transaction $tx, array $data): ?Invoice
     {
-        if ($tx->getInvoiceId()) {
-            return $this->di['db']->getExistingModelById('Invoice', $tx->getInvoiceId());
+        if ($tx->getInvoice()) {
+            return $tx->getInvoice();
         }
         if (isset($data['get']['invoice_id']) && $data['get']['invoice_id']) {
-            $invoice = $this->di['db']->getExistingModelById('Invoice', $data['get']['invoice_id']);
-            $tx->setInvoiceId((int) $invoice->id);
+            $invoice = $this->di['em']->getRepository(Invoice::class)->find((int) $data['get']['invoice_id']);
+            if (!$invoice instanceof Invoice) {
+                return null;
+            }
+
+            $tx->setInvoice($invoice);
 
             return $invoice;
         }
@@ -274,21 +605,66 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
         return is_array($payload) && isset($payload['type']);
     }
 
-    private function processPaymentIntent(Transaction $tx, ?Model_Invoice $invoice, array $data): void
+    /** Read-only recovery lookup. Never creates, confirms, or cancels a payment. */
+    public function inspectPayment(string $reference, int $invoiceId): array
+    {
+        if (!str_starts_with($reference, 'pi_')) {
+            return ['state' => 'unknown', 'reference' => $reference];
+        }
+        $intent = $this->stripe->paymentIntents->retrieve($reference, []);
+        if ($intent->id !== $reference || (string) ($intent->metadata->invoice_id ?? '') !== (string) $invoiceId
+            || (string) ($intent->metadata->gateway_id ?? '') !== (string) $this->gatewayId()) {
+            throw new Payment_Exception('Payment does not belong to this invoice and gateway');
+        }
+
+        return [
+            'state' => match ($intent->status) {
+                'succeeded' => 'settled',
+                'processing' => 'pending',
+                'canceled', 'requires_payment_method' => 'failed',
+                default => 'unknown',
+            },
+            'reference' => $reference, 'provider_status' => $intent->status,
+            'amount' => $this->getAmountFromMinorUnits($intent->amount, $intent->currency),
+            'currency' => strtoupper($intent->currency),
+        ];
+    }
+
+    private function processPaymentIntent(Transaction $tx, ?Invoice $invoice, array $data): void
     {
         $charge = $this->stripe->paymentIntents->retrieve($data['get']['payment_intent'], []);
+        $this->validateRedirectPaymentIntent($tx, $invoice, $charge);
 
-        $this->withPaymentIntentLock(
+        $this->withStripeObjectLock(
             $charge->id,
-            (int) $tx->getGatewayId(),
+            (int) $tx->getGateway()?->getId(),
             fn () => $this->processPaymentIntentUnderLock($tx, $invoice, $charge)
         );
     }
 
-    private function processPaymentIntentUnderLock(Transaction $tx, ?Model_Invoice $invoice, object $charge): void
+    private function validateRedirectPaymentIntent(Transaction $tx, ?Invoice $invoice, object $paymentIntent): void
     {
-        $invoiceService = $this->di['mod_service']('Invoice');
+        $gatewayId = $paymentIntent->metadata->gateway_id ?? null;
+        if (!is_numeric($gatewayId) || (int) $gatewayId !== (int) $tx->getGateway()?->getId()) {
+            throw new FOSSBilling\Core\Exception\BaseException('PaymentIntent does not belong to this payment gateway');
+        }
 
+        if (!$invoice instanceof Invoice) {
+            return;
+        }
+
+        $invoiceId = $paymentIntent->metadata->invoice_id ?? null;
+        if (!is_numeric($invoiceId) || (int) $invoiceId !== (int) $invoice->getId()) {
+            throw new FOSSBilling\Core\Exception\BaseException('PaymentIntent does not belong to this invoice');
+        }
+
+        if (strcasecmp((string) ($paymentIntent->currency ?? ''), (string) $invoice->getCurrency()) !== 0) {
+            throw new FOSSBilling\Core\Exception\BaseException('PaymentIntent currency does not match invoice currency');
+        }
+    }
+
+    private function processPaymentIntentUnderLock(Transaction $tx, ?Invoice $invoice, object $charge): void
+    {
         $tx->setTxnStatus($charge->status);
         $tx->setTxnId($charge->id);
         $tx->setAmount((string) $this->getAmountFromMinorUnits($charge->amount, $charge->currency));
@@ -298,7 +674,7 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
         // Stripe may deliver the webhook before redirecting the customer.
         // Keep that transaction instead of recording the PaymentIntent twice.
         $transactionRepository = $this->di['em']->getRepository(Transaction::class);
-        $existing = $transactionRepository->findActiveByTxnIdAndGatewayId($charge->id, (int) $tx->getGatewayId(), (int) $tx->getId());
+        $existing = $transactionRepository->findActiveByTxnIdAndGatewayId($charge->id, (int) $tx->getGateway()?->getId(), (int) $tx->getId());
         if ($existing instanceof Transaction) {
             $this->di['em']->remove($tx);
             $this->di['em']->flush();
@@ -307,75 +683,13 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
         }
 
         if ($charge->status === 'succeeded') {
-            if ($tx->getStatus() === Transaction::STATUS_PROCESSED && empty($tx->getError())) {
-                $tx->setUpdatedAt(new DateTime());
-                $this->di['em']->flush();
-
-                return;
-            }
-
-            // Already-paid guard — prevents double-crediting when the
-            // payment_intent.succeeded webhook processed the payment
-            // before the redirect flow runs.
-            if ($invoice instanceof Model_Invoice) {
-                $fresh = $this->di['db']->findOne('Invoice', 'id = :id', [':id' => $invoice->id]);
-                if ($fresh instanceof Model_Invoice && $fresh->status === Model_Invoice::STATUS_PAID) {
-                    $tx->setStatus(Transaction::STATUS_PROCESSED);
-                    $tx->setUpdatedAt(new DateTime());
-                    $this->di['em']->flush();
-
-                    return;
-                }
-            }
-
-            $transactionService = $this->di['mod_service']('Invoice', 'Transaction');
-            if (!$transactionService->claimForProcessing((int) $tx->getId())) {
-                return;
-            }
-
             $tx->setStatus(Transaction::STATUS_PROCESSING);
-        }
-
-        $bd = [
-            'amount' => $tx->getAmount(),
-            'description' => 'Stripe transaction ' . $charge->id,
-            'type' => 'transaction',
-            'rel_id' => $tx->getId(),
-        ];
-
-        if ($charge->status == 'succeeded' && $tx->getStatus() === Transaction::STATUS_PROCESSING) {
-            $clientService = $this->di['mod_service']('client');
-            $client = $invoice
-                ? $this->di['db']->getExistingModelById('Client', $invoice->client_id)
-                : $this->getClientFromTransaction($tx, $charge);
-
-            if ($invoice) {
-                $expected = $invoiceService->getTotalWithTax($invoice);
-
-                try {
-                    $invoiceService->validatePaymentAmount($tx->getAmount(), $expected);
-                } catch (FOSSBilling\Exception $e) {
-                    $tx->setStatus(Transaction::STATUS_ERROR);
-                    $tx->setError($e->getMessage());
-                    $tx->setUpdatedAt(new DateTime());
-                    $this->di['em']->flush();
-
-                    throw $e;
-                }
+            if (!$this->applyOneTimePayment($tx, $invoice, $charge)) {
+                $this->di['em']->remove($tx);
+                $this->di['em']->flush();
             }
 
-            $clientService->addFunds($client, $bd['amount'], $bd['description'], $bd);
-
-            if ($tx->getInvoiceId() && $invoice && !$invoiceService->isInvoiceTypeDeposit($invoice)) {
-                if (!$invoice->approved) {
-                    $invoiceService->approveInvoice($invoice, ['use_credits' => false]);
-                }
-                $invoiceService->payInvoiceWithCredits($invoice);
-            } elseif ($tx->getInvoiceId() && $invoice && $invoiceService->isInvoiceTypeDeposit($invoice)) {
-                $invoiceService->markAsPaid($invoice);
-            } elseif (!$tx->getInvoiceId()) {
-                $invoiceService->doBatchPayWithCredits(['client_id' => $client->id]);
-            }
+            return;
         }
 
         $paymentStatus = match ($charge->status) {
@@ -392,22 +706,30 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
         };
 
         $tx->setStatus($paymentStatus);
-        $tx->setUpdatedAt(new DateTime());
+        $tx->setUpdatedAt(new DateTimeImmutable());
         $this->di['em']->flush();
     }
 
-    private function processSetupIntent($api_admin, Transaction $tx, ?Model_Invoice $invoice, array $data, int $gateway_id): void
+    private function processSetupIntent($api_admin, Transaction $tx, ?Invoice $invoice, array $data, int $gateway_id): void
     {
         $setupIntent = $this->stripe->setupIntents->retrieve($data['get']['setup_intent'], []);
 
         $tx->setTxnStatus($setupIntent->status);
         $tx->setTxnId($setupIntent->id);
 
-        if ($setupIntent->status === 'succeeded' && $invoice instanceof Model_Invoice) {
-            $customer = $this->getOrCreateCustomer($invoice);
+        // $invoice and $setupIntent are resolved independently, from separate
+        // query parameters on the redirect URL (see resolveInvoice()) - unlike
+        // the webhook flow, which derives the invoice from the setup intent's
+        // own metadata and so can't have this mismatch. Without this check, a
+        // request naming a victim's invoice alongside the requester's own
+        // completed setup intent would subscribe/charge the requester but
+        // credit and mark paid whatever invoice_id was supplied.
+        if ($setupIntent->status === 'succeeded' && $invoice instanceof Invoice && $this->setupIntentBelongsToInvoice($setupIntent, $invoice, $gateway_id)) {
+            $customerId = $this->resolveSubscriptionCustomerId($setupIntent, $invoice);
+            $priceId = $this->resolveSubscriptionPriceId($setupIntent, $invoice);
 
             try {
-                $subscription = $this->createStripeSubscription($customer, $setupIntent, $invoice);
+                $subscription = $this->createStripeSubscription($customerId, $priceId, $setupIntent, $invoice, $tx);
             } catch (Stripe\Exception\ApiErrorException $e) {
                 // Only handle the expected race where the setup_intent.succeeded
                 // webhook created the subscription concurrently with the same
@@ -417,28 +739,14 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
                     throw $e;
                 }
 
-                // Webhook beat us here — find the subscription it created.
-                $subscriptions = $this->stripe->subscriptions->all([
-                    'customer' => $customer->id,
-                    'limit' => 1,
-                ]);
-                $subscription = count($subscriptions->data) > 0 ? $subscriptions->data[0] : null;
-
-                if ($subscription === null) {
-                    $tx->setStatus(Transaction::STATUS_PROCESSED);
-                    $tx->setUpdatedAt(new DateTime());
-                    $this->di['em']->flush();
-
-                    return;
-                }
+                throw new FOSSBilling\Core\Exception\InformationException('Stripe subscription creation is still in progress. Retry processing this transaction after it completes.');
             }
 
             $tx->setSId($subscription->id);
             $tx->setSPeriod($this->getSubscriptionPeriodForInvoice($invoice));
-            $tx->setAmount((string) $this->getAmountFromMinorUnits($this->getAmountInCents($invoice), $invoice->currency));
-            $tx->setCurrency($invoice->currency);
+            $tx->setCurrency($invoice->getCurrency());
             $tx->setType(Payment_Transaction::TXTYPE_PAYMENT);
-            $tx->setStatus(Transaction::STATUS_PROCESSED);
+            $tx->setStatus(Transaction::STATUS_PROCESSING);
 
             // Create the FOSSBilling subscription record immediately so it
             // shows up in the subscriptions list without depending on the
@@ -449,36 +757,70 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
             // sees a paid invoice on redirect. Stripe charges the first invoice
             // synchronously during subscription creation when using
             // charge_automatically with a default_payment_method.
-            $this->processInitialSubscriptionPayment($api_admin, $tx, $invoice, $subscription);
+            $firstCharge = $this->processInitialSubscriptionPayment($api_admin, $tx, $invoice, $subscription);
+            if ($firstCharge === null) {
+                $this->di['em']->remove($tx);
+                $this->di['em']->flush();
+
+                return;
+            }
+            $tx->setAmount((string) $firstCharge);
+            $tx->setStatus(Transaction::STATUS_PROCESSED);
         } else {
             $tx->setStatus(Transaction::STATUS_ERROR);
         }
 
-        $tx->setUpdatedAt(new DateTime());
+        $tx->setUpdatedAt(new DateTimeImmutable());
         $this->di['em']->flush();
     }
 
     /**
-     * Process the initial subscription payment immediately after subscription
-     * creation so the user sees a paid invoice when redirected back.
-     *
-     * Stripe charges the first invoice synchronously during subscription
-     * creation (charge_automatically + default_payment_method). This method
-     * retrieves that invoice and applies the payment to FOSSBilling right
-     * away, rather than waiting for the invoice.paid webhook to arrive.
+     * Verify a setup intent was actually created for this invoice on this
+     * gateway, per the metadata _generateSubscriptionForm() stamped onto it
+     * when creating it - see processSetupIntent()'s call site for why this
+     * check exists.
      */
-    private function processInitialSubscriptionPayment($api_admin, Transaction $tx, Model_Invoice $invoice, Stripe\Subscription $subscription): void
+    private function setupIntentBelongsToInvoice(Stripe\SetupIntent $setupIntent, Invoice $invoice, int $gatewayId): bool
     {
-        // Already-paid guard — reload from DB to narrow the TOCTOU window when
-        // the redirect flow and webhook handler race on the same subscription.
-        $fresh = $this->di['db']->findOne('Invoice', 'id = :id', [':id' => $invoice->id]);
-        if ($fresh instanceof Model_Invoice && $fresh->status === Model_Invoice::STATUS_PAID) {
-            return;
+        $metadataInvoiceId = $setupIntent->metadata->invoice_id ?? null;
+        $metadataGatewayId = $setupIntent->metadata->gateway_id ?? null;
+
+        return $metadataInvoiceId !== null
+            && (int) $metadataInvoiceId === $invoice->getId()
+            && $metadataGatewayId !== null
+            && (int) $metadataGatewayId === $gatewayId;
+    }
+
+    /**
+     * Records the subscription's first charge, returning what Stripe actually
+     * collected. An unpaid first charge records nothing: the invoice counts
+     * processed transactions as payments, so a full-total placeholder here
+     * would show money that never moved.
+     */
+    private function processInitialSubscriptionPayment($api_admin, Transaction $tx, Invoice $invoice, Stripe\Subscription $subscription): ?float
+    {
+        $ownedCredit = $this->ownedSubscriptionCredit($tx);
+        if ($ownedCredit !== false) {
+            if ((int) $ownedCredit['client_id'] !== $invoice->getClientId()) {
+                throw new FOSSBilling\Core\Exception\InformationException('This Stripe receipt belongs to another client. Reconcile its wallet history before continuing.');
+            }
+            $this->di['em']->refresh($invoice);
+            if ($invoice->getStatus() !== Invoice::STATUS_PAID) {
+                $invoiceService = $this->di['mod_service']('Invoice');
+                if (!$invoiceService->isInvoiceTypeDeposit($invoice)) {
+                    if (!$invoice->isIssued()) {
+                        $invoiceService->issueInvoice($invoice, ['use_credits' => false]);
+                    }
+                    $invoiceService->payInvoiceWithCredits($invoice);
+                }
+            }
+
+            return (float) $ownedCredit['amount'];
         }
 
         $latestInvoiceId = $subscription->latest_invoice ?? null;
         if (empty($latestInvoiceId)) {
-            return;
+            return 0.0;
         }
 
         $latestInvoice = is_string($latestInvoiceId)
@@ -486,32 +828,64 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
             : $latestInvoiceId;
 
         if (($latestInvoice->status ?? '') !== 'paid') {
-            return;
+            return 0.0;
         }
 
-        $bd = [
-            'id' => $invoice->client_id,
-            'amount' => $this->getAmountFromMinorUnits(
-                (int) ($latestInvoice->amount_paid ?? 0),
-                (string) ($latestInvoice->currency ?? '')
-            ),
-            'description' => 'Stripe subscription initial payment ' . $latestInvoice->id,
-            'type' => 'transaction',
-            'rel_id' => $tx->getId(),
-        ];
-
-        $api_admin->client_balance_add_funds($bd);
-
+        $firstCharge = $this->getAmountFromMinorUnits(
+            (int) ($latestInvoice->amount_paid ?? 0),
+            (string) ($latestInvoice->currency ?? '')
+        );
+        if ($firstCharge <= 0.0) {
+            return 0.0;
+        }
+        $client = $this->di['em']->getRepository(Client::class)->find($invoice->getClientId());
+        if (!$client instanceof Client) {
+            throw new FOSSBilling\Core\Exception\InformationException('Client not found');
+        }
+        $tx->setInvoice($invoice);
+        $tx->setAmount((string) $firstCharge);
         $invoiceService = $this->di['mod_service']('Invoice');
-        if (!$invoiceService->isInvoiceTypeDeposit($invoice)) {
-            if (!$invoice->approved) {
-                $invoiceService->approveInvoice($invoice, ['use_credits' => false]);
-            }
-            $invoiceService->payInvoiceWithCredits($invoice);
+        if (!$invoice->isIssued()) {
+            $invoiceService->issueInvoice($invoice, ['use_credits' => false]);
         }
+        if (!$invoiceService->recordGatewayPayment($tx, $client, (string) $latestInvoice->id, 'Stripe subscription initial payment ' . $latestInvoice->id, 'transaction', (string) $tx->getId())) {
+            return null;
+        }
+
+        return $firstCharge;
     }
 
-    private function processWebhookEvent($api_admin, Transaction $tx, array $data, int $gateway_id): void
+    public function authenticateJsonWebhook(array $data): void
+    {
+        $this->getVerifiedWebhookEvent($data);
+    }
+
+    private function subscriptionCredit(Transaction $tx, string $reference): array|false
+    {
+        $credit = $this->di['em']->getConnection()->fetchAssociative(
+            'SELECT client_id, gateway_transaction_id AS rel_id, amount FROM client_balance WHERE gateway_receipt_key = ?',
+            [hash('sha256', $this->gatewayId() . ':' . $reference)]
+        );
+
+        return $credit ?: false;
+    }
+
+    private function ownsSubscriptionCredit(Transaction $tx): bool
+    {
+        return $this->ownedSubscriptionCredit($tx) !== false;
+    }
+
+    private function ownedSubscriptionCredit(Transaction $tx): array|false
+    {
+        $credit = $this->di['em']->getConnection()->fetchAssociative(
+            'SELECT client_id, gateway_transaction_id AS rel_id, amount FROM client_balance WHERE gateway_transaction_id = ? AND gateway_receipt_key IS NOT NULL AND amount > 0',
+            [$tx->getId()]
+        );
+
+        return $credit ?: false;
+    }
+
+    private function getVerifiedWebhookEvent(array $data, bool $authenticatedAtIntake = false): Stripe\Event
     {
         $rawBody = $data['http_raw_post_data'] ?? '';
         $sigHeader = $data['server']['HTTP_STRIPE_SIGNATURE'] ?? '';
@@ -525,19 +899,32 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
         // event from a forged one, so refuse to process the event at all
         // rather than trusting an unsigned payload.
         if (empty($webhookSecret)) {
-            throw new FOSSBilling\Exception('Stripe webhook signing secret is not configured');
+            throw new FOSSBilling\Core\Exception\BaseException('Stripe webhook signing secret is not configured');
         }
         if (empty($sigHeader)) {
-            throw new FOSSBilling\Exception('Missing Stripe-Signature header');
+            throw new FOSSBilling\Core\Exception\BaseException('Missing Stripe-Signature header');
         }
 
         try {
-            $event = Stripe\Webhook::constructEvent($rawBody, $sigHeader, $webhookSecret);
+            $event = Stripe\Webhook::constructEvent($rawBody, $sigHeader, $webhookSecret, $authenticatedAtIntake ? 0 : Stripe\Webhook::DEFAULT_TOLERANCE);
         } catch (UnexpectedValueException) {
-            throw new FOSSBilling\Exception('Invalid Stripe webhook payload');
+            throw new FOSSBilling\Core\Exception\BaseException('Invalid Stripe webhook payload');
         } catch (Stripe\Exception\SignatureVerificationException) {
-            throw new FOSSBilling\Exception('Invalid Stripe webhook signature');
+            throw new FOSSBilling\Core\Exception\BaseException('Invalid Stripe webhook signature');
         }
+
+        return $event;
+    }
+
+    private function processWebhookEvent($api_admin, Transaction $tx, array $data, int $gateway_id): void
+    {
+        // Only create() records this proof, after verifying freshness at intake.
+        // Recheck the signature on replay, but allow its original timestamp.
+        $stored = $tx->getIpn();
+        $authenticated = ($stored['authenticated_gateway_id'] ?? null) === $gateway_id
+            && ($stored['http_raw_post_data'] ?? null) === ($data['http_raw_post_data'] ?? null)
+            && ($stored['server']['HTTP_STRIPE_SIGNATURE'] ?? null) === ($data['server']['HTTP_STRIPE_SIGNATURE'] ?? null);
+        $event = $this->getVerifiedWebhookEvent($data, $authenticated);
 
         $tx->setTxnId($event->id);
         $tx->setTxnStatus($event->type);
@@ -559,11 +946,14 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
         $keepTransaction = false;
 
         try {
+            // Refund notifications self-route: dashboard refunds carry no
+            // gateway metadata, so ownership is resolved inside their handler.
+            $isRefundNotification = $event->type === 'charge.refunded' || $event->type === 'refund.created';
             // A Stripe account can deliver the same event to multiple webhook
             // endpoints. Only the FOSSBilling gateway which created the Stripe
             // object may process it; otherwise two gateway records configured
             // for one Stripe account can both credit the same payment.
-            if (!$this->eventBelongsToGateway($event, $gateway_id)) {
+            if (!$isRefundNotification && !$this->eventBelongsToGateway($event, $gateway_id)) {
                 $this->di['em']->remove($tx);
                 $this->di['em']->flush();
 
@@ -576,18 +966,28 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
                 'customer.subscription.deleted' => $this->handleSubscriptionDeleted($api_admin, $tx, $event),
                 'invoice.payment_succeeded' => $this->handleInvoicePaymentSucceeded($api_admin, $tx, $event, $gateway_id),
                 'invoice.paid' => $this->handleInvoicePaymentSucceeded($api_admin, $tx, $event, $gateway_id),
-                'invoice.payment_failed' => $this->handleInvoicePaymentFailed($api_admin, $tx, $event),
                 'invoice_payment.paid' => $this->handleInvoicePaymentSucceeded($api_admin, $tx, $event, $gateway_id),
-                'invoice_payment.failed' => $this->handleInvoicePaymentFailed($api_admin, $tx, $event),
                 'payment_intent.succeeded' => $this->handlePaymentIntentSucceededWebhook($api_admin, $tx, $event, $gateway_id),
                 'payment_intent.payment_failed' => $this->handlePaymentIntentFailedWebhook($api_admin, $tx, $event),
                 'setup_intent.succeeded' => $this->handleSetupIntentSucceededWebhook($api_admin, $tx, $event, $gateway_id),
                 'setup_intent.setup_failed' => $this->handleSetupIntentFailedWebhook($api_admin, $tx, $event),
+                'charge.refunded' => $this->handleRefundWebhook($tx, $event),
+                'refund.created' => $this->handleRefundCreatedWebhook($tx, $event, $gateway_id),
             };
-        } catch (Stripe\Exception\CardException|Stripe\Exception\InvalidRequestException|Stripe\Exception\AuthenticationException|Stripe\Exception\ApiConnectionException|Stripe\Exception\ApiErrorException $e) {
+        } catch (Stripe\Exception\ApiErrorException $e) {
+            // These handlers only read from Stripe. Keep their transaction
+            // queued after a temporary provider failure, including failures
+            // while looking up the invoice or deciding which gateway owns it.
+            if (in_array($event->type, ['customer.subscription.updated', 'invoice.payment_succeeded', 'invoice.paid', 'invoice_payment.paid'], true)
+                && ($e instanceof Stripe\Exception\ApiConnectionException
+                    || $e instanceof Stripe\Exception\RateLimitException
+                    || $e->getHttpStatus() === 429
+                    || ($e->getHttpStatus() ?? 0) >= 500)) {
+                throw new RetryableCallbackException('Stripe is temporarily unavailable. Please retry the callback.');
+            }
             $this->logError($e, $tx);
 
-            throw new FOSSBilling\Exception('There was an error when processing the Stripe webhook');
+            throw new FOSSBilling\Core\Exception\BaseException('There was an error when processing the Stripe webhook');
         }
 
         if ($keepTransaction) {
@@ -601,7 +1001,7 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
             return;
         }
 
-        $tx->setUpdatedAt(new DateTime());
+        $tx->setUpdatedAt(new DateTimeImmutable());
         $this->di['em']->flush();
     }
 
@@ -617,9 +1017,7 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
         // Older Stripe objects predate gateway_id metadata. Resolve them via
         // their local invoice/subscription association so upgrades do not
         // break in-flight payments or existing recurring subscriptions.
-        if ($eventGatewayId === null) {
-            $eventGatewayId = $this->getInvoiceGatewayId($stripeObject->metadata->invoice_id ?? null);
-        }
+        $eventGatewayId ??= $this->getInvoiceGatewayId($stripeObject->metadata->invoice_id ?? null);
 
         if ($eventGatewayId === null && str_starts_with((string) ($event->type ?? ''), 'customer.subscription.')) {
             $eventGatewayId = $this->getLocalSubscriptionGatewayId($stripeObject->id ?? null);
@@ -658,7 +1056,7 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
             return null;
         }
 
-        $gatewayId = $this->di['dbal']->fetchOne(
+        $gatewayId = $this->di['em']->getConnection()->fetchOne(
             'SELECT gateway_id FROM invoice WHERE id = :id',
             ['id' => (int) $invoiceId]
         );
@@ -672,7 +1070,7 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
             return null;
         }
 
-        $gatewayId = $this->di['dbal']->fetchOne(
+        $gatewayId = $this->di['em']->getConnection()->fetchOne(
             'SELECT pay_gateway_id FROM subscription WHERE sid = :sid',
             ['sid' => $subscriptionId]
         );
@@ -690,54 +1088,65 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
             return false;
         }
 
-        $tx->setInvoiceId((int) $invoiceId);
+        $invoice = $this->di['em']->getRepository(Invoice::class)->find((int) $invoiceId);
+        if (!$invoice instanceof Invoice) {
+            return false;
+        }
+        $tx->setInvoice($invoice);
 
         // Subscription record is now created inline by processSetupIntent and
         // handleSetupIntentSucceededWebhook. This handler only serves as a
         // fallback if those flows didn't run (e.g. subscription created outside
         // FOSSBilling). Use the shared helper to avoid duplication.
-        $invoice = $this->di['db']->getExistingModelById('Invoice', (int) $invoiceId);
         $this->createOrUpdateSubscription($api_admin, $invoice, $stripeSubscription, $gateway_id);
 
         return false;
     }
 
+    public function getSubscriptionStatus(string $subscriptionId): string
+    {
+        $subscription = $this->stripe->subscriptions->retrieve($subscriptionId, []);
+
+        return in_array($subscription->status, ['canceled', 'incomplete_expired'], true)
+            ? 'canceled'
+            : (($subscription->cancel_at_period_end ?? false)
+                ? Box\Mod\Invoice\ServiceSubscription::STATUS_PENDING_CANCELLATION : 'active');
+    }
+
     private function handleSubscriptionUpdated($api_admin, Transaction $tx, object $event): bool
     {
-        $stripeSubscription = $event->data->object;
+        $sid = $event->data->object->id;
+        $gatewayId = (int) $this->config['gateway_id'];
 
-        $status = ($stripeSubscription->cancel_at_period_end ?? false)
-            ? Box\Mod\Invoice\ServiceSubscription::STATUS_PENDING_CANCELLATION
-            : match ($stripeSubscription->status) {
-                'active' => 'active',
-                'trialing' => 'active',
-                'past_due' => 'active',
-                default => 'canceled',
-            };
-
-        try {
-            $this->updateSubscriptionStatusFromGateway($api_admin, $stripeSubscription->id, $status);
-        } catch (Exception $e) {
-            if (DEBUG) {
-                error_log('Stripe subscription updated webhook: ' . $e->getMessage());
+        return $this->withStripeObjectLock($sid, $gatewayId, function () use ($sid, $gatewayId): bool {
+            $subscriptions = $this->di['mod_service']('Invoice', 'Subscription');
+            $id = $subscriptions->findIdBySid($sid, $gatewayId);
+            if ($id === null) {
+                return false;
             }
-        }
 
-        return false;
+            $status = $this->getSubscriptionStatus($sid);
+            $subscriptions->updateStatusForGatewayLink($id, $sid, $gatewayId, $status);
+
+            return false;
+        });
     }
 
     private function handleSubscriptionDeleted($api_admin, Transaction $tx, object $event): bool
     {
-        $stripeSubscription = $event->data->object;
-        $subscriptionService = $this->di['mod_service']('Invoice', 'Subscription');
-        $subscriptionId = $subscriptionService->findIdBySid($stripeSubscription->id);
-        if ($subscriptionId === null) {
+        $sid = $event->data->object->id;
+
+        $gatewayId = (int) $this->config['gateway_id'];
+
+        return $this->withStripeObjectLock($sid, $gatewayId, function () use ($sid, $gatewayId): bool {
+            $subscriptionService = $this->di['mod_service']('Invoice', 'Subscription');
+            $subscriptionId = $subscriptionService->findIdBySid($sid, $gatewayId);
+            if ($subscriptionId !== null) {
+                $subscriptionService->finalizeCancellationFromGateway($subscriptionId, $sid, $gatewayId);
+            }
+
             return false;
-        }
-
-        $subscriptionService->finalizeCancellationFromGateway($subscriptionId);
-
-        return false;
+        });
     }
 
     private function handleInvoicePaymentSucceeded($api_admin, Transaction $tx, object $event, int $gateway_id): bool
@@ -750,13 +1159,26 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
             return false;
         }
 
+        // Those events can arrive concurrently, so the dedup below has to be held under a lock.
+        return $this->withStripeObjectLock(
+            $stripeInvoice->id,
+            $gateway_id,
+            fn (): bool => $this->handleInvoicePaymentSucceededUnderLock($api_admin, $tx, $stripeInvoice, $subscriptionId)
+        );
+    }
+
+    private function handleInvoicePaymentSucceededUnderLock($api_admin, Transaction $tx, object $stripeInvoice, string $subscriptionId): bool
+    {
         // Dedup: Stripe sends both invoice.payment_succeeded and invoice.paid for
         // the same payment. Use the Stripe invoice ID as the shared natural key so
         // whichever event arrives second sees the first is already processing/done.
+        $credit = $this->subscriptionCredit($tx, $stripeInvoice->id);
+        $ownsCredit = $credit !== false && (string) $credit['rel_id'] === (string) $tx->getId();
+        $receiptInvoice = $credit === false ? null : ($ownsCredit ? $tx : $this->di['em']->getRepository(Transaction::class)->find((int) $credit['rel_id']))?->getInvoice();
         $tx->setTxnId($stripeInvoice->id);
         $existing = $this->di['em']->getRepository(Transaction::class)
-            ->findProcessingOrProcessedByTxnId($stripeInvoice->id, null, (int) $tx->getId());
-        if ($existing instanceof Transaction) {
+            ->findProcessingOrProcessedByTxnId($stripeInvoice->id, $this->gatewayId(), (int) $tx->getId());
+        if ($existing instanceof Transaction && !$ownsCredit) {
             return false;
         }
 
@@ -768,110 +1190,88 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
             return false;
         }
 
-        // Link the transaction to the invoice as early as possible so the
-        // association survives any early return or failure further below.
-        if ($invoiceId) {
-            $tx->setInvoiceId((int) $invoiceId);
-            $this->di['em']->flush();
+        $amount = $this->getAmountFromMinorUnits((int) ($stripeInvoice->amount_paid ?? 0), (string) ($stripeInvoice->currency ?? ''));
+        if ($credit !== false && ((int) $credit['client_id'] !== (int) $clientId || round((float) $credit['amount'], 2) !== round($amount, 2)
+            || ($receiptInvoice instanceof Invoice && $receiptInvoice->getClientId() !== (int) $clientId))) {
+            throw new FOSSBilling\Core\Exception\InformationException('This Stripe receipt has different wallet history. Reconcile it before continuing.');
         }
-
-        $isInitialPayment = ($stripeInvoice->billing_reason ?? '') === 'subscription_create';
-
-        // Single DB fetch covers: (a) skip if already paid, (b) billing_reason fallback.
-        if ($invoiceId) {
-            $existingInvoice = $this->di['db']->findOne('Invoice', 'id = :id', [':id' => (int) $invoiceId]);
-            if ($existingInvoice instanceof Model_Invoice) {
-                // Skip if already paid — redirect flow may have processed it first.
-                if ($existingInvoice->status === Model_Invoice::STATUS_PAID) {
-                    return false;
-                }
-                // Fallback: billing_reason inconclusive but original invoice still unpaid.
-                if (!$isInitialPayment && $existingInvoice->status === Model_Invoice::STATUS_UNPAID) {
-                    $isInitialPayment = true;
-                }
-            }
+        if ($receiptInvoice instanceof Invoice) {
+            $tx->setInvoice($receiptInvoice);
         }
+        $storedTarget = $tx->getInvoice();
+        $sourceInvoice = $invoiceId ? $this->di['em']->getRepository(Invoice::class)->find((int) $invoiceId) : null;
+        $billingReason = (string) ($stripeInvoice->billing_reason ?? '');
+        $sourceStatus = $sourceInvoice?->getStatus();
+        $isInitialPayment = $billingReason === 'subscription_create' || $sourceStatus === Invoice::STATUS_UNPAID;
+        $ambiguousPaidInvoice = $billingReason === '' && $sourceStatus === Invoice::STATUS_PAID;
 
-        $bd = [
-            'id' => $clientId,
-            'amount' => $this->getAmountFromMinorUnits(
-                (int) ($stripeInvoice->amount_paid ?? 0),
-                (string) ($stripeInvoice->currency ?? '')
-            ),
-            'description' => $isInitialPayment
-                ? 'Stripe subscription initial payment ' . $stripeInvoice->id
-                : 'Stripe subscription recurring payment ' . $stripeInvoice->id,
-            'type' => 'transaction',
-            'rel_id' => $tx->getId(),
-        ];
-
-        $transactionService = $this->di['mod_service']('Invoice', 'Transaction');
-        if (!$transactionService->claimForProcessing((int) $tx->getId())) {
+        $amount = $this->getAmountFromMinorUnits((int) ($stripeInvoice->amount_paid ?? 0), (string) ($stripeInvoice->currency ?? ''));
+        if ($amount <= 0.0) {
             return false;
         }
-
-        $tx->setType(Payment_Transaction::TXTYPE_PAYMENT);
-        $tx->setAmount((string) $bd['amount']);
-        $tx->setCurrency(strtoupper((string) ($stripeInvoice->currency ?? '')));
-
-        $api_admin->client_balance_add_funds($bd);
-
         $invoiceService = $this->di['mod_service']('Invoice');
+        $client = $this->di['em']->getRepository(Client::class)->find((int) $clientId);
+        if (!$client instanceof Client) {
+            throw new FOSSBilling\Core\Exception\InformationException('Client not found');
+        }
+        $description = $isInitialPayment ? 'Stripe subscription initial payment ' : 'Stripe subscription recurring payment ';
+        if ($invoiceService->gatewayReceiptExists((int) $tx->getGateway()?->getId(), (string) $stripeInvoice->id, $client, $amount, $description . $stripeInvoice->id, 'transaction')) {
+            $tx->setAmount((string) $amount);
+            $tx->setCurrency((string) $stripeInvoice->currency);
 
-        if ($isInitialPayment && $invoiceId) {
-            $invoiceModel = $this->di['db']->getExistingModelById('Invoice', (int) $invoiceId);
+            return $invoiceService->recordGatewayPayment($tx, $client, (string) $stripeInvoice->id, $description . $stripeInvoice->id, 'transaction', (string) $tx->getId());
+        }
 
-            if (!$invoiceService->isInvoiceTypeDeposit($invoiceModel)) {
-                if (!$invoiceModel->approved) {
-                    $invoiceService->approveInvoice($invoiceModel, ['use_credits' => false]);
-                }
-                $invoiceService->payInvoiceWithCredits($invoiceModel);
-            }
+        if ($ambiguousPaidInvoice) {
+            throw new FOSSBilling\Core\Exception\InformationException('Stripe subscription payment needs staff review because its billing reason is missing.');
+        }
+        $differentTarget = $storedTarget instanceof Invoice && (int) $storedTarget->getId() !== (int) $invoiceId;
+        if ($differentTarget && ($tx->getOriginalInvoiceId() !== (int) $invoiceId || $isInitialPayment)) {
+            throw new FOSSBilling\Core\Exception\InformationException('Stripe subscription payment needs staff review because its stored invoice could not be verified.');
+        }
+        if ($isInitialPayment) {
+            $target = $sourceInvoice;
+        } elseif ($differentTarget) {
+            $target = $storedTarget;
         } else {
-            $renewalInvoice = $invoiceService->generateRenewalInvoiceForSubscriptionPayment(
-                $stripeSubscription->id,
-                (int) $clientId
-            );
-
-            if ($renewalInvoice instanceof Model_Invoice) {
-                $tx->setInvoiceId((int) $renewalInvoice->id);
-                if (!$invoiceService->isInvoiceTypeDeposit($renewalInvoice)) {
-                    $invoiceService->payInvoiceWithCredits($renewalInvoice);
+            $manager = $this->di['em'];
+            $target = $invoiceService->generateRenewalInvoiceForSubscriptionPayment($stripeSubscription->id, (int) $clientId, (int) $tx->getGateway()?->getId(), (int) $invoiceId, (int) $tx->getId());
+            if ($manager !== $this->di['em']) {
+                // Invoice generation recovered a closed manager. Reload the
+                // entities detached by the failed transaction before recording
+                // the successful provider payment.
+                $tx = $this->di['em']->getRepository(Transaction::class)->find((int) $tx->getId());
+                $client = $this->di['em']->getRepository(Client::class)->find((int) $clientId);
+                if (!$tx instanceof Transaction || !$client instanceof Client) {
+                    throw new FOSSBilling\Core\Exception\InformationException('Unable to reload the subscription payment.');
                 }
-            } else {
-                $api_admin->invoice_batch_pay_with_credits(['client_id' => $clientId]);
+                $tx->setTxnId((string) $stripeInvoice->id);
             }
+        }
+        if ($target instanceof Invoice && (int) $target->getClientId() !== (int) $clientId) {
+            throw new FOSSBilling\Core\Exception\InformationException('Unable to select the subscription renewal invoice.');
+        }
+        if (!$target instanceof Invoice && $isInitialPayment) {
+            throw new FOSSBilling\Core\Exception\InformationException('Unable to select the subscription invoice.');
+        }
+        // A successful renewal charge still belongs to the customer when no
+        // renewal invoice can be created. Preserve it as unallocated credit.
+        if (!$isInitialPayment && $invoiceId) {
+            $tx->setOriginalInvoiceId((int) $invoiceId);
+        }
+        $tx->setInvoice($target);
+        $tx->setType(Payment_Transaction::TXTYPE_PAYMENT);
+        $tx->setAmount((string) $amount);
+        $tx->setCurrency(strtoupper((string) ($stripeInvoice->currency ?? '')));
+        $this->di['em']->flush();
+        if ($target instanceof Invoice && !$target->isIssued()) {
+            $invoiceService->issueInvoice($target, ['use_credits' => false]);
+        }
+        if (!$invoiceService->recordGatewayPayment($tx, $client, (string) $stripeInvoice->id, $description . $stripeInvoice->id, 'transaction', (string) $tx->getId())) {
+            return false;
         }
 
         return true;
-    }
-
-    private function handleInvoicePaymentFailed($api_admin, Transaction $tx, object $event): bool
-    {
-        $stripeInvoice = $this->resolveStripeInvoice($event->data->object);
-
-        $subscriptionId = $this->extractSubscriptionId($stripeInvoice);
-
-        if ($stripeInvoice === null || $subscriptionId === null) {
-            return false;
-        }
-
-        try {
-            $this->updateSubscriptionStatusFromGateway($api_admin, $subscriptionId, 'canceled');
-        } catch (Exception $e) {
-            if (DEBUG) {
-                error_log('Stripe invoice payment failed webhook: ' . $e->getMessage());
-            }
-        }
-
-        return false;
-    }
-
-    private function updateSubscriptionStatusFromGateway($api_admin, string $subscriptionId, string $status): void
-    {
-        $subscription = $api_admin->invoice_subscription_get(['sid' => $subscriptionId]);
-        $subscriptionService = $this->di['mod_service']('Invoice', 'Subscription');
-        $subscriptionService->updateStatusFromGateway((int) $subscription['id'], $status);
     }
 
     /**
@@ -885,11 +1285,27 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
     {
         $paymentIntent = $event->data->object;
 
-        return $this->withPaymentIntentLock(
-            $paymentIntent->id,
-            $gateway_id,
-            fn (): bool => $this->handlePaymentIntentSucceededWebhookUnderLock($tx, $paymentIntent, $gateway_id)
-        );
+        $db = $this->di['em']->getConnection();
+        if ($db->isTransactionActive()) {
+            throw new LogicException('Payment success processing must begin outside a database transaction.');
+        }
+        $invoiceId = (int) ($paymentIntent->metadata->invoice_id ?? 0);
+        $lock = $invoiceId > 0 ? 'fb:card-charge:' . $invoiceId : null;
+        if ($lock !== null && !NamedLock::acquire($db, $lock, 0)) {
+            throw new FOSSBilling\Core\Exception\BaseException('The payment worker is still active. Retry this webhook later.');
+        }
+
+        try {
+            return $this->withStripeObjectLock(
+                $paymentIntent->id,
+                $gateway_id,
+                fn (): bool => $this->handlePaymentIntentSucceededWebhookUnderLock($tx, $paymentIntent, $gateway_id)
+            );
+        } finally {
+            if ($lock !== null) {
+                NamedLock::release($db, $lock);
+            }
+        }
     }
 
     private function handlePaymentIntentSucceededWebhookUnderLock(Transaction $tx, object $paymentIntent, int $gateway_id): bool
@@ -908,7 +1324,7 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
         $existing = $this->di['em']->getRepository(Transaction::class)
             ->findProcessingOrProcessedByTxnId($paymentIntent->id, $gateway_id, (int) $tx->getId());
         if ($existing instanceof Transaction) {
-            $tx->setInvoiceId($existing->getInvoiceId());
+            $tx->setInvoice($existing->getInvoice());
 
             return false;
         }
@@ -927,7 +1343,7 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
         }
 
         if ($invoiceId) {
-            $tx->setInvoiceId((int) $invoiceId);
+            $tx->setInvoice($this->di['em']->getRepository(Invoice::class)->find((int) $invoiceId));
         }
 
         // Persist the PaymentIntent ID while the lock is held so a redirect
@@ -938,48 +1354,160 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
             return false;
         }
 
-        $invoice = $invoiceId ? $this->di['db']->getExistingModelById('Invoice', (int) $invoiceId) : null;
+        $invoice = $tx->getInvoice();
 
-        // Delegate to the shared payment processing logic
-        $this->applyOneTimePayment($tx, $invoice, $paymentIntent);
+        $clearing = $this->di['em']->getRepository(Transaction::class)->findClearingByTxnId(
+            (string) $paymentIntent->id,
+            $gateway_id,
+            (int) $tx->getId()
+        );
+        if ($clearing instanceof Transaction) {
+            if (!$invoice instanceof Invoice) {
+                throw new FOSSBilling\Core\Exception\InformationException('Invoice not found for cleared payment.');
+            }
+            $this->di['mod_service']('Invoice')->settleClearingPayment($invoice, $clearing, $tx);
+        } else {
+            $this->applyOneTimePayment($tx, $invoice, $paymentIntent);
+        }
 
         return true;
     }
 
-    private function withPaymentIntentLock(string $paymentIntentId, int $gatewayId, callable $callback): mixed
+    private function withStripeObjectLock(string $objectId, int $gatewayId, callable $callback): mixed
     {
-        $lockName = 'fb:stripe:' . substr(hash('sha256', $gatewayId . ':' . $paymentIntentId), 0, 54);
+        $lockName = 'fb:stripe:' . substr(hash('sha256', $gatewayId . ':' . $objectId), 0, 54);
         $waitStartedAt = hrtime(true);
-        $acquired = (int) $this->di['dbal']->fetchOne(
-            'SELECT GET_LOCK(:lock_name, 10)',
-            ['lock_name' => $lockName]
-        );
 
-        if ($acquired !== 1) {
+        if (!NamedLock::acquire($this->di['em']->getConnection(), $lockName, 10)) {
             $waitDurationMs = (hrtime(true) - $waitStartedAt) / 1_000_000;
             $this->di['logger']->warning(
-                'Timed out after %.1f ms waiting for Stripe PaymentIntent lock %s',
-                $waitDurationMs,
-                $lockName
+                'Timed out after {duration_ms} ms waiting for Stripe object lock {lock_name}',
+                ['duration_ms' => $waitDurationMs, 'lock_name' => $lockName]
             );
 
-            throw new FOSSBilling\Exception('Timed out waiting to process this Stripe payment');
+            throw new RetryableCallbackException('Timed out waiting to process this Stripe payment');
         }
 
         try {
             return $callback();
         } finally {
-            $this->di['dbal']->fetchOne('SELECT RELEASE_LOCK(:lock_name)', ['lock_name' => $lockName]);
+            NamedLock::release($this->di['em']->getConnection(), $lockName);
         }
     }
 
     private function handlePaymentIntentFailedWebhook($api_admin, Transaction $tx, object $event): bool
     {
         $paymentIntent = $event->data->object;
+        $db = $this->di['em']->getConnection();
+        if ($db->isTransactionActive()) {
+            throw new LogicException('Payment failure processing must begin outside a database transaction.');
+        }
+        $invoiceId = (int) ($paymentIntent->metadata->invoice_id ?? 0);
+        // Match the saved-charge/recovery lock order: invoice, then Stripe object.
+        $lock = $invoiceId > 0 ? 'fb:card-charge:' . $invoiceId : null;
+        if ($lock !== null && !NamedLock::acquire($db, $lock, 0)) {
+            throw new FOSSBilling\Core\Exception\BaseException('The payment worker is still active. Retry this webhook later.');
+        }
+
+        try {
+            return $this->withStripeObjectLock((string) $paymentIntent->id, (int) $tx->getGateway()?->getId(),
+                fn (): bool => $this->handlePaymentIntentFailedUnderLock($tx, $paymentIntent));
+        } finally {
+            if ($lock !== null) {
+                NamedLock::release($db, $lock);
+            }
+        }
+    }
+
+    private function handlePaymentIntentFailedUnderLock(Transaction $tx, object $paymentIntent): bool
+    {
+        if (!in_array($paymentIntent->status, ['requires_payment_method', 'canceled'], true)) {
+            return false;
+        }
+        $em = $this->di['em'];
+        $db = $em->getConnection();
+        $gatewayId = (int) $tx->getGateway()?->getId();
+        if ($em->getRepository(Transaction::class)->findProcessingOrProcessedByTxnId((string) $paymentIntent->id, $gatewayId, (int) $tx->getId()) instanceof Transaction) {
+            return false;
+        }
+        $invoiceId = (int) ($paymentIntent->metadata->invoice_id ?? 0);
+        $attempt = $invoiceId > 0 ? $db->fetchAssociative("SELECT id, owner_token FROM invoice_gateway_charge_attempt WHERE invoice_id = ? AND gateway_id = ? AND payment_id = ? AND state = 'pending'", [$invoiceId, $gatewayId, (string) $paymentIntent->id]) : false;
+        // MySQL/PostgreSQL session locks are reentrant. Never revoke the charge
+        // scope of a worker using this same connection and call stack.
+        foreach (FOSSBilling\Core\Payment\ProcessingFence::claims() as $claim) {
+            if ($attempt && $claim['table'] === 'invoice_gateway_charge_attempt' && $claim['id'] === $attempt['id']) {
+                throw new FOSSBilling\Core\Exception\BaseException('The payment worker is still active. Retry this webhook later.');
+            }
+        }
+        if ($attempt) {
+            // Failure events may arrive after this PaymentIntent was retried.
+            // Only the provider's current terminal answer may release the barrier.
+            $current = $this->stripe->paymentIntents->retrieve((string) $paymentIntent->id, []);
+            if ($current->id !== $paymentIntent->id || !in_array($current->status, ['requires_payment_method', 'canceled'], true)) {
+                return false;
+            }
+        }
         $tx->setTxnId($paymentIntent->id);
         $tx->setTxnStatus($paymentIntent->status);
         $tx->setStatus(Transaction::STATUS_ERROR);
-        $tx->setError('Payment failed via webhook');
+        $tx->setError($this->failureReason($paymentIntent));
+        if ($invoiceId > 0) {
+            $tx->setInvoice($em->getRepository(Invoice::class)->find($invoiceId));
+        }
+
+        try {
+            $wasClearing = $db->transactional(function () use ($db, $paymentIntent, $tx, $attempt): bool {
+                $cleared = $this->settleClearing($paymentIntent, $tx);
+                if ($attempt) {
+                    $owner = $attempt['owner_token'] === null ? 'owner_token IS NULL' : 'owner_token = ?';
+                    $parameters = [date('Y-m-d H:i:s'), $attempt['id']];
+                    if ($attempt['owner_token'] !== null) {
+                        $parameters[] = $attempt['owner_token'];
+                    }
+                    if ($db->executeStatement("UPDATE invoice_gateway_charge_attempt SET state = 'failed', resolved_at = ? WHERE id = ? AND state = 'pending' AND {$owner}", $parameters) !== 1) {
+                        throw new FOSSBilling\Core\Payment\OwnershipLost('The charge attempt changed while processing its failure.');
+                    }
+                }
+
+                return $cleared;
+            });
+        } catch (Throwable $e) {
+            $em->close();
+
+            throw $e;
+        }
+        // Notify only after the clearing marker and journal commit together.
+        if ($wasClearing && $invoiceId > 0 && ($paymentIntent->metadata->auto_pay ?? '') === '1') {
+            $invoice = $tx->getInvoice();
+            $method = $paymentIntent->last_payment_error->payment_method ?? null;
+            if ($invoice instanceof Invoice) {
+                $this->di['mod_service']('Invoice', 'SavedCards')->emailDebitFailure($invoice, is_object($method) ? $this->cardLabel($method) : '', (string) $tx->getError());
+            }
+        }
+
+        return true;
+    }
+
+    /** As the gateway log, a failed attempt keeps Stripe's answer. */
+    private function failureReason(object $paymentIntent): string
+    {
+        return 'Stripe payment failed: ' . ($paymentIntent->last_payment_error->message ?? $paymentIntent->status ?? 'unknown');
+    }
+
+    /** Stripe answered for a payment still clearing: ends the wait, true when there was one. */
+    private function settleClearing(object $paymentIntent, Transaction $tx): bool
+    {
+        $clearing = $this->di['em']->getRepository(Transaction::class)->findClearingByTxnId(
+            (string) $paymentIntent->id,
+            (int) $tx->getGateway()?->getId(),
+            (int) $tx->getId()
+        );
+        if (!$clearing instanceof Transaction) {
+            return false;
+        }
+        $clearing->setTxnStatus((string) $paymentIntent->status);
+        $clearing->setUpdatedAt(new DateTimeImmutable());
+        $this->di['em']->flush();
 
         return true;
     }
@@ -1000,7 +1528,7 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
 
         if ($setupIntent->status !== 'succeeded') {
             $tx->setStatus(Transaction::STATUS_ERROR);
-            $tx->setUpdatedAt(new DateTime());
+            $tx->setUpdatedAt(new DateTimeImmutable());
             $this->di['em']->flush();
 
             return false;
@@ -1008,9 +1536,9 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
 
         // Dedup: skip if already processed or being processed via the redirect flow.
         $existing = $this->di['em']->getRepository(Transaction::class)
-            ->findProcessingOrProcessedByTxnId($setupIntent->id);
-        if ($existing instanceof Transaction) {
-            $tx->setInvoiceId($existing->getInvoiceId());
+            ->findProcessingOrProcessedByTxnId($setupIntent->id, $gateway_id, (int) $tx->getId());
+        if ($existing instanceof Transaction && !$this->ownsSubscriptionCredit($tx)) {
+            $tx->setInvoice($existing->getInvoice());
 
             return false;
         }
@@ -1020,18 +1548,22 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
             return false;
         }
 
-        $tx->setInvoiceId((int) $invoiceId);
+        $invoice = $this->di['em']->getRepository(Invoice::class)->find((int) $invoiceId);
+        if (!$invoice instanceof Invoice) {
+            return false;
+        }
+        $tx->setInvoice($invoice);
         $this->di['em']->flush();
 
-        $invoice = $this->di['db']->getExistingModelById('Invoice', (int) $invoiceId);
-        $customer = $this->getOrCreateCustomer($invoice);
+        $customerId = $this->resolveSubscriptionCustomerId($setupIntent, $invoice);
+        $priceId = $this->resolveSubscriptionPriceId($setupIntent, $invoice);
 
         // createStripeSubscription uses an idempotency key based on the
         // invoice ID, so this is safe even if the redirect flow races.
         // If both fire simultaneously, Stripe returns the same subscription
         // to the first and a "concurrent request" error to the second.
         try {
-            $subscription = $this->createStripeSubscription($customer, $setupIntent, $invoice);
+            $subscription = $this->createStripeSubscription($customerId, $priceId, $setupIntent, $invoice, $tx);
         } catch (Stripe\Exception\ApiErrorException $e) {
             // Only treat idempotency conflicts as the expected race with the
             // redirect flow; rethrow all other API errors (card declined, auth
@@ -1040,19 +1572,16 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
                 throw $e;
             }
 
-            if (DEBUG) {
-                error_log('Stripe setup_intent webhook: subscription creation deferred to redirect flow: ' . $e->getMessage());
-            }
+            $this->debugLog('Stripe setup_intent webhook: subscription creation deferred to redirect flow: ' . $e->getMessage());
 
             return false;
         }
 
         $tx->setSId($subscription->id);
         $tx->setSPeriod($this->getSubscriptionPeriodForInvoice($invoice));
-        $tx->setAmount((string) $this->getAmountFromMinorUnits($this->getAmountInCents($invoice), $invoice->currency));
-        $tx->setCurrency($invoice->currency);
+        $tx->setCurrency($invoice->getCurrency());
         $tx->setType(Payment_Transaction::TXTYPE_PAYMENT);
-        $tx->setUpdatedAt(new DateTime());
+        $tx->setUpdatedAt(new DateTimeImmutable());
         $this->di['em']->flush();
 
         // Create the FOSSBilling subscription record immediately.
@@ -1060,7 +1589,11 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
 
         // Process the initial payment immediately so the invoice is paid
         // even if the redirect flow hasn't completed yet.
-        $this->processInitialSubscriptionPayment($api_admin, $tx, $invoice, $subscription);
+        $firstCharge = $this->processInitialSubscriptionPayment($api_admin, $tx, $invoice, $subscription);
+        if ($firstCharge === null) {
+            return false;
+        }
+        $tx->setAmount((string) $firstCharge);
 
         return true;
     }
@@ -1077,12 +1610,200 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
     }
 
     /**
+     * Acknowledge Stripe refund notifications without moving money: outbound
+     * refunds already recorded their credit note synchronously, and inbound
+     * ones are recorded by the admin via the Refund action. Returning false
+     * deletes the placeholder transaction to keep the list clean.
+     */
+    private function handleRefundWebhook(Transaction $tx, object $event): bool
+    {
+        $refund = $event->data->object;
+        $refundId = is_string($refund->id ?? null) ? $refund->id : $event->id;
+        $tx->setTxnId($refundId);
+        $tx->setTxnStatus($event->type);
+        $this->debugLog('Stripe refund webhook acknowledged: ' . $refundId);
+
+        return false;
+    }
+
+    /**
+     * Record a refund made in the Stripe dashboard as a credit note.
+     * Refunds stamped with our gateway metadata originated here and already
+     * have theirs, so only metadata-less refunds are recorded. Partial
+     * dashboard refunds are left for the admin: mapping an amount back onto
+     * invoice lines is a judgment call, not something to guess.
+     */
+    private function handleRefundCreatedWebhook(Transaction $tx, object $event, int $gateway_id): bool
+    {
+        $refund = $event->data->object;
+        $refundId = is_string($refund->id ?? null) ? $refund->id : $event->id;
+
+        if (is_numeric($refund->metadata->gateway_id ?? null)) {
+            return false;
+        }
+
+        return $this->withStripeObjectLock(
+            $refundId,
+            $gateway_id,
+            fn (): bool => $this->recordDashboardRefund($tx, $event, $refund, $refundId, $gateway_id)
+        );
+    }
+
+    private function recordDashboardRefund(Transaction $tx, object $event, object $refund, string $refundId, int $gateway_id): bool
+    {
+        $tx->setTxnId($refundId);
+        $tx->setTxnStatus($event->type);
+
+        $invoice = $this->findInvoiceForDashboardRefund($refund, $gateway_id);
+        if (!$invoice instanceof Invoice) {
+            $this->debugLog('Stripe dashboard refund ' . $refundId . ' matches no local invoice; ignoring');
+
+            return false;
+        }
+        if ((int) $invoice->getGateway()?->getId() !== $gateway_id) {
+            return false;
+        }
+
+        $fresh = $this->di['em']->getRepository(Invoice::class)->find($invoice->getId());
+        if ($fresh instanceof Invoice) {
+            $invoice = $fresh;
+        }
+        if ($invoice->getStatus() !== Invoice::STATUS_PAID) {
+            return false;
+        }
+
+        $invoiceService = $this->di['mod_service']('Invoice');
+        $remaining = round($invoiceService->getTotalWithTax($invoice) - (float) ($invoice->getRefund() ?? 0), 2);
+        if ($remaining <= 0.005) {
+            return false;
+        }
+
+        $refundedAmount = $this->getAmountFromMinorUnits((int) ($refund->amount ?? 0), (string) ($refund->currency ?? $invoice->getCurrency()));
+        if (abs($refundedAmount - $remaining) > 0.005) {
+            $this->di['logger']->info('Partial Stripe dashboard refund {refund} for invoice #{id} needs manual recording', ['refund' => $refundId, 'id' => $invoice->getId()]);
+
+            return false;
+        }
+
+        try {
+            $invoiceService->refundInvoice($invoice, 'Recorded from Stripe dashboard refund ' . $refundId, null, [
+                'gateway_refund' => false,
+                'gateway_returned' => true,
+            ]);
+        } catch (Throwable $e) {
+            // A concurrent admin refund may have settled the invoice first:
+            // the credit note exists, so there is nothing left to record.
+            $settled = $this->di['em']->getRepository(Invoice::class)->find($invoice->getId());
+            if ($settled instanceof Invoice && $settled->getStatus() !== Invoice::STATUS_PAID) {
+                $this->debugLog('Stripe dashboard refund ' . $refundId . ' already recorded by a concurrent refund; ignoring');
+
+                return false;
+            }
+            $tx->setStatus(Transaction::STATUS_ERROR);
+            $tx->setError($e->getMessage());
+            $this->debugLog('Could not record Stripe dashboard refund ' . $refundId . ': ' . $e->getMessage());
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Find the local invoice a dashboard refund belongs to: first by the
+     * refund's charge or payment intent matching a processed transaction,
+     * then via the charge's Stripe invoice or the invoice-payment list for
+     * subscription payments, whose local transactions are stored under the
+     * Stripe invoice ID.
+     */
+    private function findInvoiceForDashboardRefund(object $refund, int $gateway_id): ?Invoice
+    {
+        $transactionRepository = $this->di['em']->getRepository(Transaction::class);
+
+        $paymentIntentId = null;
+        $chargeId = null;
+        foreach (['payment_intent', 'charge'] as $field) {
+            $candidate = $refund->{$field} ?? null;
+            if (!is_string($candidate) || $candidate === '') {
+                continue;
+            }
+            if ($field === 'payment_intent') {
+                $paymentIntentId = $candidate;
+            } else {
+                $chargeId = $candidate;
+            }
+            $paymentTx = $transactionRepository->findOneByTxnIdAndGatewayId($candidate, $gateway_id);
+            if ($paymentTx instanceof Transaction && $paymentTx->getInvoice() instanceof Invoice) {
+                return $paymentTx->getInvoice();
+            }
+        }
+
+        $charge = null;
+        if ($chargeId !== null) {
+            try {
+                $charge = $this->stripe->charges->retrieve($chargeId, []);
+            } catch (Stripe\Exception\ApiErrorException) {
+                $charge = null;
+            }
+        }
+
+        if ($charge !== null) {
+            if ($paymentIntentId === null) {
+                $paymentIntent = $charge->payment_intent ?? null;
+                if (is_object($paymentIntent)) {
+                    $paymentIntent = $paymentIntent->id ?? null;
+                }
+                if (is_string($paymentIntent) && $paymentIntent !== '') {
+                    $paymentIntentId = $paymentIntent;
+                }
+            }
+
+            // Legacy accounts still return the invoice on the charge; newer API
+            // versions removed it, so fall through to the invoice-payment lookup.
+            $stripeInvoiceId = is_string($charge->invoice ?? null) && $charge->invoice !== '' ? $charge->invoice : null;
+            if ($stripeInvoiceId !== null) {
+                $paymentTx = $transactionRepository->findOneByTxnIdAndGatewayId($stripeInvoiceId, $gateway_id);
+                if ($paymentTx instanceof Transaction && $paymentTx->getInvoice() instanceof Invoice) {
+                    return $paymentTx->getInvoice();
+                }
+            }
+        }
+
+        if ($paymentIntentId === null) {
+            return null;
+        }
+
+        try {
+            $invoicePayments = $this->stripe->invoicePayments->all([
+                'payment' => ['type' => 'payment_intent', 'payment_intent' => $paymentIntentId],
+                'limit' => 1,
+            ]);
+        } catch (Stripe\Exception\ApiErrorException) {
+            return null;
+        }
+
+        foreach ($invoicePayments->data ?? [] as $invoicePayment) {
+            $linked = $invoicePayment->invoice ?? null;
+            $linkedId = is_object($linked) ? ($linked->id ?? null) : $linked;
+            if (!is_string($linkedId) || $linkedId === '') {
+                continue;
+            }
+            $paymentTx = $transactionRepository->findOneByTxnIdAndGatewayId($linkedId, $gateway_id);
+            if ($paymentTx instanceof Transaction && $paymentTx->getInvoice() instanceof Invoice) {
+                return $paymentTx->getInvoice();
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * Create a FOSSBilling subscription record from a Stripe subscription.
      * Called from the redirect flow and webhook handler so the subscription
      * appears immediately, without depending on the customer.subscription.created
      * webhook event.
      */
-    private function createOrUpdateSubscription($api_admin, Model_Invoice $invoice, object $subscription, int $gateway_id): void
+    private function createOrUpdateSubscription($api_admin, Invoice $invoice, object $subscription, int $gateway_id): void
     {
         $existing = $this->di['em']->getRepository(Subscription::class)->findOneBy(['sid' => $subscription->id]);
         if ($existing instanceof Subscription) {
@@ -1090,23 +1811,21 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
         }
 
         $sd = [
-            'client_id' => $invoice->client_id,
+            'client_id' => $invoice->getClientId(),
             'gateway_id' => $gateway_id,
-            'currency' => strtoupper($invoice->currency),
+            'currency' => strtoupper((string) $invoice->getCurrency()),
             'sid' => $subscription->id,
             'status' => 'active',
             'period' => $this->getSubscriptionPeriodForInvoice($invoice),
-            'amount' => $this->getAmountFromMinorUnits($this->getAmountInCents($invoice), $invoice->currency),
+            'amount' => $this->getAmountFromMinorUnits($this->getAmountInCents($invoice), $invoice->getCurrency()),
             'rel_type' => 'invoice',
-            'rel_id' => $invoice->id,
+            'rel_id' => $invoice->getId(),
         ];
 
         try {
             $api_admin->invoice_subscription_create($sd);
         } catch (Exception $e) {
-            if (DEBUG) {
-                error_log('Failed to create FOSSBilling subscription for ' . $subscription->id . ': ' . $e->getMessage());
-            }
+            $this->debugLog('Failed to create FOSSBilling subscription for ' . $subscription->id . ': ' . $e->getMessage());
         }
     }
 
@@ -1115,76 +1834,32 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
      * invoice. Used by both the redirect flow (processPaymentIntent) and the
      * payment_intent.succeeded webhook handler.
      */
-    private function applyOneTimePayment(Transaction $tx, ?Model_Invoice $invoice, object $charge): void
+    private function applyOneTimePayment(Transaction $tx, ?Invoice $invoice, object $charge): bool
     {
-        // Reload the invoice from the database to get the freshest status.
-        // This narrows the TOCTOU race window when the redirect flow and
-        // webhook process the same payment concurrently.
-        if ($invoice instanceof Model_Invoice) {
-            $fresh = $this->di['db']->findOne('Invoice', 'id = :id', [':id' => $invoice->id]);
-            if ($fresh instanceof Model_Invoice) {
-                $invoice = $fresh;
-            }
-        }
-
-        // Skip if the invoice is already paid — prevents double-crediting
-        // when the webhook arrives after the redirect flow.
-        if ($invoice instanceof Model_Invoice && $invoice->status === Model_Invoice::STATUS_PAID) {
-            return;
-        }
+        // A payment the client chose to save the card with keeps it (default
+        // when none, or when the client chose it). Runs before anything is
+        // recorded; a replay never undoes a default chosen since.
+        $this->rememberPaidCard($charge, (int) ($invoice?->getClientId() ?? ($charge->metadata->client_id ?? 0)), $tx->getId());
 
         $invoiceService = $this->di['mod_service']('Invoice');
-
-        $transactionService = $this->di['mod_service']('Invoice', 'Transaction');
-        if (!$transactionService->claimForProcessing((int) $tx->getId())) {
-            return;
-        }
-
-        $tx->setStatus(Transaction::STATUS_PROCESSING);
-
-        $clientService = $this->di['mod_service']('client');
-        $client = $invoice
-            ? $this->di['db']->getExistingModelById('Client', $invoice->client_id)
+        $client = $invoice instanceof Invoice
+            ? $this->di['em']->getRepository(Client::class)->find($invoice->getClientId())
             : $this->getClientFromTransaction($tx, $charge);
-
-        if ($invoice) {
-            $expected = $invoiceService->getTotalWithTax($invoice);
-
-            try {
-                $invoiceService->validatePaymentAmount($tx->getAmount(), $expected);
-            } catch (FOSSBilling\Exception $e) {
-                $tx->setStatus(Transaction::STATUS_ERROR);
-                $tx->setError($e->getMessage());
-                $tx->setUpdatedAt(new DateTime());
-                $this->di['em']->flush();
-
-                throw $e;
+        if (!$client instanceof Client) {
+            throw new FOSSBilling\Core\Exception\InformationException('Client not found');
+        }
+        if ($invoice instanceof Invoice && $invoice->getStatus() !== Invoice::STATUS_PAID) {
+            if (!$invoice->isIssued()) {
+                $invoiceService->issueInvoice($invoice, ['use_credits' => false]);
             }
         }
-
-        $bd = [
-            'amount' => $tx->getAmount(),
-            'description' => 'Stripe transaction ' . $charge->id,
-            'type' => 'transaction',
-            'rel_id' => $tx->getId(),
-        ];
-
-        $clientService->addFunds($client, $bd['amount'], $bd['description'], $bd);
-
-        if ($tx->getInvoiceId() && $invoice && !$invoiceService->isInvoiceTypeDeposit($invoice)) {
-            if (!$invoice->approved) {
-                $invoiceService->approveInvoice($invoice, ['use_credits' => false]);
-            }
-            $invoiceService->payInvoiceWithCredits($invoice);
-        } elseif ($tx->getInvoiceId() && $invoice && $invoiceService->isInvoiceTypeDeposit($invoice)) {
-            $invoiceService->markAsPaid($invoice);
-        } elseif (!$tx->getInvoiceId()) {
-            $invoiceService->doBatchPayWithCredits(['client_id' => $client->id]);
+        $tx->setInvoice($invoice);
+        $created = $invoiceService->recordGatewayPayment($tx, $client, (string) $charge->id, 'Stripe transaction ' . $charge->id, 'transaction', (string) $tx->getId());
+        if ($created && !$invoice instanceof Invoice) {
+            $invoiceService->doBatchPayWithCredits(['client_id' => (int) $client->getId()]);
         }
 
-        $tx->setStatus(Transaction::STATUS_PROCESSED);
-        $tx->setUpdatedAt(new DateTime());
-        $this->di['em']->flush();
+        return $created;
     }
 
     /**
@@ -1249,91 +1924,631 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
         return str_replace(['\\', '\''], ['\\\\', '\\\''], $value);
     }
 
-    private function getOrCreateCustomer(Model_Invoice $invoice): Stripe\Customer
+    /**
+     * Resolve the Stripe customer ID for an invoice's client, preferring a
+     * locally cached ID (see {@see PayGatewayCustomer}) over asking Stripe.
+     *
+     * Per Stripe's own recommended integration pattern - look the customer
+     * up in your own database first, and only ask Stripe when you don't
+     * have an ID yet - this makes repeat lookups a strongly consistent
+     * local read instead of relying on the Search API's eventual
+     * consistency for dedup.
+     */
+    private function getOrCreateCustomer(Invoice $invoice): string
     {
-        $validatedEmail = filter_var($invoice->buyer_email, FILTER_VALIDATE_EMAIL);
+        $gatewayId = (int) $this->config['gateway_id'];
+        $clientId = $invoice->getClientId();
+
+        if ($clientId === null) {
+            return $this->resolveCustomerIdFromStripe($invoice);
+        }
+
+        // Test and live keys are separate Stripe customer namespaces sharing
+        // one PayGateway row: the lookup must stay in this request's mode.
+        $testMode = !empty($this->config['test_mode']);
+        $cached = $this->di['em']->getRepository(PayGatewayCustomer::class)
+            ->findOneByGatewayAndClient($gatewayId, $clientId, $testMode);
+        if ($cached instanceof PayGatewayCustomer) {
+            return $cached->getExternalCustomerId();
+        }
+
+        $customerId = $this->resolveCustomerIdFromStripe($invoice);
+
+        return $this->cacheGatewayCustomer($gatewayId, $clientId, $customerId, $testMode);
+    }
+
+    /**
+     * Resolve a Stripe customer ID for an invoice that isn't cached locally
+     * yet - via a one-time Search API lookup (so a buyer who already has a
+     * Stripe customer from before this cache existed doesn't get a second
+     * one created for them), falling back to creating a new customer. Only
+     * ever reached on a cache miss, so the Search API's eventual
+     * consistency isn't a steady-state concern here the way it was when
+     * every checkout depended on it for dedup.
+     */
+    private function resolveCustomerIdFromStripe(Invoice $invoice): string
+    {
+        $validatedEmail = filter_var($invoice->getBuyerEmail(), FILTER_VALIDATE_EMAIL);
 
         if ($validatedEmail !== false) {
             $customers = $this->stripe->customers->search([
                 'query' => "email:'" . $this->escapeStripeSearchValue($validatedEmail) . "'",
                 'limit' => 1,
             ]);
-        } else {
-            $customers = (object) ['data' => []];
-        }
 
-        if (count($customers->data) > 0) {
-            return $customers->data[0];
+            if (count($customers->data) > 0) {
+                return $customers->data[0]->id;
+            }
         }
 
         return $this->stripe->customers->create([
-            'email' => $invoice->buyer_email,
-            'name' => trim($invoice->buyer_first_name . ' ' . $invoice->buyer_last_name),
+            'email' => $invoice->getBuyerEmail(),
+            'name' => trim($invoice->getBuyerFirstName() . ' ' . $invoice->getBuyerLastName()),
             'address' => [
-                'line1' => $invoice->buyer_address,
-                'city' => $invoice->buyer_city,
-                'state' => $invoice->buyer_state,
-                'postal_code' => $invoice->buyer_zip,
-                'country' => $invoice->buyer_country,
+                'line1' => $invoice->getBuyerAddress(),
+                'city' => $invoice->getBuyerCity(),
+                'state' => $invoice->getBuyerState(),
+                'postal_code' => $invoice->getBuyerZip(),
+                'country' => $invoice->getBuyerCountry(),
             ],
-        ]);
+        ])->id;
     }
 
-    private function createStripeSubscription(Stripe\Customer $customer, Stripe\SetupIntent $setupIntent, Model_Invoice $invoice): Stripe\Subscription
+    /**
+     * Persist a resolved customer ID so future lookups for this (gateway,
+     * client) pair are a local read, and return the ID that ends up
+     * cached. Uses its own isolated EntityManager (see
+     * newIsolatedEntityManager()) rather than the shared $this->di['em'] -
+     * a unique constraint violation would otherwise leave the EntityManager
+     * other callers in this request rely on (e.g. to flush the
+     * transaction/invoice being processed) in a closed, unusable state.
+     *
+     * Two requests for the same (gateway, client) can both miss the cache
+     * read in getOrCreateCustomer() and each resolve their own Stripe
+     * customer before either persists here. The unique constraint on
+     * (pay_gateway_id, client_id, test_mode) stops both rows from existing; the
+     * loser re-reads and returns the winner's ID instead of its own, so
+     * every caller converges on one customer - the loser's own Stripe
+     * customer just ends up orphaned, unused but harmless.
+     */
+    private function cacheGatewayCustomer(int $gatewayId, int $clientId, string $externalCustomerId, bool $testMode): string
     {
-        $product = $this->getOrCreateProduct($invoice);
-        $price = $this->getOrCreatePrice($product, $invoice);
+        $em = $this->newIsolatedEntityManager();
 
-        return $this->stripe->subscriptions->create([
-            'customer' => $customer->id,
+        try {
+            $record = new PayGatewayCustomer();
+            $record->setPayGateway($em->getReference(PayGateway::class, $gatewayId));
+            $record->setClientId($clientId);
+            $record->setTestMode($testMode);
+            $record->setExternalCustomerId($externalCustomerId);
+
+            $em->persist($record);
+            $em->flush();
+
+            return $externalCustomerId;
+        } catch (UniqueConstraintViolationException) {
+            // flush() leaves $em itself closed at this point (Doctrine's own
+            // behavior on a failed commit) - reads still work fine on a
+            // closed EntityManager, only further writes would need
+            // newIsolatedEntityManager() to hand out a fresh one.
+            /** @var Box\Mod\Invoice\Repository\PayGatewayCustomerRepository $repository */
+            $repository = $em->getRepository(PayGatewayCustomer::class);
+            $winner = $repository->findOneByGatewayAndClient($gatewayId, $clientId, $testMode);
+
+            return $winner instanceof PayGatewayCustomer ? $winner->getExternalCustomerId() : $externalCustomerId;
+        }
+    }
+
+    public function gatewayId(): int
+    {
+        return (int) $this->config['gateway_id'];
+    }
+
+    public function testMode(): bool
+    {
+        return !empty($this->config['test_mode']);
+    }
+
+    /**
+     * The client's saved method for automatic charges, if they kept one:
+     * {payment_method, card, auto_pay_at}. Saved while paying or on the
+     * Payment methods page; charged by the cron, the client, or staff.
+     *
+     * @return array{payment_method: string, card: string, auto_pay_at: string}|null
+     */
+    public function savedCard(int $clientId): ?array
+    {
+        return $this->di['mod_service']('Invoice', 'SavedCards')->saved($this->gatewayId(), $this->testMode(), $clientId);
+    }
+
+    /** The Stripe customer that holds the client's saved cards, or null. */
+    private function ownedCustomer(int $clientId): ?string
+    {
+        $row = $this->di['em']->getRepository(PayGatewayCustomer::class)->findOneByGatewayAndClient($this->gatewayId(), $clientId, $this->testMode());
+        $customerId = $row?->hasSavedCards() ? $row->getExternalCustomerId() : null;
+
+        return $customerId !== null && $customerId !== '' ? $customerId : null;
+    }
+
+    /**
+     * Charges the client's saved card for an invoice's balance (the cron or staff), off session.
+     * $attempt names the try, so each one is its own idempotent charge. Returns the PaymentIntent id;
+     * a declined card throws InformationException with Stripe's reason.
+     */
+    public function chargeSavedCard(Invoice $invoice, string $attempt): string
+    {
+        $card = $this->savedCard((int) $invoice->getClientId());
+        $customerId = $this->ownedCustomer((int) $invoice->getClientId());
+        if ($card === null || $customerId === null) {
+            throw new FOSSBilling\Core\Exception\InformationException('The client has no saved card.');
+        }
+        $params = [
+            'amount' => $this->getAmountInMinorUnits($invoice),
+            'currency' => strtolower((string) $invoice->getCurrency()),
+            'customer' => $customerId,
+            'payment_method' => $card['payment_method'],
+            'off_session' => true,
+            'confirm' => true,
+            // A saved method needs no redirect; without this Stripe asks for a return_url and refuses.
+            'automatic_payment_methods' => ['enabled' => true, 'allow_redirects' => 'never'],
+            'description' => $this->getInvoiceTitle($invoice),
+            'receipt_email' => $invoice->getBuyerEmail(),
+            'metadata' => [
+                'client_id' => (string) $invoice->getClientId(),
+                'invoice_id' => (string) $invoice->getId(),
+                'gateway_id' => (string) $this->config['gateway_id'],
+                // Marks the payment as automatic (a bank debit that fails days later emails the client once webhooks handle it).
+                'auto_pay' => '1',
+            ],
+        ];
+
+        try {
+            $intent = $this->stripe->paymentIntents->create($params, ['idempotency_key' => sprintf('saved_card_invoice_%d_%s_%s', $invoice->getId(), $attempt, hash('sha256', json_encode($params, JSON_THROW_ON_ERROR)))]);
+        } catch (Stripe\Exception\CardException $e) {
+            throw new FOSSBilling\Core\Exception\InformationException('The card was declined: :reason', [':reason' => $e->getMessage()]);
+        }
+        // A bank debit stays processing until it clears; the gateway's answer then marks the invoice paid.
+        if (!in_array($intent->status, ['succeeded', 'processing'], true)) {
+            // Off session there is nobody to complete a bank check (3-D Secure): the client pays by hand.
+            throw new FOSSBilling\Core\Exception\InformationException('The card needs the client to confirm the payment.');
+        }
+
+        return $intent->id;
+    }
+
+    /** The client's saved cards at Stripe for the Payment methods page: {id, card, default} each. */
+    public function cards(int $clientId): array
+    {
+        $customerId = $this->ownedCustomer($clientId);
+        if ($customerId === null) {
+            return [];
+        }
+        $default = $this->savedCard($clientId)['payment_method'] ?? '';
+        $cards = [];
+        foreach ($this->methodTypes($clientId) as $type) {
+            foreach ($this->stripe->customers->allPaymentMethods($customerId, ['type' => $type, 'limit' => 20])->data as $method) {
+                $cards[] = ['id' => $method->id, 'card' => $this->cardLabel($method), 'default' => $method->id === $default];
+            }
+        }
+        // A bank account saved before saved bank accounts was turned off still pays: it stays listed, so the client can remove it.
+        if ($default !== '' && !in_array($default, array_column($cards, 'id'), true)) {
+            $method = $this->stripe->paymentMethods->retrieve($default, []);
+            if ($method->customer === $customerId) {
+                $cards[] = ['id' => $method->id, 'card' => $this->cardLabel($method), 'default' => true];
+            }
+        }
+
+        return $cards;
+    }
+
+    /** The payment method types a client can save: cards, and with saved bank accounts on, the bank debit of the client's currency. */
+    private function methodTypes(int $clientId): array
+    {
+        if ((string) ($this->config['bank_debits'] ?? '') !== '1') {
+            return ['card'];
+        }
+        $client = $this->di['em']->getRepository(Client::class)->find($clientId);
+        $currency = strtolower((string) ($client?->getCurrency() ?? ''));
+
+        return array_filter(['card', self::BANK_DEBITS[$currency] ?? null]);
+    }
+
+    /** Whether the client can save a bank account (saved bank accounts on, and a bank debit for the client's currency). */
+    public function bankDebit(int $clientId): bool
+    {
+        return count($this->methodTypes($clientId)) > 1;
+    }
+
+    /** A Stripe setup for adding a card or bank account on the Payment methods page: {client_secret, pub_key}. */
+    public function cardSetup(int $clientId): array
+    {
+        $params = [
+            'customer' => $this->clientCustomer($clientId),
+            'usage' => 'off_session',
+            'payment_method_types' => $this->methodTypes($clientId),
+            'metadata' => ['client_id' => (string) $clientId, 'gateway_id' => (string) $this->config['gateway_id']],
+        ];
+
+        try {
+            $intent = $this->stripe->setupIntents->create($params);
+        } catch (Stripe\Exception\InvalidRequestException $e) {
+            if ($params['payment_method_types'] === ['card']) {
+                throw $e;
+            }
+            // The bank debit is not turned on in the Stripe dashboard: cards only.
+            $this->di['logger']->warning('Stripe: {method} is not available, saving cards only: {message}', ['method' => $params['payment_method_types'][1], 'message' => $e->getMessage()]);
+            $intent = $this->stripe->setupIntents->create(['payment_method_types' => ['card']] + $params);
+        }
+
+        return ['client_secret' => $intent->client_secret, 'pub_key' => $this->testMode() ? $this->config['test_pub_key'] : $this->config['pub_key']];
+    }
+
+    /** After the page confirmed a setup: keeps its card, the default one when the client has none. */
+    public function cardAdded(int $clientId, string $setupIntentId): void
+    {
+        $intent = $this->stripe->setupIntents->retrieve($setupIntentId, []);
+        $customerId = $this->ownedCustomer($clientId);
+        if (!in_array($intent->status, ['succeeded', 'processing'], true) || $customerId === null || $intent->customer !== $customerId || empty($intent->payment_method)) {
+            throw new FOSSBilling\Core\Exception\InformationException('The payment method was not saved. Please try again.');
+        }
+        $this->rememberCard($clientId, (string) $intent->payment_method, false);
+    }
+
+    /** Makes one of the client's cards the one charged automatically. */
+    public function cardDefault(int $clientId, string $paymentMethodId): void
+    {
+        $this->clientMethod($clientId, $paymentMethodId);
+        $this->rememberCard($clientId, $paymentMethodId, true);
+    }
+
+    /** Removes a card from the client's Stripe customer (and as the default card). */
+    public function cardRemove(int $clientId, string $paymentMethodId): void
+    {
+        $this->clientMethod($clientId, $paymentMethodId);
+        $this->stripe->paymentMethods->detach($paymentMethodId, []);
+        $row = $this->di['em']->getRepository(PayGatewayCustomer::class)->findOneByGatewayAndClient($this->gatewayId(), $clientId, $this->testMode());
+        if ($row instanceof PayGatewayCustomer && $row->getDefaultPaymentMethod() === $paymentMethodId) {
+            $row->setDefaultPaymentMethod(null);
+            $row->setDefaultCard(null);
+            $this->di['em']->flush();
+        }
+    }
+
+    /**
+     * Checks available cards only for clients with an established saved-card
+     * customer. Discovery is read-only: the client must choose a card before
+     * it can pay invoices automatically. Never adopt customers by email or
+     * promote a subscription cache into card ownership.
+     * Checks up to $limit clients after $afterId: {checked, found, next}
+     * (next: the id to continue after, or null when all were checked).
+     */
+    public function findCards(int $afterId, int $limit): array
+    {
+        $connection = $this->di['em']->getConnection();
+        $rows = $connection->fetchAllAssociative(
+            'SELECT c.id FROM client c LEFT JOIN pay_gateway_customer g ON g.client_id = c.id AND g.pay_gateway_id = ? AND g.test_mode = ?
+              WHERE c.id > ? AND (g.default_payment_method IS NULL OR g.default_payment_method = ?) ORDER BY c.id LIMIT ' . max(1, $limit),
+            [$this->gatewayId(), (int) $this->testMode(), $afterId, '']
+        );
+        $found = 0;
+        foreach ($rows as $row) {
+            $clientId = (int) $row['id'];
+            $customerId = $this->ownedCustomer($clientId);
+            if ($customerId === null) {
+                continue;
+            }
+            $customer = $this->stripe->customers->retrieve($customerId, []);
+            $default = $customer->invoice_settings->default_payment_method ?? null;
+            $method = is_string($default) ? $default : ($default->id ?? null);
+            $method ??= $this->stripe->customers->allPaymentMethods($customerId, ['type' => 'card', 'limit' => 1])->data[0]->id ?? null;
+            if ($method !== null) {
+                ++$found;
+            }
+        }
+
+        return ['checked' => count($rows), 'found' => $found, 'next' => count($rows) < $limit ? null : (int) end($rows)['id']];
+    }
+
+    /** The client's "Save this card" choice (and "Use this card for automatic payments") on invoice $invoiceId's card form, set on the payment before it is confirmed. */
+    public function cardSaveChoice(int $clientId, int $invoiceId, string $paymentIntentId, bool $save, bool $makeDefault): void
+    {
+        $intent = $this->stripe->paymentIntents->retrieve($paymentIntentId, []);
+        $customerId = $this->ownedCustomer($clientId);
+        if (($intent->metadata['invoice_id'] ?? null) !== (string) $invoiceId || ($intent->metadata['gateway_id'] ?? null) !== (string) $this->gatewayId()
+            || $customerId === null || $intent->customer !== $customerId
+            || !in_array($intent->status, ['requires_payment_method', 'requires_confirmation', 'requires_action'], true)) {
+            throw new FOSSBilling\Core\Exception\InformationException('This payment cannot be changed. Reload the page and try again.');
+        }
+        // The metadata only the server sets tells rememberPaidCard() to make the paid card the automatic one.
+        $this->stripe->paymentIntents->update($paymentIntentId, ['payment_method_options' => ['card' => ['setup_future_usage' => $save ? 'off_session' : '']], 'metadata' => ['make_default' => $makeDefault ? '1' : '']]);
+    }
+
+    /** A successful payment the client chose to save the card with: keeps the card (default when none, or when the client chose it). */
+    private function rememberPaidCard(object $paymentIntent, int $clientId, ?int $currentTransactionId = null): void
+    {
+        $save = ($paymentIntent->setup_future_usage ?? null) === 'off_session' || ($paymentIntent->payment_method_options->card->setup_future_usage ?? null) === 'off_session';
+        if (($paymentIntent->status ?? '') !== 'succeeded' || !$save
+            || empty($paymentIntent->payment_method) || $clientId <= 0
+            || ($paymentIntent->customer ?? null) === null || $paymentIntent->customer !== $this->ownedCustomer($clientId)) {
+            return;
+        }
+        $method = is_string($paymentIntent->payment_method) ? $paymentIntent->payment_method : $paymentIntent->payment_method->id;
+
+        // A payment already recorded is a replay (webhook retry, old return link): it must not undo a default chosen since.
+        $makeDefault = ($paymentIntent->metadata->make_default ?? '') === '1'
+            && !$this->di['em']->getRepository(Transaction::class)->findProcessingOrProcessedByTxnId($paymentIntent->id, $this->gatewayId(), $currentTransactionId)
+            && !$this->di['em']->getRepository(Box\Mod\Client\Entity\ClientBalance::class)->findOneBy([
+                'gatewayReceiptKey' => hash('sha256', $this->gatewayId() . ':' . $paymentIntent->id),
+            ]);
+
+        try {
+            $this->rememberCard($clientId, $method, $makeDefault);
+        } catch (Throwable $e) {
+            // Keeping the card must never stop the payment being recorded; the client can add it again.
+            $this->di['logger']->warning('Stripe: the card saved with payment {payment} was not kept: {message}', ['payment' => $paymentIntent->id ?? '', 'message' => $e->getMessage()]);
+        }
+    }
+
+    /** Keeps a card as the client's default: always with $makeDefault, else only when there is none. */
+    private function rememberCard(int $clientId, string $paymentMethodId, bool $makeDefault): void
+    {
+        $method = $this->stripe->paymentMethods->retrieve($paymentMethodId, []);
+        // A method Stripe did not save (paid with another way than the card the client chose to save) cannot be charged later.
+        if ($method->customer !== $this->ownedCustomer($clientId)) {
+            return;
+        }
+        $row = $this->di['em']->getRepository(PayGatewayCustomer::class)->findOneByGatewayAndClient($this->gatewayId(), $clientId, $this->testMode());
+        if (!$row instanceof PayGatewayCustomer || !$row->hasSavedCards()) {
+            return;
+        }
+        if (!$makeDefault && $row->getDefaultPaymentMethod() !== null && $row->getDefaultPaymentMethod() !== '') {
+            return;
+        }
+        $row->setDefaultPaymentMethod($method->id);
+        $row->setDefaultCard($this->cardLabel($method));
+        // The card a client saved or chose last pays.
+        $row->setAutoPayAt(new DateTimeImmutable());
+        $this->di['em']->flush();
+    }
+
+    /** The client's payment method, or an error when it is not on the client's Stripe customer. */
+    private function clientMethod(int $clientId, string $paymentMethodId): void
+    {
+        $customerId = $this->ownedCustomer($clientId);
+        $method = $customerId === null ? null : $this->stripe->paymentMethods->retrieve($paymentMethodId, []);
+        if ($method === null || $method->customer !== $customerId) {
+            throw new FOSSBilling\Core\Exception\InformationException('Payment method not found.');
+        }
+    }
+
+    /** "Visa •••• 4242 (12/2028)", "BECS Direct Debit •••• 3456 (000-000)". */
+    private function cardLabel(object $method): string
+    {
+        $card = $method->card ?? null;
+        $bank = $method->{$method->type} ?? null;
+
+        return match (true) {
+            $card !== null => sprintf('%s •••• %s (%02d/%d)', ucfirst((string) $card->brand), (string) $card->last4, (int) $card->exp_month, (int) $card->exp_year),
+            $method->type === 'au_becs_debit' => sprintf('BECS Direct Debit •••• %s (%s)', $bank->last4 ?? '', substr_replace((string) ($bank->bsb_number ?? ''), '-', 3, 0)),
+            $method->type === 'sepa_debit' => sprintf('SEPA Direct Debit •••• %s (%s)', $bank->last4 ?? '', $bank->country ?? ''),
+            $method->type === 'bacs_debit' => sprintf('Bacs Direct Debit •••• %s (%s)', $bank->last4 ?? '', implode('-', str_split((string) ($bank->sort_code ?? ''), 2))),
+            default => (string) $method->type,
+        };
+    }
+
+    /**
+     * The client's saved-card customer, made at Stripe when there is none. Never one found by email:
+     * a client could take another person's old email and so their cards. A customer cached for a
+     * subscription (possibly found by email) is replaced by the new one.
+     */
+    private function clientCustomer(int $clientId): string
+    {
+        $customerId = $this->ownedCustomer($clientId);
+        if ($customerId !== null) {
+            return $customerId;
+        }
+        $client = $this->di['em']->getRepository(Client::class)->find($clientId);
+        if (!$client instanceof Client) {
+            throw new FOSSBilling\Core\Exception\InformationException('Client not found');
+        }
+        $customerId = $this->stripe->customers->create([
+            'email' => $client->getEmail(),
+            'name' => trim($client->getFirstName() . ' ' . $client->getLastName()),
+            'metadata' => ['client_id' => (string) $clientId],
+        ])->id;
+        $this->linkCustomer($clientId, $customerId);
+
+        return $this->ownedCustomer($clientId) ?? $customerId;
+    }
+
+    /** Makes $customerId the client's saved-card customer (kept with the subscription customer cache). */
+    private function linkCustomer(int $clientId, string $customerId): void
+    {
+        $repository = $this->di['em']->getRepository(PayGatewayCustomer::class);
+        $row = $repository->findOneByGatewayAndClient($this->gatewayId(), $clientId, $this->testMode());
+        if ($row === null) {
+            $row = new PayGatewayCustomer();
+            $row->setPayGateway($this->di['em']->getReference(PayGateway::class, $this->gatewayId()));
+            $row->setClientId($clientId);
+            $row->setTestMode($this->testMode());
+            $row->setExternalCustomerId($customerId);
+            $row->setSavedCards(true);
+
+            try {
+                $this->di['em']->persist($row);
+                $this->di['em']->flush();
+            } catch (UniqueConstraintViolationException) {
+                $row = $repository->findOneByGatewayAndClient($this->gatewayId(), $clientId, $this->testMode());
+            }
+        }
+        if ($row instanceof PayGatewayCustomer && !$row->hasSavedCards()) {
+            $row->setExternalCustomerId($customerId);
+            $row->setSavedCards(true);
+            $row->setDefaultPaymentMethod(null);
+            $row->setDefaultCard(null);
+            $this->di['em']->flush();
+        }
+    }
+
+    private function createStripeSubscription(string $customerId, string $priceId, Stripe\SetupIntent $setupIntent, Invoice $invoice, ?Transaction $transaction = null): Stripe\Subscription
+    {
+        if ($transaction?->getSId()) {
+            $subscription = $this->stripe->subscriptions->retrieve($transaction->getSId(), []);
+            if ((int) ($subscription->metadata->invoice_id ?? 0) !== $invoice->getId()
+                || (int) ($subscription->metadata->gateway_id ?? 0) !== $this->gatewayId()) {
+                throw new FOSSBilling\Core\Exception\InformationException('The recorded Stripe subscription does not match this invoice and gateway.');
+            }
+
+            return $subscription;
+        }
+        if ($transaction !== null && $this->ownsSubscriptionCredit($transaction)) {
+            throw new FOSSBilling\Core\Exception\InformationException('This transaction already credited a Stripe payment. Record its verified subscription ID before retrying.');
+        }
+
+        $subscriptionParams = [
+            'customer' => $customerId,
             'items' => [[
-                'price' => $price->id,
+                'price' => $priceId,
             ]],
             'default_payment_method' => $setupIntent->payment_method,
             'description' => $this->getInvoiceTitle($invoice),
             'metadata' => [
-                'invoice_id' => $invoice->id,
-                'client_id' => $invoice->client_id,
+                'invoice_id' => (string) $invoice->getId(),
+                'client_id' => (string) $invoice->getClientId(),
                 'gateway_id' => (string) $this->config['gateway_id'],
             ],
-        ], ['idempotency_key' => 'sub_invoice_' . $invoice->id]);
-    }
-
-    private function getOrCreateProduct(Model_Invoice $invoice): Stripe\Product
-    {
-        $invoiceItems = $this->di['db']->getAll(
-            'SELECT title FROM invoice_item WHERE invoice_id = :invoice_id',
-            [':invoice_id' => $invoice->id]
+        ];
+        // Hashing the resolved params into the key, like _generateForm() and
+        // generateSubscriptionFormUnderLock() do, covers the same invoice
+        // producing setup intents with different customers/prices over time
+        // (e.g. a stale setup intent's late webhook arriving after a reload
+        // already completed checkout with a different one) - reusing a plain
+        // invoice-id key across that would hit an idempotency_error instead
+        // of the expected/handled idempotency_key_in_use race.
+        $idempotencyKey = sprintf(
+            'sub_invoice_%d_gateway_%d_%s',
+            $invoice->getId(),
+            $this->config['gateway_id'],
+            hash('sha256', json_encode($subscriptionParams, JSON_THROW_ON_ERROR))
         );
 
-        if (empty($invoiceItems)) {
-            throw new RuntimeException('No invoice items found for invoice ID: ' . $invoice->id);
+        return $this->stripe->subscriptions->create($subscriptionParams, ['idempotency_key' => $idempotencyKey]);
+    }
+
+    /**
+     * Resolve the Stripe customer to subscribe, preferring the customer
+     * already attached to the setup intent (set once in
+     * _generateSubscriptionForm()) over asking getOrCreateCustomer() again.
+     *
+     * Both the redirect flow (processSetupIntent) and the webhook flow
+     * (handleSetupIntentSucceededWebhook) can run for the same invoice, and
+     * createStripeSubscription() relies on both submitting identical
+     * parameters under the same idempotency key. getOrCreateCustomer() is
+     * safe to call from both now (see its docblock), but reading the ID
+     * already sitting on the setup intent both flows already fetched skips
+     * a redundant cache lookup for no behavioral difference.
+     */
+    private function resolveSubscriptionCustomerId(Stripe\SetupIntent $setupIntent, Invoice $invoice): string
+    {
+        if (!empty($setupIntent->customer)) {
+            return is_string($setupIntent->customer) ? $setupIntent->customer : $setupIntent->customer->id;
         }
 
-        $productName = $invoiceItems[0]['title'];
+        return $this->getOrCreateCustomer($invoice);
+    }
 
+    /**
+     * Resolve the Stripe price to subscribe to, preferring the price ID
+     * already stored in the setup intent's metadata (set once in
+     * _generateSubscriptionForm()) over asking getOrCreatePriceId() again -
+     * see resolveSubscriptionCustomerId() for why that's just avoiding a
+     * redundant lookup rather than a correctness requirement.
+     */
+    private function resolveSubscriptionPriceId(Stripe\SetupIntent $setupIntent, Invoice $invoice): string
+    {
+        $period = $this->requireSubscriptionPeriod($invoice);
+        $priceId = $setupIntent->metadata->price_id ?? null;
+        if (!empty($priceId)) {
+            return $priceId;
+        }
+
+        return $this->getOrCreatePriceId($invoice, $period);
+    }
+
+    /**
+     * Resolve the Stripe price ID for an invoice's product, preferring a
+     * locally cached ID (see {@see PayGatewayProduct}) over asking Stripe -
+     * for the same reason, and via the same pattern, as
+     * {@see getOrCreateCustomer()}.
+     */
+    private function getOrCreatePriceId(Invoice $invoice, ?string $period = null): string
+    {
+        $period ??= $this->requireSubscriptionPeriod($invoice);
+        $gatewayId = (int) $this->config['gateway_id'];
+        $productName = $this->getInvoiceProductName($invoice);
+        $amount = $this->getAmountInCents($invoice);
+        $currency = strtolower((string) $invoice->getCurrency());
+        $recurring = $this->getStripeRecurringParams($period);
+        $cacheKey = $this->buildProductCacheKey($productName, $currency, $amount, $recurring);
+
+        $cached = $this->di['em']->getRepository(PayGatewayProduct::class)
+            ->findOneByGatewayAndCacheKey($gatewayId, $cacheKey);
+        if ($cached instanceof PayGatewayProduct) {
+            return $cached->getExternalPriceId();
+        }
+
+        [$externalProductId, $externalPriceId] = $this->resolvePriceFromStripe($productName, $amount, $currency, $recurring, $invoice);
+
+        return $this->cacheGatewayProduct($gatewayId, $cacheKey, $productName, $externalProductId, $externalPriceId);
+    }
+
+    private function getInvoiceProductName(Invoice $invoice): string
+    {
+        $invoiceItems = $this->getInvoiceItemTitles($invoice);
+
+        if (empty($invoiceItems)) {
+            throw new RuntimeException('No invoice items found for invoice ID: ' . $invoice->getId());
+        }
+
+        return $invoiceItems[0]['title'];
+    }
+
+    /**
+     * @param array{interval: string, interval_count: int} $recurring
+     */
+    private function buildProductCacheKey(string $productName, string $currency, int $amount, array $recurring): string
+    {
+        return hash('sha256', implode('|', [
+            $productName,
+            $currency,
+            $amount,
+            $recurring['interval'],
+            $recurring['interval_count'],
+        ]));
+    }
+
+    /**
+     * Resolve a Stripe product/price pair that isn't cached locally yet -
+     * via a one-time Search/List lookup, falling back to creating them.
+     * Only ever reached on a cache miss - see resolveCustomerIdFromStripe().
+     *
+     * @param array{interval: string, interval_count: int} $recurring
+     *
+     * @return array{0: string, 1: string} the external product ID and price ID
+     */
+    private function resolvePriceFromStripe(string $productName, int $amount, string $currency, array $recurring, Invoice $invoice): array
+    {
         $products = $this->stripe->products->search([
             'query' => "name:'" . $this->escapeStripeSearchValue($productName) . "'",
             'limit' => 1,
         ]);
 
-        if (count($products->data) > 0) {
-            return $products->data[0];
-        }
-
-        return $this->stripe->products->create([
-            'name' => $productName,
-            'description' => $this->getInvoiceTitle($invoice),
-        ]);
-    }
-
-    private function getOrCreatePrice(Stripe\Product $product, Model_Invoice $invoice): Stripe\Price
-    {
-        $amount = $this->getAmountInCents($invoice);
-        $currency = strtolower($invoice->currency);
-        $recurring = $this->getStripeRecurringParams(
-            $this->getSubscriptionPeriodForInvoice($invoice)
-        );
+        $product = count($products->data) > 0
+            ? $products->data[0]
+            : $this->stripe->products->create([
+                'name' => $productName,
+                'description' => $this->getInvoiceTitle($invoice),
+            ]);
 
         // Stripe's price list filter only supports 'interval' (not 'interval_count') under
         // 'recurring', so the match below must also compare interval_count explicitly -
@@ -1348,19 +2563,58 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
 
         foreach ($prices->data as $existingPrice) {
             if ($existingPrice->unit_amount === $amount && ($existingPrice->recurring->interval_count ?? null) === $recurring['interval_count']) {
-                return $existingPrice;
+                return [$product->id, $existingPrice->id];
             }
         }
 
-        return $this->stripe->prices->create([
+        $price = $this->stripe->prices->create([
             'product' => $product->id,
             'unit_amount' => $amount,
             'currency' => $currency,
             'recurring' => $recurring,
         ]);
+
+        return [$product->id, $price->id];
     }
 
-    private function getSubscriptionPeriodForInvoice(Model_Invoice $invoice): string
+    /**
+     * Persist a resolved product/price pair and return the price ID that
+     * ends up cached - see cacheGatewayCustomer() for why this uses its own
+     * isolated EntityManager and re-reads the winner on a unique constraint
+     * violation.
+     */
+    private function cacheGatewayProduct(int $gatewayId, string $cacheKey, string $name, string $externalProductId, string $externalPriceId): string
+    {
+        $em = $this->newIsolatedEntityManager();
+
+        try {
+            $record = new PayGatewayProduct();
+            $record->setPayGateway($em->getReference(PayGateway::class, $gatewayId));
+            $record->setCacheKey($cacheKey);
+            $record->setName($name);
+            $record->setExternalProductId($externalProductId);
+            $record->setExternalPriceId($externalPriceId);
+
+            $em->persist($record);
+            $em->flush();
+
+            return $externalPriceId;
+        } catch (UniqueConstraintViolationException) {
+            /** @var Box\Mod\Invoice\Repository\PayGatewayProductRepository $repository */
+            $repository = $em->getRepository(PayGatewayProduct::class);
+            $winner = $repository->findOneByGatewayAndCacheKey($gatewayId, $cacheKey);
+
+            return $winner instanceof PayGatewayProduct ? $winner->getExternalPriceId() : $externalPriceId;
+        }
+    }
+
+    private function requireSubscriptionPeriod(Invoice $invoice): string
+    {
+        return $this->di['mod_service']('Invoice', 'Subscription')->getSubscriptionPeriod($invoice)
+            ?? throw new FOSSBilling\Core\Exception\InformationException('This invoice is no longer eligible for a subscription. Please use a one-time payment.');
+    }
+
+    private function getSubscriptionPeriodForInvoice(Invoice $invoice): string
     {
         $subscriptionService = $this->di['mod_service']('Invoice', 'Subscription');
         $period = $subscriptionService->getSubscriptionPeriod($invoice);
@@ -1369,9 +2623,9 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
     }
 
     /**
-     * Converts a Box_Period code (e.g. "1M", "3Y", "45D") into Stripe's recurring price
+     * Converts a billing period code (e.g. "1M", "3Y", "45D") into Stripe's recurring price
      * parameters. Stripe caps how large interval_count can be per unit, so periods that
-     * exceed those caps (Box_Period already allows up to 5 years) are rejected outright
+     * exceed those caps (billing periods allow up to 5 years) are rejected outright
      * rather than silently mis-billed.
      *
      * @see https://docs.stripe.com/api/prices/create#create_price-recurring-interval_count
@@ -1380,7 +2634,7 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
      */
     private function getStripeRecurringParams(string $periodCode): array
     {
-        $period = new Box_Period($periodCode);
+        $period = new Period($periodCode);
         $interval = $this->convertPeriodToStripe($period);
         $intervalCount = $period->getQty();
 
@@ -1402,25 +2656,26 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
         ];
     }
 
-    private function convertPeriodToStripe(Box_Period $period): string
+    private function convertPeriodToStripe(Period $period): string
     {
         return match ($period->getUnit()) {
-            Box_Period::UNIT_DAY => 'day',
-            Box_Period::UNIT_WEEK => 'week',
-            Box_Period::UNIT_MONTH => 'month',
-            Box_Period::UNIT_YEAR => 'year',
+            Period::UNIT_DAY => 'day',
+            Period::UNIT_WEEK => 'week',
+            Period::UNIT_MONTH => 'month',
+            Period::UNIT_YEAR => 'year',
             default => 'month',
         };
     }
 
-    private function getClientFromTransaction(Transaction $tx, Stripe\PaymentIntent $charge): Model_Client
+    private function getClientFromTransaction(Transaction $tx, Stripe\PaymentIntent $charge): Client
     {
         $clientId = (int) ($charge->metadata->client_id ?? 0);
 
         if ($clientId > 0) {
             try {
-                return $this->di['db']->getExistingModelById('Client', $clientId);
-            } catch (FOSSBilling\Exception $e) {
+                return $this->di['em']->getRepository(Client::class)->find($clientId)
+                    ?? throw new FOSSBilling\Core\Exception\InformationException('Client not found');
+            } catch (FOSSBilling\Core\Exception\BaseException $e) {
                 throw new Payment_Exception('Unable to load client for transaction: :msg', [':msg' => $e->getMessage()]);
             }
         }
@@ -1428,23 +2683,52 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
         throw new Payment_Exception('Unable to determine client for transaction. No invoice or client metadata available.');
     }
 
-    protected function _generateForm(Model_Invoice $invoice): string
+    protected function _generateForm(Invoice $invoice): string
     {
         $intentParams = [
             'amount' => $this->getAmountInMinorUnits($invoice),
-            'currency' => strtolower($invoice->currency),
+            'currency' => strtolower((string) $invoice->getCurrency()),
             'description' => $this->getInvoiceTitle($invoice),
             'automatic_payment_methods' => ['enabled' => true],
-            'receipt_email' => $invoice->buyer_email,
+            'receipt_email' => $invoice->getBuyerEmail(),
             'metadata' => [
-                'client_id' => (string) $invoice->client_id,
-                'invoice_id' => (string) $invoice->id,
+                'client_id' => (string) $invoice->getClientId(),
+                'invoice_id' => (string) $invoice->getId(),
                 'gateway_id' => (string) $this->config['gateway_id'],
             ],
         ];
+        // A signed-in client paying their own invoice may save the card (and use a saved
+        // one), through a customer session.
+        $customerSession = null;
+        $saveCard = null;
+        $autoCard = null;
+        $loggedInClientId = isset($this->di['loggedin_client']) ? (int) $this->di['loggedin_client']->getId() : 0;
+        if ($loggedInClientId > 0 && $loggedInClientId === (int) $invoice->getClientId()) {
+            try {
+                $customerId = $this->clientCustomer((int) $invoice->getClientId());
+                $autoCard = $this->savedCard((int) $invoice->getClientId());
+                $customerSession = $this->stripe->customerSessions->create([
+                    'customer' => $customerId,
+                    'components' => ['payment_element' => ['enabled' => true, 'features' => [
+                        'payment_method_redisplay' => 'enabled',
+                        // Cards saved on the Payment methods page are "unspecified", which Stripe hides by default.
+                        'payment_method_allow_redisplay_filters' => ['always', 'limited', 'unspecified'],
+                        // Our own "Save this card" box: Stripe's box is always unticked.
+                        'payment_method_save' => 'disabled',
+                        'payment_method_remove' => 'disabled',
+                    ]]],
+                ]);
+                $intentParams['customer'] = $customerId;
+                $saveCard = true;
+                $intentParams['payment_method_options'] = ['card' => ['setup_future_usage' => 'off_session']];
+            } catch (Throwable $e) {
+                // Saving a card is extra: the client can always pay without it.
+                $this->di['logger']->warning('Stripe: no saved cards on invoice #{id}: {message}', ['id' => $invoice->getId(), 'message' => $e->getMessage()]);
+            }
+        }
         $idempotencyKey = sprintf(
             'one_time_invoice_%d_gateway_%d_%s',
-            $invoice->id,
+            $invoice->getId(),
             $this->config['gateway_id'],
             hash('sha256', json_encode($intentParams, JSON_THROW_ON_ERROR))
         );
@@ -1462,6 +2746,7 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
                     <div id="payment-element">
                         <!-- Stripe Elements will create form elements here -->
                     </div>
+:save_card
 
                     <button id="submit" class="btn btn-primary mt-2" style="margin-top: 0.5em;">Submit</button>
 
@@ -1477,7 +2762,7 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
 
                     var elements = stripe.elements({
                         clientSecret: \':intent_secret\',
-                        appearance: stripeAppearance,
+                        appearance: stripeAppearance,:customer_session
                       });
 
                     var paymentElement = elements.create(\'payment\', {
@@ -1490,9 +2775,41 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
                     paymentElement.mount(\'#payment-element\');
 
                     const form = document.getElementById(\'payment-form\');
+                    const saveCard = document.getElementById(\'fb-save-card\');
+                    const cardDefault = document.getElementById(\'fb-card-default\');
+                    let newCard = true;
+                    if (saveCard) {
+                        // The save boxes are for a new card only: not a saved method (payment_method).
+                        paymentElement.on(\'change\', (event) => {
+                            newCard = event.value.type === \'card\' && !event.value.payment_method;
+                            document.getElementById(\'fb-save-card-box\').hidden = !newCard;
+                        });
+                        saveCard.addEventListener(\'change\', () => {
+                            if (cardDefault) {
+                                document.getElementById(\'fb-card-default-box\').hidden = !saveCard.checked;
+                            }
+                        });
+                    }
 
                     form.addEventListener(\'submit\', async (event) => {
                     event.preventDefault();
+
+                    if (saveCard) {
+                        const save = newCard && saveCard.checked;
+                        try {
+                            await new Promise((resolve, reject) => {
+                                FOSSBilling.api.client.post(\'invoice/card_save_choice\', {hash: \':invoice_hash\', gateway_id: \':gateway_id\', intent: \':intent_id\', save: save ? 1 : 0, make_default: save && cardDefault && cardDefault.checked ? 1 : 0}, resolve, reject);
+                            });
+                            const updated = await elements.fetchUpdates();
+                            if (updated.error) {
+                                throw updated.error;
+                            }
+                        } catch (saveError) {
+                            const messageContainer = document.querySelector(\'#error-message\');
+                            messageContainer.innerHTML = `<p class="alert alert-danger">${saveError.message}</p>`;
+                            return;
+                        }
+                    }
 
                     const {error} = await stripe.confirmPayment({
                         elements,
@@ -1500,8 +2817,8 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
                             return_url: \':callbackUrl&redirect=true&invoice_hash=:invoice_hash\',
                             payment_method_data: {
                                 billing_details: {
-                                    name: \':buyer_name\',
-                                    email: \':buyer_email\',
+                                    name: :buyer_name,
+                                    email: :buyer_email,
                                 },
                             },
                         },
@@ -1519,31 +2836,74 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
         $bindings = [
             ':pub_key' => $pubKey,
             ':intent_secret' => $intent->client_secret,
-            ':buyer_email' => htmlspecialchars((string) $invoice->buyer_email, ENT_QUOTES, 'UTF-8'),
-            ':buyer_name' => htmlspecialchars(trim($invoice->buyer_first_name . ' ' . $invoice->buyer_last_name), ENT_QUOTES, 'UTF-8'),
+            ':intent_id' => $intent->id,
+            ':gateway_id' => (string) $this->gatewayId(),
+            ':save_card' => $saveCard === null ? '' : sprintf(
+                '<div id="fb-save-card-box" class="mt-2"><div class="form-check"><input class="form-check-input" type="checkbox" id="fb-save-card" checked><label class="form-check-label" for="fb-save-card">%s</label><div class="form-text">%s</div></div>%s</div>',
+                htmlspecialchars(__trans('Save this card for future invoices'), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'),
+                htmlspecialchars($autoCard === null
+                    ? __trans('This card will pay this account\'s invoices automatically. You can remove it on the Payment methods page.')
+                    : __trans('A saved card can pay this account\'s invoices automatically. You can remove it on the Payment methods page.'), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'),
+                $autoCard === null ? '' : sprintf(
+                    '<div class="form-check" id="fb-card-default-box"><input class="form-check-input" type="checkbox" id="fb-card-default"><label class="form-check-label" for="fb-card-default">%s</label></div>',
+                    htmlspecialchars(__trans('Use this card for automatic payments instead of :card', [':card' => $autoCard['card']]), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'))
+            ),
+            ':buyer_email' => self::encodeJsString((string) $invoice->getBuyerEmail()),
+            ':buyer_name' => self::encodeJsString(trim($invoice->getBuyerFirstName() . ' ' . $invoice->getBuyerLastName())),
             ':callbackUrl' => $this->config['notify_url'],
-            ':invoice_hash' => $invoice->hash,
+            ':invoice_hash' => $invoice->getHash(),
+            ':customer_session' => $customerSession === null ? '' : ' customerSessionClientSecret: ' . self::encodeJsString((string) $customerSession->client_secret) . ',',
         ];
 
         return strtr($form, $bindings);
     }
 
-    protected function _generateSubscriptionForm(Model_Invoice $invoice): string
+    protected function _generateSubscriptionForm(Invoice $invoice): string
     {
-        $customer = $this->getOrCreateCustomer($invoice);
-        $product = $this->getOrCreateProduct($invoice);
-        $price = $this->getOrCreatePrice($product, $invoice);
+        // This is the sole point where the Stripe customer/product/price are
+        // resolved for a subscription checkout, but the checkout page can be
+        // loaded more than once for the same invoice (a reload, a duplicate
+        // tab, the user pressing back and forward). getOrCreateCustomer()
+        // and getOrCreatePriceId() are each individually safe to call from
+        // two such loads at once (see their docblocks), but locking on the
+        // invoice ID here still avoids two loads redundantly repeating the
+        // same cache lookups and Stripe calls, and the idempotency key on
+        // setupIntents->create() below makes a second load reuse the very
+        // same setup intent instead of creating another one.
+        return $this->withStripeObjectLock(
+            'gen_subscription_form_invoice_' . $invoice->getId(),
+            (int) $this->config['gateway_id'],
+            fn (): string => $this->generateSubscriptionFormUnderLock($invoice)
+        );
+    }
 
-        $setupIntent = $this->stripe->setupIntents->create([
-            'customer' => $customer->id,
-            'payment_method_types' => ['card'],
+    private function generateSubscriptionFormUnderLock(Invoice $invoice): string
+    {
+        $customerId = $this->getOrCreateCustomer($invoice);
+        $priceId = $this->getOrCreatePriceId($invoice);
+
+        $setupIntentParams = [
+            'customer' => $customerId,
+            'allowed_payment_method_types' => ['card'],
             'usage' => 'off_session',
             'metadata' => [
-                'invoice_id' => $invoice->id,
-                'price_id' => $price->id,
+                'invoice_id' => (string) $invoice->getId(),
+                'price_id' => $priceId,
                 'gateway_id' => (string) $this->config['gateway_id'],
             ],
-        ]);
+        ];
+        // Hashing the resolved params into the key, like _generateForm() does for
+        // one-time payments, covers the case where they legitimately differ between
+        // two loads of the same invoice's checkout page (e.g. an admin edits the
+        // invoice's items/amount between them) - reusing a plain invoice-id key
+        // across that would hit the same idempotency_error this file exists to avoid.
+        $idempotencyKey = sprintf(
+            'setup_invoice_%d_gateway_%d_%s',
+            $invoice->getId(),
+            $this->config['gateway_id'],
+            hash('sha256', json_encode($setupIntentParams, JSON_THROW_ON_ERROR))
+        );
+        $setupIntent = $this->stripe->setupIntents->create($setupIntentParams, ['idempotency_key' => $idempotencyKey]);
 
         $pubKey = ($this->config['test_mode']) ? $this->config['test_pub_key'] : $this->config['pub_key'];
 
@@ -1585,8 +2945,8 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
                                 return_url: \':callbackUrl&redirect=true&invoice_hash=:invoice_hash\',
                                 payment_method_data: {
                                     billing_details: {
-                                        name: \':buyer_name\',
-                                        email: \':buyer_email\',
+                                        name: :buyer_name,
+                                        email: :buyer_email,
                                     },
                                 },
                             },
@@ -1603,10 +2963,10 @@ class Payment_Adapter_Stripe implements FOSSBilling\InjectionAwareInterface
         $bindings = [
             ':pub_key' => $pubKey,
             ':setup_intent_secret' => $setupIntent->client_secret,
-            ':buyer_email' => htmlspecialchars($invoice->buyer_email ?? '', ENT_QUOTES, 'UTF-8'),
-            ':buyer_name' => htmlspecialchars(trim($invoice->buyer_first_name . ' ' . $invoice->buyer_last_name), ENT_QUOTES, 'UTF-8'),
+            ':buyer_email' => self::encodeJsString($invoice->getBuyerEmail() ?? ''),
+            ':buyer_name' => self::encodeJsString(trim($invoice->getBuyerFirstName() . ' ' . $invoice->getBuyerLastName())),
             ':callbackUrl' => $this->config['notify_url'],
-            ':invoice_hash' => $invoice->hash,
+            ':invoice_hash' => $invoice->getHash(),
         ];
 
         return strtr($form, $bindings);

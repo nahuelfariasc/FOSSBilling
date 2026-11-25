@@ -2,8 +2,8 @@
   <br>
   <a href="https://fossbilling.org/">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/FOSSBilling/branding/refs/heads/main/logo-svg/fossb_logo-white_text.svg">
-      <img alt="FOSSBilling logo" src="https://raw.githubusercontent.com/FOSSBilling/branding/refs/heads/main/logo-svg/fossb_logo-black_text.svg" height="100">
+      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/FOSSBilling/branding/refs/heads/main/assets/dark-background/fossbilling-logo.svg">
+      <img alt="FOSSBilling logo" src="https://raw.githubusercontent.com/FOSSBilling/branding/refs/heads/main/assets/light-background/fossbilling-logo.svg" height="100">
     </picture>
   </a>
   <br>
@@ -11,7 +11,7 @@
 
 <div align="center">
 
-<a href="https://fossbilling.org/downloads/"><img src="https://raw.githubusercontent.com/FOSSBilling/fossbilling.org/main/public/img/gh/download-button.png" alt="Download button" width="400"/></a>
+<a href="https://fossbilling.org/downloads/"><img src="https://fossbilling.org/img/gh/download-button.png" alt="Download button" width="400"/></a>
 
 [![CI](https://github.com/FOSSBilling/FOSSBilling/actions/workflows/ci.yml/badge.svg)](https://github.com/FOSSBilling/FOSSBilling/actions/workflows/ci.yml)
 [![Download Latest](https://img.shields.io/github/downloads/FOSSBilling/FOSSBilling/total)](https://github.com/FOSSBilling/FOSSBilling/releases/latest)
@@ -46,6 +46,8 @@
 
 FOSSBilling runs on standard LAMP/LEMP stacks. For the latest system requirements (PHP version, extensions, database, etc.), see the official [requirements](https://docs.fossbilling.org/getting-started/requirements/).
 
+Install and enable PHP's ZIP extension (`ext-zip`) for the web server and CLI before installing or upgrading FOSSBilling.
+
 ### Installation
 
 Follow the step-by-step [Getting Started guide](https://docs.fossbilling.org/getting-started/).
@@ -64,11 +66,11 @@ If you prefer to start a conversation first, drop by the [forum](https://forum.f
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=FOSSBilling%2FFOSSBilling&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=fossbilling%2Ffossbilling&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=FOSSBilling/FOSSBilling&type=date&theme=dark&legend=top-left&sealed_token=ioJopLgtNzi8yMGmGszWYUH4Wt8JZOgRfi9GscyJOzAhSUWXjpK_hCml7VrZAOnJkL7sWGtd47X7WWR-a0hnJrYr6v-S6IjBNrQJW36PZPQXZSXcfiTnasf0F_U2DDomBkP_p3hUcPegkId4CIwL5vk4dM1S_K-bjklbRDDqnSJpnZg7Pus4QG8uez3K" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=FOSSBilling/FOSSBilling&type=date&legend=top-left&sealed_token=ioJopLgtNzi8yMGmGszWYUH4Wt8JZOgRfi9GscyJOzAhSUWXjpK_hCml7VrZAOnJkL7sWGtd47X7WWR-a0hnJrYr6v-S6IjBNrQJW36PZPQXZSXcfiTnasf0F_U2DDomBkP_p3hUcPegkId4CIwL5vk4dM1S_K-bjklbRDDqnSJpnZg7Pus4QG8uez3K" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=FOSSBilling/FOSSBilling&type=date&legend=top-left&sealed_token=ioJopLgtNzi8yMGmGszWYUH4Wt8JZOgRfi9GscyJOzAhSUWXjpK_hCml7VrZAOnJkL7sWGtd47X7WWR-a0hnJrYr6v-S6IjBNrQJW36PZPQXZSXcfiTnasf0F_U2DDomBkP_p3hUcPegkId4CIwL5vk4dM1S_K-bjklbRDDqnSJpnZg7Pus4QG8uez3K" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=fossbilling/fossbilling&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=fossbilling/fossbilling&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=fossbilling/fossbilling&type=date&legend=top-left" />
  </picture>
 </a>
 

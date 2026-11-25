@@ -18,7 +18,7 @@ use Doctrine\ORM\ORMSetup;
 test('maps service_custom table without changing columns', function (): void {
     $config = ORMSetup::createAttributeMetadataConfig([dirname(__DIR__, 3) . '/Entity'], true);
     $config->setProxyDir(sys_get_temp_dir());
-    $config->setProxyNamespace('FOSSBilling\\Tests\\DoctrineProxies');
+    $config->setProxyNamespace('FOSSBilling\\Core\\Tests\\DoctrineProxies');
     $entityManager = new EntityManager(DriverManager::getConnection(['driver' => 'pdo_sqlite', 'memory' => true]), $config);
 
     $meta = $entityManager->getClassMetadata(ServiceCustom::class);
@@ -41,16 +41,16 @@ test('service custom getters and setters round-trip values', function (): void {
 
     $entity->setClientId(10)
         ->setPlugin('MyPlugin')
-        ->setPluginConfig('{"key":"val"}')
+        ->setPluginConfig(['key' => 'val'])
         ->setF1('field1')
         ->setF10('field10')
-        ->setConfig('{"a":1}');
+        ->setConfig(['a' => 1]);
 
     expect($entity->getClientId())->toBe(10)
         ->and($entity->getPlugin())->toBe('MyPlugin')
-        ->and($entity->getPluginConfig())->toBe('{"key":"val"}')
+        ->and($entity->getPluginConfig())->toBe(['key' => 'val'])
         ->and($entity->getF1())->toBe('field1')
         ->and($entity->getF10())->toBe('field10')
-        ->and($entity->getConfig())->toBe('{"a":1}')
+        ->and($entity->getConfig())->toBe(['a' => 1])
         ->and($entity->getId())->toBeNull();
 });

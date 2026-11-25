@@ -1,0 +1,3250 @@
+<?php
+
+declare(strict_types=1);
+/**
+ * Copyright 2022-2026 FOSSBilling
+ * SPDX-License-Identifier: Apache-2.0.
+ *
+ * @copyright FOSSBilling (https://www.fossbilling.org)
+ * @license http://www.apache.org/licenses/LICENSE-2.0 Apache-2.0
+ */
+
+namespace FOSSBilling\Core\Update;
+
+use FOSSBilling\Core\Container\InjectionAwareInterface;
+use FOSSBilling\Core\Doctrine\Driver;
+use FOSSBilling\Core\Doctrine\DriverManagerFactory;
+use FOSSBilling\Core\Doctrine\EncryptedConfigurationMigration;
+use FOSSBilling\Core\Doctrine\EntityManagerFactory;
+use FOSSBilling\Core\Doctrine\ModuleEntityScope;
+use FOSSBilling\Core\Doctrine\SchemaSynchronizer;
+use FOSSBilling\Core\Enums\ExtensionType;
+use FOSSBilling\Core\Exception\BaseException;
+use FOSSBilling\Core\Security\Crypt;
+use FOSSBilling\Core\System\Config;
+use FOSSBilling\Core\System\Environment;
+use FOSSBilling\Core\System\Version;
+use Symfony\Component\Filesystem\Exception\IOException;
+use Symfony\Component\Filesystem\Filesystem;
+use Symfony\Component\Filesystem\Path;
+use Symfony\Component\Finder\Finder;
+use Symfony\Component\Uid\Uuid;
+
+class Patcher implements InjectionAwareInterface
+{
+    private const string SCHEMA_METADATA_HASH_PARAM = 'schema_metadata_hash';
+    private const string SCHEMA_METADATA_HASH_FAILED_PARAM = 'schema_metadata_hash_failed';
+    private const int SCHEMA_SYNC_RETRY_COOLDOWN = 3600;
+    private const string INVOICE_ITEM_ORDER_BACKFILL_DONE = 'invoice_item_order_id_backfill_done';
+    /**
+     * Rescan when the derivation rule changes. Rule 3 also recognizes paid
+     * order references ending in ASCII spaces, which older rules skipped.
+     */
+    public const string INVOICE_ITEM_ORDER_BACKFILL_RULE_VERSION = '3';
+    private bool $schemaSyncFailed = false;
+    public ?\Pimple\Container $di = null;
+    public Filesystem $filesystem;
+
+    public function __construct()
+    {
+        $this->filesystem = new Filesystem();
+    }
+
+    public function setDi(\Pimple\Container $di): void
+    {
+        $this->di = $di;
+        if (isset($di['filesystem'])) {
+            $this->filesystem = $di['filesystem'];
+        }
+    }
+
+    public function getDi(): ?\Pimple\Container
+    {
+        return $this->di;
+    }
+
+    public function availablePatches(): int
+    {
+        // These are MySQL/MariaDB-only patches (see applyCorePatches()) - never "pending" on
+        // another platform, regardless of what the last_patch bookkeeping row says.
+        if (!$this->isLegacyPatchDriver()) {
+            return 0;
+        }
+
+        $patchLevel = $this->getPatchLevel();
+        $patches = $this->getPatches($patchLevel);
+
+        return count($patches);
+    }
+
+    public function latestPatchLevel(): int
+    {
+        $patches = $this->getPatches();
+        $latestPatchLevel = array_key_last($patches);
+
+        return is_int($latestPatchLevel) ? $latestPatchLevel : 0;
+    }
+
+    /**
+     * Apply configuration file patches.
+     */
+    public function applyConfigPatches(bool $force = false): void
+    {
+        // Legacy auto-updaters call this after extracting new files.
+        // Make it no-op unless the request is coming from the new post-update hello screen.
+        // This makes old versions automatically defer to the new hello screen without running the patches.
+        if (!$force) {
+            return;
+        }
+
+        $currentConfig = Config::getConfig();
+
+        if (empty($currentConfig)) {
+            throw new BaseException('Unable to load existing configuration');
+        }
+
+        $newConfig = $currentConfig;
+        $newConfig['security'] ??= [];
+        $newConfig['security']['mode'] ??= 'strict';
+        $newConfig['security']['force_https'] ??= true;
+        $newConfig['security']['trusted_proxies'] ??= [];
+        $newConfig['security']['trusted_proxies']['enabled'] ??= false;
+        $newConfig['security']['trusted_proxies']['proxies'] ??= [];
+        $newConfig['security']['trusted_proxies']['headers'] ??= 'x_forwarded';
+        $newConfig['security']['session_lifespan'] ??= $newConfig['security']['cookie_lifespan'] ?? 7200;
+        $newConfig['security']['session_regeneration_grace_period'] ??= 300;
+        $newConfig['security']['perform_session_fingerprinting'] ??= true;
+        $newConfig['security']['debug_fingerprint'] ??= false;
+        $newConfig['update_branch'] ??= 'release';
+        $newConfig['log_stacktrace'] ??= true;
+        $newConfig['stacktrace_length'] ??= 25;
+        $newConfig['maintenance_mode']['enabled'] ??= false;
+        $newConfig['maintenance_mode']['allowed_urls'] ??= [];
+        $newConfig['maintenance_mode']['allowed_ips'] ??= [];
+        $newConfig['disable_auto_cron'] = !Version::isPreviewVersion() && !Environment::isDevelopment();
+        $newConfig['i18n']['locale'] ??= $currentConfig['locale'] ?? 'en_US';
+        $newConfig['i18n']['auto_detect_locale'] ??= true;
+        $newConfig['i18n']['timezone'] ??= $currentConfig['timezone'] ?? 'UTC';
+        $newConfig['i18n']['date_format'] ??= 'medium';
+        $newConfig['i18n']['time_format'] ??= 'short';
+        $newConfig['db']['driver'] ??= 'pdo_mysql';
+        $rawDriver = $newConfig['db']['driver'] ?? 'pdo_mysql';
+        $driver = Driver::tryFromAlias($rawDriver);
+        $normalizedDriver = $driver instanceof Driver ? $driver->value : $rawDriver;
+        $newConfig['db']['driver'] = $normalizedDriver;
+        if ($driver instanceof Driver && $driver->isSqlite()) {
+            unset($newConfig['db']['port']);
+        } else {
+            $defaultPort = $driver instanceof Driver && $driver->defaultPort() !== null ? $driver->defaultPort() : 3306;
+            $newConfig['db']['port'] = \FOSSBilling\Core\Utils\Normalizer::normalizePort($newConfig['db']['port'] ?? null, $defaultPort);
+        }
+        unset(
+            $newConfig['api']['rate_span'],
+            $newConfig['api']['rate_limit'],
+            $newConfig['api']['throttle_delay'],
+            $newConfig['api']['rate_span_login'],
+            $newConfig['api']['rate_limit_login'],
+            $newConfig['api']['rate_limit_whitelist'],
+        );
+        $newConfig['api']['CSRFPrevention'] ??= true;
+        $newConfig['rate_limiter']['enabled'] ??= true;
+        $newConfig['rate_limiter']['whitelist_ips'] ??= [];
+        $newConfig['rate_limiter']['policies'] ??= [];
+        $newConfig['rate_limiter']['whitelist_ips'] = array_values(array_unique(array_merge($newConfig['rate_limiter']['whitelist_ips'], $currentConfig['api']['rate_limit_whitelist'] ?? [])));
+        $newConfig['debug_and_monitoring'] ??= [];
+        $newConfig['debug_and_monitoring']['debug'] ??= $newConfig['debug'] ?? false;
+        $newConfig['debug_and_monitoring']['log_stacktrace'] ??= $newConfig['log_stacktrace'];
+        $newConfig['debug_and_monitoring']['stacktrace_length'] ??= $newConfig['stacktrace_length'];
+        $newConfig['debug_and_monitoring']['report_errors'] ??= false;
+
+        // Instance ID handling
+        $this->refreshComposerAutoloader();
+        $newConfig['info']['instance_id'] ??= Uuid::v4()->toString();
+        $newConfig['info']['salt'] ??= $newConfig['salt'];
+
+        // Remove the hardcoded protocol
+        $newConfig['url'] = str_replace(['https://', 'http://'], '', $newConfig['url']);
+
+        // Remove deprecated config keys/subkeys.
+        $deprecatedConfigKeys = ['guzzle', 'locale', 'locale_date_format', 'locale_time_format', 'timezone', 'sef_urls', 'salt', 'path_logs', 'log_to_db'];
+        $deprecatedConfigSubkeys = [
+            'security' => 'cookie_lifespan',
+            'db' => 'type',
+        ];
+        $newConfig = array_diff_key($newConfig, array_flip($deprecatedConfigKeys));
+        foreach ($deprecatedConfigSubkeys as $key => $subkey) {
+            unset($newConfig[$key][$subkey]);
+        }
+
+        if ($currentConfig === $newConfig) {
+            return;
+        }
+
+        Config::setConfig($newConfig);
+    }
+
+    /**
+     * Apply all relevant patches to current FOSSBilling instance.
+     */
+    public function applyCorePatches(bool $force = false): void
+    {
+        // See applyConfigPatches(): no-argument calls are deferred to the new post-update screen.
+        if (!$force) {
+            return;
+        }
+
+        // The patches below are raw MySQL/MariaDB DDL (backtick identifiers, ENGINE=, SHOW COLUMNS
+        // introspection, ...) with no PostgreSQL/SQLite equivalent, and
+        // several of them are one-time data transformations tied to a specific historical release
+        // (splitting/merging tables, rewriting existing rows) that can't be ported by rewriting SQL
+        // syntax alone. Porting all of that is out of scope; see SchemaSynchronizer's docblock. On
+        // PostgreSQL/SQLite there is nothing here to run at all.
+        //
+        // This guard matters beyond "there's nothing to run": getPatchLevel() returning null (e.g.
+        // a restored/cloned database missing its `setting` row for last_patch) makes getPatches()
+        // treat every patch as pending. Without this check, that combined with a missing/stale
+        // update-finalization state would make the very next page load - see
+        // UpdateFinalization::finalizePendingUpdate(), called unconditionally from every request -
+        // start executing MySQL-only DDL against a non-MySQL database.
+        if ($this->isLegacyPatchDriver()) {
+            $patchLevel = $this->getPatchLevel();
+            $patches = $this->getPatches($patchLevel);
+            foreach ($patches as $patchLevel => $patch) {
+                call_user_func($patch, $this);
+                $this->setPatchLevel($patchLevel);
+            }
+        }
+
+        // Portable (plain UPDATE ... WHERE, no MySQL-specific syntax) and idempotent, so it
+        // runs on every platform rather than being folded into the MySQL-only patch loop above -
+        // a PostgreSQL/SQLite install predating this change never runs Patch115 at all, and
+        // would otherwise be left with a theme that never got renamed and orphaned saved settings
+        // forever.
+        $this->migrateThemePackageLayout();
+
+        // Extension type values were renamed ('mod' to 'module'). This must run
+        // before anything below reads the extension table: the legacy
+        // MySQL-only patch loop above still expects the old values, while
+        // everything from here on reads the new ones.
+        $this->migrateExtensionTypeValues();
+
+        // Branding paths and obsolete files need migrating on every database driver.
+        $this->migrateDefaultBrandingAssetsToPublicDirectory();
+
+        // Gateway and registrar secrets need encrypting on every database driver, but the
+        // numbered patch loop above is MySQL-only. Like migrateThemePackageLayout(), this
+        // runs here for all drivers and keeps a numbered patch for the MySQL bookkeeping.
+        $this->migrateEncryptedAdapterSecrets();
+
+        // Retired hook packages and listener registrations have no runtime consumer. Remove
+        // their records on every driver so old installs do not retain invisible extensions.
+        $this->removeRetiredHookData();
+
+        // Same treatment for the debit-note settings rows content.sql seeds for fresh installs:
+        // plain check-then-insert SQL, idempotent, so every platform gets them even though no
+        // MySQL-only patch can run there.
+        $this->seedInvoiceNoteSettings();
+
+        // Same-version-deploys never run the numbered patches, so seeded module
+        // versions updated there would otherwise stay stale. Same treatment.
+        $this->syncSeededModuleVersions();
+
+        // Portable invoice settings/rename steps, shared with the drift healer.
+        try {
+            $this->applyPortableInvoiceMigrations();
+        } catch (\Throwable $e) {
+            $this->logUpdate('error', 'Portable invoice migration failed: ' . $e->getMessage());
+
+            throw $e;
+        }
+
+        // Heal installs missing product_category.priority independent of patch
+        // level (see ensureProductCategoryPriorityColumn()): runs on every
+        // driver before the sync below so the storefront query never hits a
+        // missing column after finalization.
+        $this->ensureProductCategoryPriorityColumn();
+
+        // Additive structural sync runs on every platform, MySQL/MariaDB included: it picks up any
+        // column/table/index that's on entity metadata but not yet applied, without needing a
+        // hand-written patch for it - the only mechanism at all on PostgreSQL/SQLite, and on
+        // MySQL/MariaDB a catch-all for anything the patches above didn't (or, going forward, for
+        // structural changes that land on metadata without a patch being written at all).
+        $this->syncPortableSchema();
+
+        $this->applyJsonMigrations();
+
+        // Baseline the invoice journal on every driver, after the sync above: on non-MySQL
+        // installs the invoice_event table only comes into existence there, and backfilling
+        // first would find no table and leave existing invoices without baseline entries.
+        // Deliberately outside the drift healer: a large backlog must not stall page loads.
+        // A genuine backfill failure propagates so finalization stays pending: invoices
+        // that gain a live event before a later run are never revisited by the healer,
+        // so completing finalization here would leave baselines missing for good. A
+        // connection failure is tolerated only if schema sync already recorded it;
+        // a connection lost after successful sync must still fail finalization.
+        try {
+            $this->backfillInvoiceJournal();
+            $this->backfillRefundIncomeBasis();
+            // Typed order linkage backfill (see invoice_item.order_id): runs here for
+            // every driver while the column the sync above added is guaranteed present.
+            // Same-version deploys converge through the bounded per-request heal
+            // Finalization::healSchemaDrift() schedules.
+            $this->backfillInvoiceItemOrderIds();
+            $this->checkInvoiceNumberCounter();
+        } catch (\Doctrine\DBAL\Exception\ConnectionException $e) {
+            if (!$this->schemaSyncFailed) {
+                throw $e;
+            }
+        }
+    }
+
+    public function applyJsonMigrations(): void
+    {
+        $em = $this->di['em'];
+        $crypt = $this->di['crypt'];
+        $result = (new \FOSSBilling\Core\Doctrine\JsonMigration())->automatic($em, $crypt);
+        foreach (array_slice($result['quarantined'] ?? [], 0, 20) as $entry) {
+            $this->logUpdate('warning', sprintf('Quarantined %s.%s id=%s (%s); value was set to NULL. Review the row and re-enter any needed data.', $entry['table'], $entry['column'], $entry['id'], $entry['issue']));
+        }
+        if (($result['quarantined_values'] ?? 0) > 20) {
+            $this->logUpdate('warning', sprintf('Quarantined %d JSON value(s) in total; see database:json:audit --quarantined for the full list.', $result['quarantined_values']));
+        }
+        if (($result['decoded_values'] ?? 0) > 0) {
+            $this->logUpdate('info', sprintf('Decoded %d double-encoded JSON value(s) in place during migration.', $result['decoded_values']));
+        }
+        $connection = $em->getConnection();
+        $warnings = (new EncryptedConfigurationMigration())->run($connection, $crypt, $this->di['cache']);
+        foreach ($warnings as $warning) {
+            $this->logUpdate('warning', $warning);
+        }
+        if ($connection->createSchemaManager()->tablesExist(['email_template']) && $connection->createSchemaManager()->introspectTableByUnquotedName('email_template')->hasColumn('vars')) {
+            $connection->executeStatement('UPDATE email_template SET vars = NULL WHERE vars IS NOT NULL');
+        }
+        if ($connection->createSchemaManager()->tablesExist(['pay_gateway'])) {
+            $this->di['mod_service']('Invoice', 'PayGateway')->migrateConfigSecrets();
+        }
+        if ($connection->createSchemaManager()->tablesExist(['tld_registrar'])) {
+            $this->di['mod_service']('Servicedomain')->migrateConfigSecrets();
+        }
+    }
+
+    public function isJsonMigrationPending(): bool
+    {
+        if ($this->di === null || !isset($this->di['em'])) {
+            return false;
+        }
+
+        try {
+            $connection = $this->di['em']->getConnection();
+
+            return !$connection->createSchemaManager()->tablesExist(['json_migration_record'])
+                || !\FOSSBilling\Core\Doctrine\JsonMigrationJournal::hasRecord($connection, \FOSSBilling\Core\Doctrine\JsonMigrationJournal::COMPLETE);
+        } catch (\Doctrine\DBAL\Exception) {
+            // Bootstrap probes must tolerate an unavailable database; the next request retries.
+            return false;
+        }
+    }
+
+    public function checkInvoiceNumberCounter(): void
+    {
+        $counter = $this->fetchOne('SELECT value FROM setting WHERE param = :param', ['param' => 'invoice_starting_number']);
+        if (filter_var($counter, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1, 'max_range' => PHP_INT_MAX - 1]]) !== false) {
+            return;
+        }
+
+        // Stored invoice history may be incomplete or use custom numbering. Reseeding
+        // from it could reuse an issued number, so leave the choice to the administrator.
+        $this->logUpdate('warning', 'The next invoice number is missing or invalid. Review invoice history and set an unused positive whole number in Invoice Settings before issuing invoices.');
+    }
+
+    /**
+     * Whether the legacy MySQL-only patch loop should run.
+     *
+     * The historical patches 25-116 are raw MySQL/MariaDB DDL — the only platform
+     * {@see self::applyCorePatches()}'s legacy SQL patches are written for.
+     */
+    public function isLegacyPatchDriver(): bool
+    {
+        try {
+            $driver = Driver::tryFrom(DriverManagerFactory::getDatabaseConfig()['driver'] ?? '');
+
+            return $driver?->isMysql() === true;
+        } catch (\Throwable) {
+            // Can't determine the driver - don't guess. Fail safe by not running MySQL-only DDL.
+            return false;
+        }
+    }
+
+    /**
+     * Brings the live schema up to date with current Doctrine entity metadata - see
+     * {@see SchemaSynchronizer} for exactly what this does and does not cover (additive structural
+     * changes only, never a substitute for the legacy patches' data transformations).
+     *
+     * Scoped to core-module entities plus whichever extensions are currently marked installed
+     * ({@see ModuleEntityScope::isEagerNow()}) - the same gating {@see \FOSSBilling\Core\Doctrine\
+     * SchemaInstaller} applies at fresh-install time. Running the unscoped {@see SchemaSynchronizer::
+     * sync()} here instead would undo that gating: it compares every entity's table
+     * unconditionally, so an inactive extension's table (custom_pages, mod_massmailer,
+     * service_apikey, or any future one) would get silently recreated by this method - as if it
+     * were activated - regardless of whether anyone ever installs that extension.
+     *
+     * Errors are logged, not thrown: this runs on every request via UpdateFinalization, and a
+     * database this can't reach (or a metadata error) should degrade to "nothing changed", the same
+     * outcome as before this method existed, rather than breaking the request.
+     */
+    public function syncPortableSchema(): ?array
+    {
+        $this->schemaSyncFailed = false;
+        if (!$this->di instanceof \Pimple\Container || !$this->di->offsetExists('em')) {
+            return null;
+        }
+
+        $entityManager = $this->di['em'];
+
+        // Scope discovery (the connection, the installed-extensions query, metadata loading) can
+        // throw for the same reasons the sync itself can - an unreachable database above all -
+        // so it has to share this method's one error boundary, not run ahead of it. Only the sync
+        // itself used to be able to throw, back when this called SchemaSynchronizer::sync() with
+        // no scope discovery beforehand at all.
+        try {
+            $connection = $entityManager->getConnection();
+
+            // Fetched once and reused for every entity below, rather than one query per entity -
+            // an unbounded number of extra queries per non-core module isn't a cost worth paying
+            // just to derive a handful of booleans.
+            $installedExtensionModules = ModuleEntityScope::installedExtensionModules($connection);
+
+            $eagerEntityClasses = array_values(array_filter(
+                array_map(
+                    static fn ($classMetadata): string => $classMetadata->getName(),
+                    $entityManager->getMetadataFactory()->getAllMetadata(),
+                ),
+                static function (string $entityClass) use ($installedExtensionModules): bool {
+                    $module = ModuleEntityScope::moduleForEntityClass($entityClass);
+
+                    return $module === null || ModuleEntityScope::isEagerNow($module, $installedExtensionModules);
+                },
+            ));
+
+            if ($eagerEntityClasses === []) {
+                return null;
+            }
+
+            $syncError = null;
+
+            try {
+                $result = SchemaSynchronizer::syncEntities($entityManager, $eagerEntityClasses);
+                $this->migrateClientGroupMemberships($connection);
+            } catch (\Throwable $e) {
+                // The structural sync and the membership copy can fail for
+                // reasons unrelated to product categories. Remember the failure
+                // but still run the priority heal below, so a failed sync never
+                // leaves the column missing or newly added priorities NULL.
+                // The error is rethrown afterward, preserving the failure
+                // behavior: logged, cooled down, and no metadata hash stored.
+                $syncError = $e;
+            }
+
+            // Re-assert the column even when the comparator skipped it, before
+            // the backfill below (which no-ops when the column is absent) and
+            // before the metadata hash is stored.
+            try {
+                $this->ensureProductCategoryPriorityColumn($connection);
+                // Data backfill gated on the hash below: like the membership copy above,
+                // a throw here fails the sync (recorded with cooldown for retry) instead
+                // of leaving NULL priorities behind a stored hash.
+                $this->backfillProductCategoryPriorities($connection);
+            } catch (\Throwable $repairError) {
+                if ($syncError !== null) {
+                    $this->logUpdate('error', 'Schema sync against the configured database failed: ' . $syncError->getMessage());
+                }
+
+                throw $repairError;
+            }
+
+            if ($syncError !== null) {
+                throw $syncError;
+            }
+
+            if ($connection->getDatabasePlatform() instanceof \Doctrine\DBAL\Platforms\AbstractMySQLPlatform) {
+                $this->widenLegacyTextColumns('client_order_cancel_request', ['reason']);
+            }
+            $this->storeSchemaMetadataHash(EntityManagerFactory::entityDefinitionsHash());
+        } catch (\Throwable $e) {
+            // Attach the metadata hash so the failure can be correlated with
+            // the cooldown row (see lastSchemaSyncFailure()).
+            $metadataHash = null;
+
+            try {
+                $metadataHash = EntityManagerFactory::entityDefinitionsHash();
+            } catch (\Throwable) {
+                // Hashing must not mask the original sync error.
+            }
+
+            $this->logUpdate('error', 'Schema sync against the configured database failed: ' . $e->getMessage(), [
+                'metadata_hash' => $metadataHash,
+            ]);
+            $this->schemaSyncFailed = true;
+
+            return null;
+        }
+
+        if ($result['applied'] !== []) {
+            $this->logUpdate('info', 'Synced database schema with current entity metadata.', ['statements' => $result['applied']]);
+        }
+
+        // Never one log line per skipped item: on MySQL especially, entity metadata and the live
+        // schema can differ in ways that were never meant to be applied (see SchemaSynchronizer's
+        // "never touches" guarantees) and there can legitimately be hundreds of them - logging each
+        // on every request this runs would be pure noise. A single rolled-up count, with the detail
+        // attached as structured context rather than the message, keeps this useful without
+        // flooding the log.
+        if ($result['skipped'] !== []) {
+            $this->logUpdate(
+                'info',
+                sprintf('Schema sync left %d existing structural difference(s) from entity metadata untouched.', count($result['skipped'])),
+                ['skipped' => $result['skipped']],
+            );
+        }
+
+        return $result;
+    }
+
+    public function schemaSyncFailed(): bool
+    {
+        return $this->schemaSyncFailed;
+    }
+
+    /**
+     * Execute actions against the provided directories and files.
+     *
+     * @param array $files Array containing files and directories to perform action on and
+     *                     the actions to perform. Valid options are 'rename' and 'unlink'.
+     */
+    public function executeFileActions(array $files): void
+    {
+        foreach ($files as $file => $action) {
+            try {
+                if ($action === 'unlink' && $this->filesystem->exists($file)) {
+                    $this->filesystem->remove($file);
+                } elseif ($this->filesystem->exists($file)) {
+                    $this->filesystem->rename($file, $action);
+                }
+            } catch (IOException $e) {
+                $this->logUpdate('error', $e->getMessage());
+            }
+        }
+    }
+
+    public function getPdo(): \PDO
+    {
+        // The first request after updating from 0.7.x still uses the old Composer autoloader.
+        // Use PDO here because it is available before and after the archive is extracted.
+        if (!$this->di instanceof \Pimple\Container || !$this->di->offsetExists('pdo')) {
+            throw new BaseException('Database connection is not available.');
+        }
+
+        return $this->di['pdo'];
+    }
+
+    public function prepareAndExecute(string $sql, array $params = []): \PDOStatement
+    {
+        $statement = $this->getPdo()->prepare($sql);
+        $statement->execute($params);
+
+        return $statement;
+    }
+
+    /**
+     * Execute the given SQL statement.
+     *
+     * @param $sql The SQL statement to execute
+     */
+    public function executeSql(string $sql, array $params = []): void
+    {
+        try {
+            $this->prepareAndExecute($sql, $params);
+        } catch (\Exception $e) {
+            // Log the error and then throw a user-friendly exception to prevent further patches from being applied.
+            $this->logUpdate('error', $e->getMessage());
+
+            throw new BaseException('There was an error while applying database patches. Please check the error log for information on the error, correct it, and then perform the backup patching method to complete the update.');
+        }
+    }
+
+    public function logUpdate(string $level, string $message, array $context = []): void
+    {
+        try {
+            if ($this->di instanceof \Pimple\Container && $this->di->offsetExists('logger')) {
+                $this->di['logger']->withChannel('update')->log($level, $message, $context);
+
+                return;
+            }
+        } catch (\Throwable) {
+            // Logging must not hide the patch failure when the session schema
+            // is still being migrated and the normal logger cannot initialize.
+        }
+
+        error_log('FOSSBilling update: ' . $message);
+    }
+
+    public function fetchAll(string $sql, array $params = []): array
+    {
+        return $this->prepareAndExecute($sql, $params)->fetchAll(\PDO::FETCH_ASSOC);
+    }
+
+    public function fetchOne(string $sql, array $params = []): mixed
+    {
+        return $this->prepareAndExecute($sql, $params)->fetchColumn();
+    }
+
+    public function fetchFirstColumn(string $sql, array $params = []): array
+    {
+        return $this->prepareAndExecute($sql, $params)->fetchAll(\PDO::FETCH_COLUMN);
+    }
+
+    public function fetchKeyValue(string $sql, array $params = []): array
+    {
+        return $this->prepareAndExecute($sql, $params)->fetchAll(\PDO::FETCH_KEY_PAIR);
+    }
+
+    public function updateTable(string $table, array $data, array $criteria): void
+    {
+        $set = [];
+        $where = [];
+        $params = [];
+
+        try {
+            $driver = Driver::tryFrom(DriverManagerFactory::getDatabaseConfig()['driver'] ?? 'pdo_mysql');
+        } catch (\Throwable) {
+            $driver = Driver::PdoMysql;
+        }
+        $isMysql = $driver?->isMysql() === true;
+        $quote = static fn (string $id): string => $isMysql ? sprintf('`%s`', $id) : sprintf('"%s"', $id);
+
+        foreach ($data as $column => $value) {
+            $placeholder = "set_{$column}";
+            $set[] = sprintf('%s = :%s', $quote($this->quoteIdentifier($column)), $placeholder);
+            $params[$placeholder] = $value;
+        }
+
+        foreach ($criteria as $column => $value) {
+            $placeholder = "where_{$column}";
+            $where[] = sprintf('%s = :%s', $quote($this->quoteIdentifier($column)), $placeholder);
+            $params[$placeholder] = $value;
+        }
+
+        $this->executeSql(
+            sprintf('UPDATE %s SET %s WHERE %s', $quote($this->quoteIdentifier($table)), implode(', ', $set), implode(' AND ', $where)),
+            $params
+        );
+    }
+
+    public function tableHasColumn(string $table, string $column): bool
+    {
+        return in_array($column, $this->getTableColumns($table), true);
+    }
+
+    public function tableExists(string $table): bool
+    {
+        $this->quoteIdentifier($table);
+
+        if ($this->di instanceof \Pimple\Container && $this->di->offsetExists('em')) {
+            try {
+                $connection = $this->di['em']->getConnection();
+                $schemaManager = $connection->createSchemaManager();
+
+                return $schemaManager->tablesExist([$table]);
+            } catch (\Throwable) {
+                // fall through to driver-specific query
+            }
+        }
+
+        try {
+            $driver = Driver::tryFrom(DriverManagerFactory::getDatabaseConfig()['driver'] ?? 'pdo_mysql');
+        } catch (\Throwable) {
+            $driver = Driver::PdoMysql;
+        }
+
+        if ($driver === Driver::PdoPgsql) {
+            return (bool) $this->fetchOne(
+                "SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = :table LIMIT 1",
+                ['table' => $table],
+            );
+        }
+
+        if ($driver === Driver::PdoSqlite) {
+            return (bool) $this->fetchOne(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = :table LIMIT 1",
+                ['table' => $table],
+            );
+        }
+
+        return (bool) $this->fetchOne(
+            'SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table LIMIT 1',
+            ['table' => $table],
+        );
+    }
+
+    public function computeInvoiceHashExpiration(): ?string
+    {
+        $value = $this->fetchOne("SELECT value FROM setting WHERE param = 'invoice_hash_lifetime_days'");
+        $days = is_string($value) && $value !== '' ? (int) $value : 90;
+        if ($days <= 0) {
+            return null;
+        }
+
+        return date('Y-m-d H:i:s', strtotime("+{$days} days"));
+    }
+
+    public function getTableColumns(string $table): array
+    {
+        $this->quoteIdentifier($table);
+
+        try {
+            $driver = Driver::tryFrom(DriverManagerFactory::getDatabaseConfig()['driver'] ?? 'pdo_mysql');
+        } catch (\Throwable) {
+            $driver = Driver::PdoMysql;
+        }
+
+        if ($driver?->isMysql() !== true) {
+            if ($this->di instanceof \Pimple\Container && $this->di->offsetExists('em')) {
+                try {
+                    $schemaManager = $this->di['em']->getConnection()->createSchemaManager();
+                    if (!$schemaManager->tablesExist([$table])) {
+                        return [];
+                    }
+                    $columns = $schemaManager->listTableColumns($table);
+
+                    return array_map(static fn ($col) => $col->getName(), array_values($columns));
+                } catch (\Throwable) {
+                    // fall through
+                }
+            }
+
+            if ($driver === Driver::PdoPgsql) {
+                return $this->fetchFirstColumn(
+                    "SELECT column_name FROM information_schema.columns WHERE table_name = :table AND table_schema = 'public' ORDER BY ordinal_position",
+                    ['table' => $table],
+                );
+            }
+
+            if ($driver === Driver::PdoSqlite) {
+                $rows = $this->fetchAll('PRAGMA table_info(' . $this->quoteIdentifier($table) . ')');
+
+                return array_map(static fn (array $r): string => (string) ($r['name'] ?? ''), $rows);
+            }
+        }
+
+        $columns = $this->fetchAll(sprintf('SHOW COLUMNS FROM `%s`', $this->quoteIdentifier($table)));
+
+        return array_map(static fn (array $column): string => (string) $column['Field'], $columns);
+    }
+
+    public function getColumnLength(string $table, string $column): ?int
+    {
+        $this->quoteIdentifier($table);
+        $this->quoteIdentifier($column);
+
+        try {
+            $driver = Driver::tryFrom(DriverManagerFactory::getDatabaseConfig()['driver'] ?? 'pdo_mysql');
+        } catch (\Throwable) {
+            $driver = Driver::PdoMysql;
+        }
+
+        if ($driver?->isMysql() !== true) {
+            if ($this->di instanceof \Pimple\Container && $this->di->offsetExists('em')) {
+                try {
+                    $schemaManager = $this->di['em']->getConnection()->createSchemaManager();
+                    if (!$schemaManager->tablesExist([$table])) {
+                        return null;
+                    }
+                    $columns = $schemaManager->listTableColumns($table);
+                    foreach ($columns as $col) {
+                        if (strcasecmp((string) $col->getName(), $column) === 0) {
+                            return $col->getLength();
+                        }
+                    }
+
+                    return null;
+                } catch (\Throwable) {
+                    // fall through
+                }
+            }
+
+            return null;
+        }
+
+        $rows = $this->fetchAll(sprintf('SHOW COLUMNS FROM `%s` LIKE :column', $this->quoteIdentifier($table)), [
+            'column' => $column,
+        ]);
+
+        if ($rows === []) {
+            return null;
+        }
+
+        preg_match('/\((\d+)\)/', (string) $rows[0]['Type'], $matches);
+
+        return isset($matches[1]) ? (int) $matches[1] : null;
+    }
+
+    public function getColumnType(string $table, string $column): ?string
+    {
+        $this->quoteIdentifier($table);
+        $this->quoteIdentifier($column);
+
+        try {
+            $driver = Driver::tryFrom(DriverManagerFactory::getDatabaseConfig()['driver'] ?? 'pdo_mysql');
+        } catch (\Throwable) {
+            $driver = Driver::PdoMysql;
+        }
+
+        if ($driver?->isMysql() !== true) {
+            if ($this->di instanceof \Pimple\Container && $this->di->offsetExists('em')) {
+                try {
+                    $schemaManager = $this->di['em']->getConnection()->createSchemaManager();
+                    if (!$schemaManager->tablesExist([$table])) {
+                        return null;
+                    }
+                    $columns = $schemaManager->listTableColumns($table);
+                    foreach ($columns as $col) {
+                        if (strcasecmp((string) $col->getName(), $column) === 0) {
+                            $type = $col->getType()->getName();
+                            $length = $col->getLength();
+
+                            return $length !== null ? sprintf('%s(%d)', $type, $length) : $type;
+                        }
+                    }
+
+                    return null;
+                } catch (\Throwable) {
+                    // fall through
+                }
+            }
+
+            return null;
+        }
+
+        $rows = $this->fetchAll(sprintf('SHOW COLUMNS FROM `%s` LIKE :column', $this->quoteIdentifier($table)), [
+            'column' => $column,
+        ]);
+
+        return $rows === [] ? null : (string) $rows[0]['Type'];
+    }
+
+    public function tableHasIndex(string $table, string $indexName): bool
+    {
+        $this->quoteIdentifier($table);
+
+        try {
+            $driver = Driver::tryFrom(DriverManagerFactory::getDatabaseConfig()['driver'] ?? 'pdo_mysql');
+        } catch (\Throwable) {
+            $driver = Driver::PdoMysql;
+        }
+
+        if ($driver?->isMysql() !== true) {
+            if ($this->di instanceof \Pimple\Container && $this->di->offsetExists('em')) {
+                try {
+                    $schemaManager = $this->di['em']->getConnection()->createSchemaManager();
+                    if (!$schemaManager->tablesExist([$table])) {
+                        return false;
+                    }
+                    $indexes = $schemaManager->listTableIndexes($table);
+                    foreach ($indexes as $name => $index) {
+                        if (strcasecmp((string) $name, $indexName) === 0 || strcasecmp((string) $index->getName(), $indexName) === 0) {
+                            return true;
+                        }
+                    }
+
+                    return false;
+                } catch (\Throwable) {
+                    // fall through
+                }
+            }
+
+            if ($driver === Driver::PdoPgsql) {
+                return (bool) $this->fetchOne(
+                    "SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND tablename = :table AND indexname = :index LIMIT 1",
+                    ['table' => $table, 'index' => $indexName],
+                );
+            }
+
+            if ($driver === Driver::PdoSqlite) {
+                return (bool) $this->fetchOne(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'index' AND tbl_name = :table AND name = :index LIMIT 1",
+                    ['table' => $table, 'index' => $indexName],
+                );
+            }
+        }
+
+        $indexes = $this->fetchAll(sprintf('SHOW INDEX FROM `%s`', $this->quoteIdentifier($table)));
+        foreach ($indexes as $index) {
+            if (($index['Key_name'] ?? null) === $indexName) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public function quoteIdentifier(string $identifier): string
+    {
+        if (!preg_match('/^[A-Za-z0-9_]+$/', $identifier)) {
+            throw new BaseException('Invalid database identifier: :identifier', [':identifier' => $identifier]);
+        }
+
+        return $identifier;
+    }
+
+    public function migrateEncryptedColumn(string $table, string $idColumn, string $valueColumn, string $where, array $params = []): void
+    {
+        $rawTable = $table;
+        $rawIdColumn = $idColumn;
+        $rawValueColumn = $valueColumn;
+        $quotedTable = $this->quoteIdentifier($table);
+        $idColumn = $this->quoteIdentifier($idColumn);
+        $valueColumn = $this->quoteIdentifier($valueColumn);
+
+        // This method expects a static SQL predicate fragment with bound parameters in $params.
+        if (
+            str_contains($where, ';')
+            || str_contains($where, '--')
+            || str_contains($where, '/*')
+            || str_contains($where, '*/')
+            || str_contains($where, '`')
+            || !preg_match('/^[A-Za-z0-9_:\\s<>=!().,%+-]++$/', $where)
+        ) {
+            throw new BaseException('Invalid SQL WHERE clause fragment.');
+        }
+
+        $rows = $this->fetchAll("SELECT {$idColumn} AS id, {$valueColumn} AS encrypted_value FROM {$quotedTable} WHERE {$where}", $params);
+
+        /** @var Crypt $crypt */
+        $crypt = $this->di['crypt'];
+        $salt = Config::getProperty('info.salt');
+
+        $hasUpdatedAt = $this->tableHasColumn($rawTable, 'updated_at');
+
+        foreach ($rows as $row) {
+            $encryptedValue = $row['encrypted_value'] ?? null;
+            if (!is_string($encryptedValue) || $encryptedValue === '' || str_starts_with($encryptedValue, Crypt::CURRENT_FORMAT_PREFIX)) {
+                continue;
+            }
+
+            $decryptedValue = $crypt->decrypt($encryptedValue, $salt);
+            if ($decryptedValue === false) {
+                continue;
+            }
+
+            $updateData = [$rawValueColumn => $crypt->encrypt($decryptedValue, $salt)];
+            if ($hasUpdatedAt) {
+                $updateData['updated_at'] = date('Y-m-d H:i:s');
+            }
+
+            $this->updateTable($table, $updateData, [
+                $rawIdColumn => $row['id'],
+            ]);
+        }
+    }
+
+    /**
+     * Get the current patch level of FOSSBilling.
+     *
+     * @return int|null the current patch level
+     */
+    public function getPatchLevel(): ?int
+    {
+        $value = $this->fetchOne('SELECT value FROM setting WHERE param = :param', [
+            'param' => 'last_patch',
+        ]);
+
+        return intval($value) ?: null;
+    }
+
+    /**
+     * Set the current patch level of FOSSBilling.
+     *
+     * @param int $patchLevel The last executed patch level
+     */
+    public function setPatchLevel(int $patchLevel): void
+    {
+        $now = date('Y-m-d H:i:s');
+
+        $exists = $this->fetchOne('SELECT 1 FROM setting WHERE param = :param LIMIT 1', [
+            'param' => 'last_patch',
+        ]);
+
+        if ($exists) {
+            $this->executeSql(
+                'UPDATE setting SET value = :value, updated_at = :updated_at WHERE param = :param',
+                [
+                    'param' => 'last_patch',
+                    'value' => $patchLevel,
+                    'updated_at' => $now,
+                ]
+            );
+        } else {
+            $this->executeSql(
+                'INSERT INTO setting (param, value, public, created_at, updated_at) VALUES (:param, :value, 0, :created_at, :updated_at)',
+                [
+                    'param' => 'last_patch',
+                    'value' => $patchLevel,
+                    'created_at' => $now,
+                    'updated_at' => $now,
+                ]
+            );
+        }
+    }
+
+    /**
+     * Get patches to be applied.
+     *
+     * @param int|null $patchLevel the current patch level of FOSSBilling
+     *
+     * @return array array containing the patches to be executed, in order
+     */
+    private function getPatches(?int $patchLevel = 0): array
+    {
+        $patches = Patch\PatchRegistry::MAP;
+        ksort($patches, SORT_NATURAL);
+
+        $patchesToApply = array_filter($patches, fn ($key): bool => $key > $patchLevel, ARRAY_FILTER_USE_KEY);
+
+        return array_map(fn (string $patchClass): array => [new $patchClass(), 'apply'], $patchesToApply);
+    }
+
+    public function refreshComposerAutoloader(): void
+    {
+        $uuidClass = Uuid::class;
+
+        if (!class_exists($uuidClass)) {
+            $autoloadPath = Path::join(PATH_VENDOR, 'autoload.php');
+            if ($this->filesystem->exists($autoloadPath)) {
+                require $autoloadPath;
+            }
+        }
+
+        if (!class_exists($uuidClass)) {
+            $this->registerSymfonyUidAutoloader();
+        }
+
+        if (!class_exists($uuidClass)) {
+            throw new BaseException('Unable to load the Symfony UID package from Composer. Please reinstall dependencies and try again.');
+        }
+    }
+
+    public function registerSymfonyUidAutoloader(): void
+    {
+        $uidPath = Path::join(PATH_VENDOR, 'symfony', 'uid');
+        if (!$this->filesystem->exists($uidPath)) {
+            return;
+        }
+
+        spl_autoload_register(function (string $class) use ($uidPath): void {
+            $prefix = 'Symfony\\Component\\Uid\\';
+            if (!str_starts_with($class, $prefix)) {
+                return;
+            }
+
+            $relativeClass = substr($class, strlen($prefix));
+            $path = Path::join($uidPath, str_replace('\\', DIRECTORY_SEPARATOR, $relativeClass) . '.php');
+            if ($this->filesystem->exists($path)) {
+                require $path;
+            }
+        });
+    }
+
+    /**
+     * Remove obsolete directories only when they contain no files, including hidden files.
+     *
+     * @param list<string> $directories
+     */
+    public function removeEmptyDirectories(array $directories): void
+    {
+        foreach ($directories as $directory) {
+            if (!is_dir($directory)) {
+                continue;
+            }
+
+            $finder = (new Finder())
+                ->in($directory)
+                ->depth('== 0')
+                ->ignoreDotFiles(false)
+                ->ignoreVCS(false);
+
+            if ($finder->hasResults()) {
+                continue;
+            }
+
+            // rmdir is intentional here: Filesystem::remove() is recursive and could
+            // delete a file created between the emptiness check and the removal.
+            if (!@rmdir($directory)) {
+                $this->logUpdate('warning', sprintf('Unable to remove empty obsolete directory "%s".', $directory));
+            }
+        }
+    }
+
+    /**
+     * Bundles the shipped themes into one package: admin_default -> default/admin,
+     * huraga -> default/client. Third-party themes are untouched.
+     *
+     * Unlike the raw-DDL patches, this is plain, portable SQL (no backticks,
+     * ENGINE=, or ON DUPLICATE KEY UPDATE) and a filesystem rename - neither is
+     * MySQL-specific, so this is called both from Patch115 (for MySQL/MariaDB's
+     * sequential patch-level bookkeeping) and unconditionally from
+     * applyCorePatches() above, so PostgreSQL/SQLite installs - which never run the
+     * patch loop at all - still get migrated. Every step is idempotent, so
+     * running it twice on a MySQL/MariaDB install (once via Patch115, once via
+     * the unconditional call) is a harmless no-op the second time.
+     */
+    public function migrateThemePackageLayout(): void
+    {
+        $filesystem = $this->filesystem;
+
+        // Each shipped theme's old code, new code, and the setting param that selects it.
+        $renames = [
+            'admin_default' => ['newCode' => 'default/admin', 'settingParam' => 'admin_theme'],
+            'huraga' => ['newCode' => 'default/client', 'settingParam' => 'theme'],
+        ];
+
+        foreach ($renames as $oldCode => $rename) {
+            $oldPath = Path::join(PATH_THEMES, $oldCode);
+            $newPath = Path::join(PATH_THEMES, $rename['newCode']);
+
+            if ($filesystem->exists($oldPath) && !$filesystem->exists($newPath)) {
+                $filesystem->mkdir(Path::getDirectory($newPath));
+                $filesystem->rename($oldPath, $newPath);
+            }
+
+            // A code-only deploy (e.g. `git pull`) already moves every tracked file via the
+            // checkout itself, before this ever runs - the rename above then finds $newPath
+            // already there and skips. What's left behind at $oldPath at that point is mostly
+            // gitignored leftovers (a rebuilt assets/build/, huraga's config/settings_data.json
+            // cache, which regenerates on its own - the setting it holds is now in the database,
+            // migrated below), but TwigLoader's `html_custom` override directory and extra files
+            // dropped into `custom-icons` are genuinely untracked local customizations a checkout
+            // never touches - discarding $oldPath outright would destroy them. Mirror anything not
+            // already present at $newPath over first (never overwriting what the checkout already
+            // placed there) so those customizations survive the rename, then discard what's left.
+            if ($filesystem->exists($oldPath) && $filesystem->exists($newPath)) {
+                $filesystem->mirror($oldPath, $newPath, null, ['override' => false]);
+                $filesystem->remove($oldPath);
+            }
+
+            // Safe/no-op if the row doesn't currently hold the old value.
+            $this->executeSql('UPDATE setting SET value = :new_value WHERE param = :param AND value = :old_value', [
+                'new_value' => $rename['newCode'],
+                'param' => $rename['settingParam'],
+                'old_value' => $oldCode,
+            ]);
+
+            // Saved theme settings/presets live in extension_meta, keyed by the theme's
+            // name string (Theme\Service::updateSettings()/setCurrentThemePreset()) -
+            // 'settings' rows in rel_id, the 'preset'/'current' row in meta_key. Without
+            // this, a staff member's customized theme settings would silently fall back
+            // to the shipped defaults once the theme is renamed.
+            $this->executeSql("UPDATE extension_meta SET rel_id = :new_code WHERE extension = 'mod_theme' AND rel_type = 'settings' AND rel_id = :old_code", [
+                'new_code' => $rename['newCode'],
+                'old_code' => $oldCode,
+            ]);
+            $this->executeSql("UPDATE extension_meta SET meta_key = :new_code WHERE extension = 'mod_theme' AND rel_type = 'preset' AND rel_id = 'current' AND meta_key = :old_code", [
+                'new_code' => $rename['newCode'],
+                'old_code' => $oldCode,
+            ]);
+        }
+    }
+
+    /**
+     * Reports the database patch level against the code's patch list - the
+     * shared source of truth behind availablePatches() for callers that need
+     * the levels themselves (e.g. the finalization completion guard).
+     *
+     * @return array{current: ?int, latest: int, pending: ?int} pending is null
+     *                                                          when the count cannot be determined (non-MySQL platform or unreadable database)
+     */
+    public function patchStatus(): array
+    {
+        $latest = $this->latestPatchLevel();
+
+        if (!$this->isLegacyPatchDriver()) {
+            return [
+                'current' => null,
+                'latest' => $latest,
+                'pending' => null,
+            ];
+        }
+
+        try {
+            $current = $this->getPatchLevel();
+            $pending = count($this->getPatches($current));
+        } catch (\Throwable) {
+            return [
+                'current' => null,
+                'latest' => $latest,
+                'pending' => null,
+            ];
+        }
+
+        return [
+            'current' => $current,
+            'latest' => $latest,
+            'pending' => $pending,
+        ];
+    }
+
+    /**
+     * Brings the live schema up to date with current Doctrine entity metadata when the metadata
+     * changed since the last sync - independent of the version-gated finalization flow, so a
+     * code-only deploy (e.g. `git pull` to a commit that adds an entity column without bumping
+     * Version::VERSION) still gets its schema updated instead of crashing on the next query.
+     *
+     * Runs the portable invoice migrations before the additive sync: renames
+     * cannot be expressed by the sync, so without this a renamed column would
+     * be synced as an empty duplicate (or left crashing).
+     *
+     * The gate is EntityManagerFactory::entityDefinitionsHash(), a content hash every node running
+     * the same code computes identically - the last-synced value is kept in a plain setting row
+     * (SCHEMA_METADATA_HASH_PARAM), so a match costs file reads plus a single SELECT and runs
+     * outside the finalization lock (see Finalization::finalizePendingUpdate()).
+     *
+     * @return bool whether a sync attempt ran (even if it applied nothing)
+     */
+    public function ensureSchemaInSync(): bool
+    {
+        if (!$this->di instanceof \Pimple\Container || !$this->di->offsetExists('em')) {
+            return false;
+        }
+
+        $currentHash = null;
+
+        try {
+            $currentHash = EntityManagerFactory::entityDefinitionsHash();
+            if ($this->fetchStoredSchemaHash() === $currentHash || $this->isSyncCoolingDown($currentHash)) {
+                return false;
+            }
+
+            // Same unconditional settings seeding applyCorePatches() performs, so the
+            // same-version path it never runs on doesn't leave them missing either.
+            $this->seedInvoiceNoteSettings();
+
+            // Rename steps must precede the additive sync below, which cannot
+            // express them (see applyPortableInvoiceMigrations()).
+            $this->applyPortableInvoiceMigrations();
+
+            if ($this->syncPortableSchema() === null) {
+                $this->recordFailedSyncAttempt($currentHash);
+
+                return false;
+            }
+
+            // Heal journal gaps left by drift-created tables or lost writes, bounded to
+            // one page so a large backlog converges over runs instead of stalling this one.
+            // Failure here must not fail the sync itself, which already succeeded.
+            try {
+                $this->healInvoiceJournal();
+            } catch (\Throwable $e) {
+                $this->logUpdate('error', 'Invoice journal healing failed: ' . $e->getMessage());
+            }
+
+            // Same bounded healing for legacy tax-inclusive refunds: a finalization that
+            // ran before base_refund_tax existed leaves those rows for the drift sync
+            // above to add the column for - converge them a page at a time here.
+            // (The invoice item order_id backfill needs no such call: it is scheduled
+            // on every request from healSchemaDrift(), and short-circuits on its
+            // recorded completion once converged.)
+            try {
+                $this->backfillRefundIncomeBasis(1);
+            } catch (\Throwable $e) {
+                $this->logUpdate('error', 'Refund income basis healing failed: ' . $e->getMessage());
+            }
+
+            return true;
+        } catch (\Throwable $e) {
+            $this->logUpdate('error', 'Ambient schema sync failed: ' . $e->getMessage());
+            $this->recordFailedSyncAttempt($currentHash);
+
+            return false;
+        }
+    }
+
+    /**
+     * Whether the live schema may have drifted from current entity metadata - the hash-comparison
+     * half of ensureSchemaInSync(), safe to call without holding the finalization lock. Never
+     * throws: an unreadable database simply reports "in sync" and the next request checks again.
+     * Also honors the sync retry cooldown, so a persistently failing sync doesn't take the
+     * finalization lock on every request just to back off again inside it.
+     */
+    public function isSchemaOutOfSync(): bool
+    {
+        if (!$this->di instanceof \Pimple\Container || !$this->di->offsetExists('em')) {
+            return false;
+        }
+
+        try {
+            $currentHash = EntityManagerFactory::entityDefinitionsHash();
+
+            return $this->fetchStoredSchemaHash() !== $currentHash
+                && !$this->isSyncCoolingDown($currentHash);
+        } catch (\Throwable) {
+            return false;
+        }
+    }
+
+    /**
+     * Whether current entity metadata differs from the last synced state,
+     * ignoring the retry cooldown - the reporting half of isSchemaOutOfSync(),
+     * for status surfaces that must stay truthful while a failed sync backs
+     * off. Never throws: an unreadable database reports "no drift".
+     */
+    public function isSchemaOutOfSyncIgnoringCooldown(): bool
+    {
+        if (!$this->di instanceof \Pimple\Container || !$this->di->offsetExists('em')) {
+            return false;
+        }
+
+        try {
+            return $this->fetchStoredSchemaHash() !== EntityManagerFactory::entityDefinitionsHash();
+        } catch (\Throwable) {
+            return false;
+        }
+    }
+
+    /**
+     * @throws \Exception when the database cannot be read
+     */
+    private function fetchStoredSchemaHash(): mixed
+    {
+        return $this->fetchOne('SELECT value FROM setting WHERE param = :param', [
+            'param' => self::SCHEMA_METADATA_HASH_PARAM,
+        ]);
+    }
+
+    /**
+     * Whether a sync for this exact metadata hash already failed within the retry cooldown.
+     * Read failures fail open (no cooldown), leaving the outcome to the sync attempt itself.
+     */
+    private function isSyncCoolingDown(string $currentHash): bool
+    {
+        $failed = $this->lastSchemaSyncFailure();
+        if ($failed === null || $failed['hash'] !== $currentHash) {
+            return false;
+        }
+
+        $attemptedAt = strtotime($failed['attempted_at']);
+        if ($attemptedAt === false) {
+            return false;
+        }
+
+        return $attemptedAt + self::SCHEMA_SYNC_RETRY_COOLDOWN > time();
+    }
+
+    /**
+     * The most recent failed portable-schema-sync attempt, if any. Never
+     * throws: unreadable state reports "no failure". Surfaced via
+     * {@see Finalization::getStatus()} so a repeatedly failing sync
+     * is visible instead of living only in the update log.
+     *
+     * @return array{hash: string, attempted_at: string}|null
+     */
+    public function lastSchemaSyncFailure(): ?array
+    {
+        try {
+            $rows = $this->fetchAll('SELECT value, updated_at FROM setting WHERE param = :param', [
+                'param' => self::SCHEMA_METADATA_HASH_FAILED_PARAM,
+            ]);
+        } catch (\Throwable) {
+            return null;
+        }
+
+        $failed = $rows[0] ?? null;
+        if (!is_array($failed) || !is_string($failed['value'] ?? null) || $failed['value'] === '') {
+            return null;
+        }
+
+        return [
+            'hash' => $failed['value'],
+            'attempted_at' => (string) ($failed['updated_at'] ?? ''),
+        ];
+    }
+
+    /**
+     * Remembers a failed sync attempt for the cooldown above. Never throws - failures here must
+     * not mask the original error.
+     */
+    private function recordFailedSyncAttempt(?string $currentHash): void
+    {
+        if ($currentHash === null) {
+            return;
+        }
+
+        try {
+            $existing = $this->fetchOne('SELECT value FROM setting WHERE param = :param', [
+                'param' => self::SCHEMA_METADATA_HASH_FAILED_PARAM,
+            ]);
+
+            if ($existing === false) {
+                $now = date('Y-m-d H:i:s');
+                $this->executeSql(
+                    'INSERT INTO setting (param, value, public, created_at, updated_at) VALUES (:param, :value, 0, :created_at, :updated_at)',
+                    [
+                        'param' => self::SCHEMA_METADATA_HASH_FAILED_PARAM,
+                        'value' => $currentHash,
+                        'created_at' => $now,
+                        'updated_at' => $now,
+                    ]
+                );
+            } else {
+                $this->executeSql('UPDATE setting SET value = :value, updated_at = :updated_at WHERE param = :param', [
+                    'value' => $currentHash,
+                    'updated_at' => date('Y-m-d H:i:s'),
+                    'param' => self::SCHEMA_METADATA_HASH_FAILED_PARAM,
+                ]);
+            }
+        } catch (\Throwable) {
+            // Best effort only - the next request retries the bookkeeping too.
+        }
+    }
+
+    /**
+     * Seeds the debit-note settings rows content.sql gives fresh installs - existing installs
+     * upgrading through the credit/debit-note releases never get those rows otherwise.
+     * Plain check-then-insert SQL with no MySQL-specific syntax, so it runs unconditionally on
+     * every platform; never overwrites a customized value.
+     */
+    private function seedInvoiceNoteSettings(): void
+    {
+        $defaults = [
+            'invoice_dn_series' => 'DN-',
+            'invoice_dn_starting_number' => '1',
+        ];
+
+        foreach ($defaults as $param => $value) {
+            $existing = $this->fetchOne('SELECT value FROM setting WHERE param = :param', [
+                'param' => $param,
+            ]);
+
+            if ($existing !== false) {
+                continue;
+            }
+
+            $now = date('Y-m-d H:i:s');
+            $this->executeSql(
+                'INSERT INTO setting (param, value, public, created_at, updated_at) VALUES (:param, :value, 0, :created_at, :updated_at)',
+                [
+                    'param' => $param,
+                    'value' => $value,
+                    'created_at' => $now,
+                    'updated_at' => $now,
+                ]
+            );
+        }
+    }
+
+    /**
+     * Rename the extension type discriminator from 'mod' to 'module'.
+     *
+     * Portable (plain UPDATE/DELETE ... WHERE, no MySQL-specific syntax) and
+     * idempotent. Runs from applyCorePatches() on every platform rather than
+     * as a numbered MySQL-only patch, and again from
+     * {@see Finalization::healSchemaDrift()} so code-only (same-version)
+     * deploys convert too. A probe SELECT makes both call sites a no-op once
+     * every row is canonical. The 'mod' literals are pre-migration stored
+     * values, not references to the current type.
+     */
+    public function migrateExtensionTypeValues(): void
+    {
+        try {
+            $module = ExtensionType::Module->value;
+
+            $stale = $this->fetchOne(
+                'SELECT 1 FROM extension WHERE type = :old UNION ALL SELECT 1 FROM extension_meta WHERE rel_type = :old LIMIT 1',
+                ['old' => 'mod']
+            );
+            if ($stale === false) {
+                return;
+            }
+
+            // A post-migration 'module' row can share a name with a legacy 'mod'
+            // row (e.g. the module was reinstalled from the directory before this
+            // ran). Renaming would violate the type_name unique key, so one side
+            // is dropped first. Installed-ness wins over type, because only an
+            // installed row keeps the extension active: a non-installed canonical
+            // row must not shadow an installed legacy one. When both (or neither)
+            // are installed, the canonical 'module' row is retained as the newer
+            // record.
+            $this->executeSql(
+                "DELETE FROM extension WHERE type = :new AND (status IS NULL OR status <> 'installed') AND name IN (SELECT name FROM (SELECT name FROM extension WHERE type = :old AND status = 'installed') AS legacy)",
+                ['new' => $module, 'old' => 'mod']
+            );
+
+            $this->executeSql(
+                'DELETE FROM extension WHERE type = :old AND name IN (SELECT name FROM (SELECT name FROM extension WHERE type = :new) AS canonical)',
+                ['old' => 'mod', 'new' => $module]
+            );
+
+            $this->executeSql('UPDATE extension SET type = :new WHERE type = :old', ['new' => $module, 'old' => 'mod']);
+            $this->executeSql('UPDATE extension_meta SET rel_type = :new WHERE rel_type = :old', ['new' => $module, 'old' => 'mod']);
+        } catch (\Throwable $e) {
+            // Runs from healSchemaDrift() on every request, which must not throw
+            // (an unreachable database simply reports "nothing to do"). The next
+            // request retries; the migration is idempotent.
+            $this->logUpdate('warning', 'Extension type migration skipped: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * The manifest backfill aligned every in-repo manifest version with the
+     * release version, but existing installs still carry whatever content.sql
+     * seeded when they were installed. Sync those seeded rows with the version
+     * stamped into the on-disk manifests: a row still carrying a historically
+     * seeded version gets the installed files' version, while a row that
+     * already matches its manifest (e.g. a directory install that happens to
+     * share a legacy version number) is left untouched by the update itself.
+     * Portable (plain file reads and SQL) and idempotent: a single probe
+     * SELECT finds nothing to do once synced, so this is cheap enough to run
+     * outside versioned updates (see healSchemaDrift()). Never throws: a
+     * display-only version sync must not break requests or updates, it only
+     * logs and skips.
+     */
+    public function syncSeededModuleVersions(string $type = ExtensionType::Module->value): void
+    {
+        try {
+            // Historically seeded versions per module. Any row still carrying
+            // one of these gets the on-disk manifest version.
+            $legacy = [
+                'news' => ['1.0.0'],
+                'branding' => ['0.0.1', '1.0.0'],
+                'redirect' => ['1.0.0'],
+            ];
+
+            $conditions = [];
+            $params = ['type' => $type];
+            $i = 0;
+            foreach ($legacy as $name => $olds) {
+                foreach ($olds as $old) {
+                    $conditions[] = "(name = :name{$i} AND version = :old{$i})";
+                    $params["name{$i}"] = $name;
+                    $params["old{$i}"] = $old;
+                    ++$i;
+                }
+            }
+
+            $stale = $this->fetchOne(
+                'SELECT 1 FROM extension WHERE type = :type AND (' . implode(' OR ', $conditions) . ') LIMIT 1',
+                $params
+            );
+            if ($stale === false) {
+                return;
+            }
+
+            foreach ($legacy as $name => $olds) {
+                $target = $this->readModuleManifestVersion($name);
+                if ($target === null) {
+                    continue;
+                }
+
+                foreach ($olds as $old) {
+                    // A target matching the row is already satisfied; issuing
+                    // the UPDATE would only rewrite the same value.
+                    if ($old === $target) {
+                        continue;
+                    }
+
+                    $this->executeSql(
+                        'UPDATE extension SET version = :new WHERE type = :type AND name = :name AND version = :old',
+                        ['new' => $target, 'type' => $type, 'name' => $name, 'old' => $old]
+                    );
+                }
+            }
+        } catch (\Throwable $e) {
+            $this->logUpdate('warning', 'Seeded module version sync failed: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * The on-disk manifest version for a module, or null when it cannot be
+     * read. A missing or unreadable manifest means there is nothing safe to
+     * sync the database row to.
+     */
+    private function readModuleManifestVersion(string $module): ?string
+    {
+        $path = Path::join(PATH_MODS, ucfirst($module), 'manifest.json');
+        if (!$this->filesystem->exists($path)) {
+            return null;
+        }
+
+        try {
+            $decoded = json_decode($this->filesystem->readFile($path), true);
+        } catch (IOException) {
+            return null;
+        }
+
+        return is_array($decoded) && isset($decoded['version']) && is_string($decoded['version']) ? $decoded['version'] : null;
+    }
+
+    /**
+     * Portable, idempotent invoice settings/rename steps shared by
+     * applyCorePatches() and ensureSchemaInSync(). The additive schema sync
+     * cannot express the approved-to-issued rename, so the drift-healing path
+     * runs these first - otherwise a code-only deploy would sync an empty
+     * issued column alongside the data-bearing approved one (or crash).
+     */
+    private function applyPortableInvoiceMigrations(): void
+    {
+        // Failed inspections must stop this attempt: DBAL may reconnect before
+        // additive sync, which could otherwise create issued alongside approved.
+        // Ambient callers already log failures at their outer boundary.
+        $this->migrateInvoiceImmutabilitySetting();
+
+        // Paid invoices keep their issued number, so the retired paid-only
+        // series has no reader left. Remove it unconditionally.
+        $this->executeSql('DELETE FROM setting WHERE param = :param', ['param' => 'invoice_series_paid']);
+
+        // The auto-approval toggle was renamed to match the issue terminology.
+        $this->migrateInvoiceAutoIssueSetting();
+
+        // The invoice approval flag was renamed to issued, matching the new
+        // terminology. Runs before the structural sync so the sync sees
+        // the renamed column instead of adding it alongside the legacy one.
+        $this->renameInvoiceApprovedColumn();
+
+        // The column rename leaves the legacy composite index name behind, and
+        // the structural sync only ever adds - so without this the old name
+        // lingers as a duplicate forever.
+        $this->renameInvoiceStatusIndex();
+
+        // The dead buyer_phone_cc column is gone from entity metadata, and the
+        // structural sync only ever adds - so without this the column lingers
+        // on existing installs forever.
+        $this->dropInvoiceBuyerPhoneCcColumn();
+
+        // Same story for the dead transaction.validate_ipn flag: nothing ever
+        // read it, the entity no longer maps it, and the additive sync would
+        // otherwise leave it behind on existing installs forever.
+        $this->dropTransactionValidateIpnColumn();
+    }
+
+    /**
+     * Folds the retired per-action invoice toggles (invoice_allow_edit_unpaid,
+     * invoice_allow_delete_approved) into the single invoice_immutability
+     * setting, then removes the legacy rows. Either legacy opt-in maps to
+     * 'relaxed', preserving behavior; otherwise the install converges to
+     * 'strict'. Plain portable SQL and idempotent like seedInvoiceNoteSettings(),
+     * so it runs unconditionally from applyCorePatches() on every platform.
+     */
+    private function migrateInvoiceImmutabilitySetting(): void
+    {
+        $fetch = fn (string $param): mixed => $this->fetchOne('SELECT value FROM setting WHERE param = :param', [
+            'param' => $param,
+        ]);
+
+        $migrated = $fetch('invoice_immutability');
+        if ($migrated === false) {
+            $edit = $fetch('invoice_allow_edit_unpaid');
+            $delete = $fetch('invoice_allow_delete_approved');
+            if ($edit !== false || $delete !== false) {
+                $now = date('Y-m-d H:i:s');
+                $this->executeSql(
+                    'INSERT INTO setting (param, value, public, created_at, updated_at) VALUES (:param, :value, 0, :created_at, :updated_at)',
+                    [
+                        'param' => 'invoice_immutability',
+                        'value' => ($edit === '1' || $delete === '1') ? 'relaxed' : 'strict',
+                        'created_at' => $now,
+                        'updated_at' => $now,
+                    ]
+                );
+            }
+        }
+
+        $this->executeSql('DELETE FROM setting WHERE param = :param', ['param' => 'invoice_allow_edit_unpaid']);
+        $this->executeSql('DELETE FROM setting WHERE param = :param', ['param' => 'invoice_allow_delete_approved']);
+    }
+
+    /**
+     * Carries the retired invoice_auto_approval toggle over to its renamed
+     * invoice_auto_issue successor, then drops the legacy row. Like
+     * migrateInvoiceImmutabilitySetting(), plain portable SQL and idempotent,
+     * so it runs unconditionally from applyCorePatches() on every platform.
+     */
+    private function migrateInvoiceAutoIssueSetting(): void
+    {
+        $autoApproval = $this->fetchOne('SELECT value FROM setting WHERE param = :param', [
+            'param' => 'invoice_auto_approval',
+        ]);
+        if ($autoApproval === false) {
+            return;
+        }
+
+        $autoIssue = $this->fetchOne('SELECT value FROM setting WHERE param = :param', [
+            'param' => 'invoice_auto_issue',
+        ]);
+        if ($autoIssue === false) {
+            $now = date('Y-m-d H:i:s');
+            $this->executeSql(
+                'INSERT INTO setting (param, value, public, created_at, updated_at) VALUES (:param, :value, 0, :created_at, :updated_at)',
+                [
+                    'param' => 'invoice_auto_issue',
+                    'value' => $autoApproval,
+                    'created_at' => $now,
+                    'updated_at' => $now,
+                ]
+            );
+        }
+
+        $this->executeSql('DELETE FROM setting WHERE param = :param', ['param' => 'invoice_auto_approval']);
+    }
+
+    /**
+     * Renames invoice.approved to invoice.issued, preserving values. Portable
+     * across drivers via the DBAL schema manager for the existence check;
+     * MySQL/MariaDB uses CHANGE (works on versions without RENAME COLUMN
+     * support), everything else uses RENAME COLUMN. Idempotent: a fresh
+     * install already has issued, and a migrated one no longer has approved.
+     */
+    private function renameInvoiceApprovedColumn(): void
+    {
+        if (!$this->di instanceof \Pimple\Container || !$this->di->offsetExists('em')) {
+            return;
+        }
+
+        $table = $this->di['em']->getConnection()->createSchemaManager()->introspectTableByUnquotedName('invoice');
+        if (!$table->hasColumn('approved') || $table->hasColumn('issued')) {
+            return;
+        }
+
+        if ($this->isLegacyPatchDriver()) {
+            $this->executeSql('ALTER TABLE `invoice` CHANGE `approved` `issued` TINYINT(1) NOT NULL DEFAULT 0');
+        } else {
+            $this->executeSql('ALTER TABLE invoice RENAME COLUMN approved TO issued');
+        }
+    }
+
+    /**
+     * Swaps the legacy invoice_status_approved_due_at_idx composite index for
+     * its issued-column successor. Portable across drivers via the DBAL schema
+     * manager for the existence checks; runs unconditionally from
+     * applyCorePatches() on every platform like the rest of this block.
+     */
+    private function renameInvoiceStatusIndex(): void
+    {
+        if (!$this->di instanceof \Pimple\Container || !$this->di->offsetExists('em')) {
+            return;
+        }
+
+        $old = 'invoice_status_approved_due_at_idx';
+        $new = 'invoice_status_issued_due_at_idx';
+
+        $schemaManager = $this->di['em']->getConnection()->createSchemaManager();
+        $dropOld = $schemaManager->introspectTableByUnquotedName('invoice')->hasIndex($old);
+        $missingNew = !$schemaManager->introspectTableByUnquotedName('invoice')->hasIndex($new);
+        if ($dropOld) {
+            $this->executeSql($this->isLegacyPatchDriver()
+                ? "DROP INDEX `$old` ON `invoice`"
+                : "DROP INDEX $old");
+        }
+
+        if ($missingNew) {
+            $this->executeSql('CREATE INDEX ' . $new . ' ON invoice (status, issued, due_at)');
+        }
+    }
+
+    /**
+     * Drops the dead invoice.buyer_phone_cc column, which the entity no
+     * longer maps. Portable across drivers via the DBAL schema manager for
+     * the existence check; every supported driver accepts DROP COLUMN.
+     * Idempotent: fresh installs never have it, migrated ones no longer do.
+     */
+    private function dropInvoiceBuyerPhoneCcColumn(): void
+    {
+        if (!$this->di instanceof \Pimple\Container || !$this->di->offsetExists('em')) {
+            return;
+        }
+
+        if (!$this->di['em']->getConnection()->createSchemaManager()->introspectTableByUnquotedName('invoice')->hasColumn('buyer_phone_cc')) {
+            return;
+        }
+
+        $this->executeSql($this->isLegacyPatchDriver()
+            ? 'ALTER TABLE `invoice` DROP COLUMN `buyer_phone_cc`'
+            : 'ALTER TABLE invoice DROP COLUMN buyer_phone_cc');
+    }
+
+    /**
+     * Drops the dead transaction.validate_ipn column, which nothing ever
+     * read and the entity no longer maps. Portable across drivers via the
+     * DBAL schema manager for the existence check; every supported driver
+     * accepts DROP COLUMN. Idempotent: fresh installs never have it,
+     * migrated ones no longer do.
+     */
+    private function dropTransactionValidateIpnColumn(): void
+    {
+        if (!$this->di instanceof \Pimple\Container || !$this->di->offsetExists('em')) {
+            return;
+        }
+
+        if (!$this->di['em']->getConnection()->createSchemaManager()->introspectTableByUnquotedName('transaction')->hasColumn('validate_ipn')) {
+            return;
+        }
+
+        // `transaction` is reserved on every driver: quote it, or the ALTER
+        // is a syntax error outside MySQL's backticks.
+        $this->executeSql($this->isLegacyPatchDriver()
+            ? 'ALTER TABLE `transaction` DROP COLUMN `validate_ipn`'
+            : 'ALTER TABLE "transaction" DROP COLUMN "validate_ipn"');
+    }
+
+    /**
+     * Writes one baseline journal entry per invoice that has none, typed by
+     * its actual current state (drafts as created, the rest by status). No
+     * history is fabricated: installs upgrading to the journal get a truthful
+     * starting point, and every later transition appends live entries.
+     * Portable across drivers; idempotent: invoices that already have
+     * journal rows are skipped. Runs from applyCorePatches() only, never from the drift
+     * healer, so a large backlog can't stall page loads.
+     */
+    public function backfillInvoiceJournal(int $maxPages = 0): void
+    {
+        if (!$this->di instanceof \Pimple\Container || !$this->di->offsetExists('em')) {
+            return;
+        }
+
+        $dbal = $this->di['em']->getConnection();
+        if (!$dbal->createSchemaManager()->tablesExist(['invoice_event'])) {
+            return;
+        }
+
+        $padding = $dbal->fetchOne("SELECT value FROM setting WHERE param = 'invoice_number_padding'");
+        $padding = is_numeric($padding) && (int) $padding > 0 ? (int) $padding : 5;
+
+        // Keyset pages, not one unbounded read: on the first upgrade no invoice has a
+        // journal row, so an unpaged SELECT would load every invoice (including its
+        // notes/text blobs) into memory at once. Only the snapshot columns are read.
+        // Idempotent: written rows drop out of later pages via the LEFT JOIN.
+        // $maxPages bounds periodic healing (cron, drift sync): 0 means no limit.
+        $lastId = 0;
+        $pages = 0;
+        do {
+            $rows = $dbal->fetchAllAssociative(
+                'SELECT i.id, i.nr, i.serie, i.status, i.issued, i.client_id,
+                    i.buyer_first_name, i.buyer_last_name, i.buyer_company, i.buyer_company_vat,
+                    i.buyer_company_number, i.buyer_address, i.buyer_city, i.buyer_state,
+                    i.buyer_country, i.buyer_phone, i.buyer_email, i.buyer_zip,
+                    i.seller_company, i.seller_company_vat, i.seller_company_number,
+                    i.seller_address, i.seller_phone, i.seller_email,
+                    i.paid_at, i.due_at, i.created_at
+                FROM invoice i LEFT JOIN invoice_event e ON e.invoice_id = i.id
+                WHERE e.id IS NULL AND i.id > :last ORDER BY i.id LIMIT 500',
+                ['last' => $lastId]
+            );
+
+            foreach ($rows as $row) {
+                $lastId = (int) $row['id'];
+                $this->writeBackfillJournalEntry($dbal, $row, $padding);
+            }
+            ++$pages;
+        } while ($rows !== [] && ($maxPages === 0 || $pages < $maxPages));
+    }
+
+    /**
+     * Heal invoices missing every journal row (a lost journal write, or a table created
+     * after its invoices by drift healing). Bounded to one page per call so periodic
+     * callers converge without stalling; reruns pick up where this one stopped.
+     */
+    public function healInvoiceJournal(int $maxPages = 1): void
+    {
+        $this->backfillInvoiceJournal($maxPages);
+    }
+
+    /**
+     * Backfill pre-#4661 tax-inclusive `base_refund` rows to the net basis, preserving the tax
+     * portion in `base_refund_tax`. Only `base_refund_tax IS NULL` rows are touched, so reruns
+     * never double-apply. A row is only rewritten when its refund-time base currency is
+     * established: its currency must be the current default (whose conversions are the 1:1
+     * identity, exact at any point in time) and its payment-time `currency_rate` snapshot must
+     * be 1.0, pinning the same base across the payment-to-refund window. Anything else - a
+     * foreign base, a moved rate, or no linked note establishing the tax - is left NULL
+     * rather than recording a zero that would read as known. Bounded runs resume from a
+     * stored scan position so they converge across requests; unbounded runs rescan from
+     * zero and clear it.
+     */
+    public function backfillRefundIncomeBasis(int $maxPages = 0): void
+    {
+        if (!$this->di instanceof \Pimple\Container || !$this->di->offsetExists('em')) {
+            return;
+        }
+
+        try {
+            $dbal = $this->di['em']->getConnection();
+            $schemaManager = $dbal->createSchemaManager();
+            if (!$schemaManager->tablesExist(['invoice', 'invoice_item'])
+                || !$schemaManager->introspectTableByUnquotedName('invoice')->hasColumn('base_refund_tax')) {
+                return;
+            }
+        } catch (\Doctrine\DBAL\Exception\ConnectionException) {
+            return;
+        }
+
+        // The default currency converts 1:1, so its gross/net hypotheses are exact no
+        // matter when the refund was recorded. Anything else needs its refund-time
+        // rate, which is not stored - those rows stay unresolved (see below).
+        $defaultCode = null;
+
+        try {
+            $defaultCode = $this->di['mod_service']('currency')->getCurrencyRepository()->findDefault()?->getCode();
+        } catch (\Throwable) {
+            $defaultCode = null;
+        }
+
+        $marker = 'refund_basis_backfill_last_id';
+        $lastId = 0;
+        if ($maxPages !== 0) {
+            $stored = $this->backfillPosition($dbal, $marker);
+            if ($stored !== null) {
+                $lastId = $stored;
+            }
+        }
+
+        $updated = 0;
+        $pages = 0;
+
+        do {
+            $rows = $dbal->fetchAllAssociative(
+                'SELECT id, refund, base_refund, currency, currency_rate FROM invoice WHERE id > :last AND refund IS NOT NULL AND base_refund_tax IS NULL ORDER BY id LIMIT 200',
+                ['last' => $lastId]
+            );
+            if ($rows === []) {
+                break;
+            }
+            ++$pages;
+
+            $linkedTotalsByInvoice = $this->linkedRefundTotalsByInvoice($dbal, array_map(static fn (array $row): int => (int) $row['id'], $rows));
+
+            foreach ($rows as $row) {
+                $lastId = (int) $row['id'];
+
+                $refund = (float) ($row['refund'] ?? 0);
+                [$guard, $guardParams] = $this->unchangedRefundGuard($row);
+                if ($refund <= 0) {
+                    // Nothing refunded: no tax by definition.
+                    $updated += (int) (bool) $dbal->executeStatement(
+                        'UPDATE invoice SET base_refund_tax = :value WHERE id = :id AND base_refund_tax IS NULL ' . $guard,
+                        array_merge(['value' => '0.00', 'id' => $row['id']], $guardParams)
+                    );
+
+                    continue;
+                }
+
+                $linked = $linkedTotalsByInvoice[$lastId] ?? null;
+                // `refund` accumulates each note's rounded gross, so allow a couple of
+                // cents of rounding dust. Anything beyond that is refunded money with
+                // no linked document: the cumulative tax basis cannot be established.
+                $covered = $linked !== null && $refund - $linked['gross'] <= 0.02;
+                $net = $covered ? round(max(0.0, $refund - $linked['tax']), 2) : $refund;
+
+                if (abs($net - $refund) < 0.005) {
+                    if (!$covered) {
+                        // No linked note (or only partial coverage) establishes the tax:
+                        // unknown, leave NULL rather than recording a zero that reads as known.
+                        $this->logUpdate('warning', sprintf('Skipping refund basis backfill for invoice #%d: linked notes do not cover the full refund', $lastId));
+
+                        continue;
+                    }
+                    // Linked notes with zero tax: known zero, mark done.
+                    $updated += (int) (bool) $dbal->executeStatement(
+                        'UPDATE invoice SET base_refund_tax = :value WHERE id = :id AND base_refund_tax IS NULL ' . $guard,
+                        array_merge(['value' => '0.00', 'id' => $row['id']], $guardParams)
+                    );
+
+                    continue;
+                }
+
+                if (!$this->isEstablishedDefaultBasis($row, $defaultCode)) {
+                    $this->logUpdate('warning', sprintf('Skipping refund basis backfill for invoice #%d: cannot establish its refund-time base currency', $lastId));
+
+                    continue;
+                }
+
+                $storedBase = (float) $row['base_refund'];
+                if (abs($storedBase - $refund) < 0.005) {
+                    // Legacy gross basis: scale the stored base down to net.
+                    $newBase = round($storedBase * $net / $refund, 2);
+                    $updated += (int) (bool) $dbal->executeStatement(
+                        'UPDATE invoice SET base_refund = :net, base_refund_tax = :tax WHERE id = :id AND base_refund_tax IS NULL ' . $guard,
+                        array_merge(['net' => $newBase, 'tax' => round($storedBase - $newBase, 2), 'id' => $row['id']], $guardParams)
+                    );
+                } elseif (abs($storedBase - $net) < 0.005) {
+                    // Already net (refunded after #4661, before this migration): tax leg only.
+                    $updated += (int) (bool) $dbal->executeStatement(
+                        'UPDATE invoice SET base_refund_tax = :tax WHERE id = :id AND base_refund_tax IS NULL ' . $guard,
+                        array_merge(['tax' => round($refund - $net, 2), 'id' => $row['id']], $guardParams)
+                    );
+                } else {
+                    $this->logUpdate('warning', sprintf('Skipping refund basis backfill for invoice #%d: stored base matches neither gross nor net basis', $lastId));
+                }
+            }
+
+            if ($maxPages !== 0) {
+                $this->storeBackfillPosition($dbal, $marker, $lastId);
+            }
+        } while ($maxPages === 0 || $pages < $maxPages);
+
+        if ($maxPages === 0 || $rows === []) {
+            // Unbounded runs always scan to exhaustion; bounded runs clear the marker
+            // once they reach the end so later refunds start fresh from zero.
+            $this->clearBackfillPosition($dbal, $marker);
+        }
+
+        if ($updated > 0) {
+            $this->logUpdate('info', sprintf('Backfilled refund income basis for %d invoice(s)', $updated));
+        }
+    }
+
+    /**
+     * Optimistic-concurrency guard for backfill writes: only touch the row when `refund`
+     * and `base_refund` still hold the values this scan read. A refund posted concurrently
+     * rewrites both through `countIncome()`, so a mismatch means this page's computation
+     * is stale - the row stays NULL-taxed and is picked up again on a later scan.
+     *
+     * @param array<string, mixed> $row the invoice row as read (binds its snapshot values)
+     *
+     * @return array{string, array<string, mixed>} [AND fragment, bound snapshot values]
+     */
+    private function unchangedRefundGuard(array $row): array
+    {
+        $params = ['refund_snapshot' => $row['refund']];
+        if ($row['base_refund'] === null) {
+            return ['AND refund = :refund_snapshot AND base_refund IS NULL', $params];
+        }
+        $params['base_snapshot'] = $row['base_refund'];
+
+        return ['AND refund = :refund_snapshot AND base_refund = :base_snapshot', $params];
+    }
+
+    /**
+     * Whether the row's refund-time base currency is established well enough to rewrite it:
+     * its currency is the current default (1:1 identity conversion, exact at any point in
+     * time) and its payment-time `currency_rate` snapshot is 1.0, pinning the same base
+     * across the payment-to-refund window. The default currency's own rate is pinned at 1.0
+     * by the rate updater, so a mismatch means the base moved and the row stays unresolved.
+     *
+     * @param array<string, mixed> $row
+     */
+    private function isEstablishedDefaultBasis(array $row, ?string $defaultCode): bool
+    {
+        if ($row['base_refund'] === null || $defaultCode === null) {
+            return false;
+        }
+        if ((string) ($row['currency'] ?? '') !== $defaultCode) {
+            return false;
+        }
+        if (!is_numeric($row['currency_rate'] ?? null) || abs((float) $row['currency_rate'] - 1.0) >= 0.000001) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Resumable scan position for bounded backfill runs, so pages of unresolvable rows
+     * cannot stall convergence: each bounded run continues where the previous stopped.
+     * Best-effort only - correctness never depends on it thanks to the IS NULL guard -
+     * so storage failures are swallowed after logging.
+     */
+    private function backfillPosition(\Doctrine\DBAL\Connection $dbal, string $marker): ?int
+    {
+        try {
+            $stored = $dbal->fetchOne('SELECT value FROM setting WHERE param = :param', ['param' => $marker]);
+        } catch (\Throwable $e) {
+            $this->logUpdate('warning', sprintf('Refund basis backfill position unreadable: %s', $e->getMessage()));
+
+            return null;
+        }
+
+        return is_numeric($stored) ? (int) $stored : null;
+    }
+
+    private function storeBackfillPosition(\Doctrine\DBAL\Connection $dbal, string $marker, int $lastId): void
+    {
+        try {
+            $exists = $dbal->fetchOne('SELECT value FROM setting WHERE param = :param', ['param' => $marker]);
+            if ($exists === false) {
+                $now = date('Y-m-d H:i:s');
+                $dbal->insert('setting', [
+                    'param' => $marker,
+                    'value' => (string) $lastId,
+                    'public' => 0,
+                    'created_at' => $now,
+                    'updated_at' => $now,
+                ]);
+            } else {
+                $dbal->executeStatement(
+                    'UPDATE setting SET value = :value, updated_at = :updated WHERE param = :param',
+                    ['value' => (string) $lastId, 'updated' => date('Y-m-d H:i:s'), 'param' => $marker]
+                );
+            }
+        } catch (\Throwable $e) {
+            $this->logUpdate('warning', sprintf('Refund basis backfill position not stored: %s', $e->getMessage()));
+        }
+    }
+
+    private function clearBackfillPosition(\Doctrine\DBAL\Connection $dbal, string $marker): void
+    {
+        try {
+            $dbal->executeStatement('DELETE FROM setting WHERE param = :param', ['param' => $marker]);
+        } catch (\Throwable $e) {
+            $this->logUpdate('warning', sprintf('Refund basis backfill position not cleared: %s', $e->getMessage()));
+        }
+    }
+
+    /**
+     * Linked refund totals per invoice in invoice currency, mirroring `Invoice\Service` math:
+     * per-note rounded tax on taxed lines, and absolute credit-note totals for the gross
+     * share. Invoices without linked notes are absent.
+     *
+     * @param list<int> $invoiceIds
+     *
+     * @return array<int, array{tax: float, gross: float}>
+     */
+    private function linkedRefundTotalsByInvoice(\Doctrine\DBAL\Connection $dbal, array $invoiceIds): array
+    {
+        if ($invoiceIds === []) {
+            return [];
+        }
+
+        $placeholders = implode(',', array_fill(0, count($invoiceIds), '?'));
+        $notes = $dbal->fetchAllAssociative(
+            "SELECT id, credit_note_for_invoice_id, taxrate FROM invoice WHERE credit_note_for_invoice_id IN ({$placeholders})",
+            $invoiceIds
+        );
+        if ($notes === []) {
+            return [];
+        }
+
+        $noteIds = array_map(static fn (array $note): int => (int) $note['id'], $notes);
+        $placeholders = implode(',', array_fill(0, count($noteIds), '?'));
+        $items = $dbal->fetchAllAssociative(
+            "SELECT invoice_id, price, quantity, taxed FROM invoice_item WHERE invoice_id IN ({$placeholders})",
+            $noteIds
+        );
+
+        $subtotalByNote = [];
+        $taxableByNote = [];
+        foreach ($items as $item) {
+            $noteId = (int) $item['invoice_id'];
+            $lineTotal = ((float) ($item['price'] ?? 0) * ((float) ($item['quantity'] ?? 1)));
+            $subtotalByNote[$noteId] = ($subtotalByNote[$noteId] ?? 0.0) + $lineTotal;
+            if (!empty($item['taxed'])) {
+                $taxableByNote[$noteId] = ($taxableByNote[$noteId] ?? 0.0) + $lineTotal;
+            }
+        }
+
+        $taxByNote = [];
+        $grossByNote = [];
+        foreach ($notes as $note) {
+            $rate = (float) ($note['taxrate'] ?? 0);
+            $taxable = $taxableByNote[(int) $note['id']] ?? 0.0;
+            $taxByNote[(int) $note['id']] = ($rate > 0 && $taxable != 0.0) ? round($taxable * $rate / 100, 2) : 0.0;
+            $grossByNote[(int) $note['id']] = abs(($subtotalByNote[(int) $note['id']] ?? 0.0) + $taxByNote[(int) $note['id']]);
+        }
+
+        $totals = [];
+        foreach ($notes as $note) {
+            $invoiceId = (int) $note['credit_note_for_invoice_id'];
+            // Credit note amounts are negated, so their tax is too: negate back to a positive share.
+            $totals[$invoiceId]['tax'] = ($totals[$invoiceId]['tax'] ?? 0.0) - $taxByNote[(int) $note['id']];
+            $totals[$invoiceId]['gross'] = ($totals[$invoiceId]['gross'] ?? 0.0) + $grossByNote[(int) $note['id']];
+        }
+
+        return $totals;
+    }
+
+    /**
+     * @param array<string, mixed> $row
+     */
+    private function writeBackfillJournalEntry(\Doctrine\DBAL\Connection $dbal, array $row, int $padding): void
+    {
+        $dbal->transactional(function () use ($dbal, $row, $padding): void {
+            $invoiceId = (int) $row['id'];
+            if ($dbal->getDatabasePlatform() instanceof \Doctrine\DBAL\Platforms\SQLitePlatform) {
+                $dbal->executeStatement('UPDATE invoice SET updated_at = updated_at WHERE id = ?', [$invoiceId]);
+            }
+            $current = $dbal->fetchAssociative('SELECT * FROM invoice WHERE id = ?' . \FOSSBilling\Core\Doctrine\RowLock::suffix($dbal), [$invoiceId]);
+            if ($current === false || $dbal->fetchOne('SELECT id FROM invoice_event WHERE invoice_id = ? LIMIT 1' . \FOSSBilling\Core\Doctrine\RowLock::suffix($dbal), [$invoiceId]) !== false) {
+                return;
+            }
+            $this->writeBackfillJournalSnapshot($dbal, $current, $padding);
+        });
+    }
+
+    /** @param array<string, mixed> $row */
+    private function writeBackfillJournalSnapshot(\Doctrine\DBAL\Connection $dbal, array $row, int $padding): void
+    {
+        $invoiceId = (int) $row['id'];
+        $nr = is_numeric($row['nr'] ?? null) ? (int) $row['nr'] : $invoiceId;
+        $snapshot = [
+            'serie_nr' => ($row['serie'] ?? '') . sprintf('%0' . $padding . 's', $nr),
+            'status' => $row['status'] ?? null,
+            'issued' => !empty($row['issued']),
+            'subtotal' => null,
+            'tax' => null,
+            'total' => null,
+            'buyer' => [
+                'first_name' => $row['buyer_first_name'] ?? null,
+                'last_name' => $row['buyer_last_name'] ?? null,
+                'company' => $row['buyer_company'] ?? null,
+                'company_vat' => $row['buyer_company_vat'] ?? null,
+                'company_number' => $row['buyer_company_number'] ?? null,
+                'address' => $row['buyer_address'] ?? null,
+                'city' => $row['buyer_city'] ?? null,
+                'state' => $row['buyer_state'] ?? null,
+                'country' => $row['buyer_country'] ?? null,
+                'phone' => $row['buyer_phone'] ?? null,
+                'email' => $row['buyer_email'] ?? null,
+                'zip' => $row['buyer_zip'] ?? null,
+            ],
+            'seller' => [
+                'company' => $row['seller_company'] ?? null,
+                'company_vat' => $row['seller_company_vat'] ?? null,
+                'company_number' => $row['seller_company_number'] ?? null,
+                'address' => $row['seller_address'] ?? null,
+                'phone' => $row['seller_phone'] ?? null,
+                'email' => $row['seller_email'] ?? null,
+            ],
+            'paid_at' => $this->normalizeBackfillDate($row['paid_at'] ?? null),
+            'due_at' => $this->normalizeBackfillDate($row['due_at'] ?? null),
+            'created_at' => $this->normalizeBackfillDate($row['created_at'] ?? null),
+        ];
+
+        $type = 'created';
+        if (!empty($row['issued'])) {
+            $type = match ($row['status'] ?? null) {
+                'paid' => 'paid',
+                'canceled' => 'canceled',
+                'refunded' => 'refunded',
+                default => 'issued',
+            };
+        }
+
+        $dbal->executeStatement(
+            'INSERT INTO invoice_event (invoice_id, type, client_id, snapshot, created_at) VALUES (:invoice_id, :type, :client_id, :snapshot, :created_at)',
+            [
+                'invoice_id' => $invoiceId,
+                'type' => $type,
+                'client_id' => $row['client_id'] !== null ? (int) $row['client_id'] : null,
+                // Substitute rather than throw on legacy bytes that cannot be encoded:
+                // a single bad row must not wedge the whole patch run.
+                'snapshot' => json_encode($snapshot, JSON_INVALID_UTF8_SUBSTITUTE),
+                'created_at' => $snapshot['created_at'] ?? date('Y-m-d H:i:s'),
+            ]
+        );
+    }
+
+    private function normalizeBackfillDate(mixed $value): ?string
+    {
+        if ($value instanceof \DateTimeInterface) {
+            return $value->format('Y-m-d H:i:s');
+        }
+        if (is_string($value) && $value !== '') {
+            return $value;
+        }
+
+        return null;
+    }
+
+    /**
+     * Records the metadata identity the schema was last synced against, in the same plain
+     * setting row ensureSchemaInSync() compares. Portable check-then-write, no
+     * ON DUPLICATE KEY UPDATE, so it works on every driver.
+     */
+    private function storeSchemaMetadataHash(string $hash): void
+    {
+        $existing = $this->fetchOne('SELECT value FROM setting WHERE param = :param', [
+            'param' => self::SCHEMA_METADATA_HASH_PARAM,
+        ]);
+
+        if ($existing === false) {
+            $now = date('Y-m-d H:i:s');
+            $this->executeSql(
+                'INSERT INTO setting (param, value, public, created_at, updated_at) VALUES (:param, :value, 0, :created_at, :updated_at)',
+                [
+                    'param' => self::SCHEMA_METADATA_HASH_PARAM,
+                    'value' => $hash,
+                    'created_at' => $now,
+                    'updated_at' => $now,
+                ]
+            );
+        } elseif ($existing !== $hash) {
+            $this->executeSql('UPDATE setting SET value = :value, updated_at = :updated_at WHERE param = :param', [
+                'value' => $hash,
+                'updated_at' => date('Y-m-d H:i:s'),
+                'param' => self::SCHEMA_METADATA_HASH_PARAM,
+            ]);
+        }
+    }
+
+    /**
+     * Run once: non-MySQL installs retain the legacy column, so replaying the
+     * copy would restore memberships removed by administrators.
+     */
+    private function migrateClientGroupMemberships(\Doctrine\DBAL\Connection $connection): void
+    {
+        $marker = 'client_group_memberships_migrated';
+        if ($connection->fetchOne('SELECT value FROM setting WHERE param = :param', ['param' => $marker]) !== false) {
+            return;
+        }
+
+        $schemaManager = $connection->createSchemaManager();
+        if (!$schemaManager->tablesExist(['client'])
+            || !$schemaManager->introspectTableByUnquotedName('client')->hasColumn('client_group_id')) {
+            return;
+        }
+
+        $connection->transactional(static function (\Doctrine\DBAL\Connection $connection) use ($marker): void {
+            $connection->executeStatement(
+                'INSERT INTO client_group_members (client_id, client_group_id) '
+                . 'SELECT c.id, c.client_group_id FROM client c '
+                . 'INNER JOIN client_group g ON g.id = c.client_group_id '
+                . 'WHERE NOT EXISTS (SELECT 1 FROM client_group_members m '
+                . 'WHERE m.client_id = c.id AND m.client_group_id = c.client_group_id)'
+            );
+            $now = date('Y-m-d H:i:s');
+            $connection->insert('setting', [
+                'param' => $marker,
+                'value' => '1',
+                'public' => 0,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ]);
+        });
+    }
+
+    /**
+     * @return list<string>
+     */
+    public function getColumnForeignKeys(string $table, string $column): array
+    {
+        $rows = $this->fetchAll(
+            'SELECT CONSTRAINT_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table AND COLUMN_NAME = :column AND REFERENCED_TABLE_NAME IS NOT NULL',
+            ['table' => $table, 'column' => $column],
+        );
+
+        return array_values(array_unique(array_map(static fn (array $row): string => (string) $row['CONSTRAINT_NAME'], $rows)));
+    }
+
+    private function tableHasForeignKey(string $table, string $constraintName): bool
+    {
+        return (bool) $this->fetchOne(
+            'SELECT 1 FROM information_schema.TABLE_CONSTRAINTS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table AND CONSTRAINT_NAME = :constraint AND CONSTRAINT_TYPE = :type LIMIT 1',
+            ['table' => $table, 'constraint' => $constraintName, 'type' => 'FOREIGN KEY'],
+        );
+    }
+
+    public function addForeignKeyIfMissing(string $table, string $constraintName, string $column, string $referencedTable, string $referencedColumn): void
+    {
+        if ($this->tableHasForeignKey($table, $constraintName)) {
+            return;
+        }
+
+        $this->executeSql(sprintf(
+            'ALTER TABLE `%s` ADD CONSTRAINT `%s` FOREIGN KEY (`%s`) REFERENCES `%s` (`%s`) ON DELETE CASCADE',
+            $this->quoteIdentifier($table),
+            $this->quoteIdentifier($constraintName),
+            $this->quoteIdentifier($column),
+            $this->quoteIdentifier($referencedTable),
+            $this->quoteIdentifier($referencedColumn),
+        ));
+    }
+
+    private function removeRetiredHookData(): void
+    {
+        $this->executeSql("DELETE FROM extension_meta WHERE extension = 'mod_hook' AND meta_key = 'listener'");
+        $this->executeSql("DELETE FROM extension WHERE type = 'hook'");
+    }
+
+    public function migrateDefaultBrandingAssetsToPublicDirectory(): void
+    {
+        $settings = [
+            'company_logo' => [
+                'public/branding/logo-light.svg',
+                'public/branding/logo.svg',
+                'themes/huraga/assets/img/logo.svg',
+                'themes/huraga/assets/build/img/logo.svg',
+            ],
+            'company_logo_dark' => [
+                'public/branding/logo-dark.svg',
+                'themes/huraga/assets/img/logo_white.svg',
+                'themes/huraga/assets/build/img/logo_white.svg',
+            ],
+            'company_favicon' => [
+                'public/branding/favicon.svg',
+                'public/branding/favicon.ico',
+                'themes/huraga/assets/favicon.ico',
+                'themes/huraga/assets/build/favicon.ico',
+            ],
+        ];
+
+        foreach ($settings as $param => $values) {
+            $newValue = $values[0];
+            $oldValues = array_slice($values, 1);
+
+            foreach ($oldValues as $oldValue) {
+                $this->executeSql('UPDATE setting SET value = :new_value WHERE param = :param AND value = :old_value', [
+                    'new_value' => $newValue,
+                    'param' => $param,
+                    'old_value' => $oldValue,
+                ]);
+            }
+        }
+
+        foreach (['public/branding/logo.svg', 'public/branding/favicon.ico'] as $path) {
+            // A custom setting may still use an old asset, such as the light logo in dark mode.
+            if ($this->fetchOne('SELECT value FROM setting WHERE value = :value LIMIT 1', ['value' => $path]) !== false) {
+                continue;
+            }
+
+            $this->executeFileActions([Path::join(PATH_ROOT, $path) => 'unlink']);
+        }
+    }
+
+    public function widenLegacyTextColumns(string $table, array $columns, bool $repairTableDefault = false): void
+    {
+        if (!$this->tableExists($table)) {
+            return;
+        }
+
+        // Normalize every listed legacy text column to utf8mb4 (unicode_ci,
+        // or utf8mb4_bin where byte-order comparison must be preserved).
+        // TEXT columns keep their size (CONVERT TO CHARACTER SET can promote
+        // them to MEDIUMTEXT, so MODIFY is used instead). Indexed columns
+        // convert too, unless the wider 4-byte characters would overflow the
+        // server's index key length - those keep their definition for manual
+        // review.
+        $indexes = $this->fetchAll(sprintf('SHOW INDEX FROM `%s`', $this->quoteIdentifier($table)));
+        // MariaDB's UCA-1400 collations appear without a charset prefix here
+        // (and with NULL charset in COLLATIONS); applicability includes their aliases.
+        $applicable = $this->fetchFirstColumn('SELECT COLLATION_NAME FROM information_schema.COLLATION_CHARACTER_SET_APPLICABILITY WHERE CHARACTER_SET_NAME = :charset', ['charset' => 'utf8mb4']);
+        $unicodeTarget = self::findCollation($applicable, 'utf8mb4_unicode_ci');
+        if ($unicodeTarget === null) {
+            $this->logUpdate('warning', 'Skipped utf8mb4 conversion of ' . $table . ': utf8mb4_unicode_ci is not available on this server.');
+
+            return;
+        }
+        $binTarget = self::findCollation($applicable, 'utf8mb4_bin');
+
+        $liveColumns = [];
+        foreach ($this->fetchAll(sprintf('SHOW FULL COLUMNS FROM `%s`', $this->quoteIdentifier($table))) as $column) {
+            $liveColumns[$column['Field']] = $column;
+        }
+        $byteLimit = null;
+        $byteLimitKnown = false;
+        $changes = [];
+        foreach ($liveColumns as $column) {
+            $name = $column['Field'];
+            if (!in_array($name, $columns, true)) {
+                continue;
+            }
+
+            $collation = $column['Collation'] ?? '';
+            if (str_starts_with($collation, 'utf8mb4_')) {
+                // Already modern (including NO PAD server defaults such as
+                // utf8mb4_0900_ai_ci); only legacy charsets convert.
+                continue;
+            }
+            if (!preg_match('/^utf8(?:mb3)?_/', $collation)) {
+                if ($repairTableDefault) {
+                    $this->logUpdate('warning', 'Skipped utf8mb4 conversion of ' . $table . '.' . $name . ': customized character set requires manual review.');
+                }
+
+                continue;
+            }
+            $columnTarget = self::resolveConversionTarget($collation, $unicodeTarget, $binTarget, $applicable);
+            if ($columnTarget === null) {
+                $this->logUpdate('warning', 'Skipped utf8mb4 conversion of ' . $table . '.' . $name . ': no equivalent utf8mb4 collation is available on this server.');
+
+                continue;
+            }
+            $columnIndexes = array_filter($indexes, static fn (array $index): bool => $index['Column_name'] === $name);
+            if ($columnIndexes !== []) {
+                // Look the limit up only when an indexed column actually needs
+                // it; most tables never reach this branch.
+                if (!$byteLimitKnown) {
+                    $byteLimit = $this->utf8mb4IndexByteLimit($table);
+                    $byteLimitKnown = true;
+                }
+                if (!$this->canConvertIndexedColumn($columnIndexes, $indexes, $liveColumns, $columns, $byteLimit)) {
+                    if ($this->hasUnsupportedFulltextIndex($columnIndexes, $indexes)) {
+                        $reason = 'multi-column FULLTEXT index requires manual review.';
+                    } elseif ($byteLimit === null) {
+                        $reason = 'compressed block size requires manual review.';
+                    } else {
+                        $reason = 'index would exceed the size limit after conversion and requires manual review.';
+                    }
+                    $this->logUpdate('warning', 'Skipped utf8mb4 conversion of ' . $table . '.' . $name . ': ' . $reason);
+
+                    continue;
+                }
+            }
+            if ($this->isReferencedByExpressionIndex($name, $indexes)) {
+                // SHOW INDEX reports functional key parts with a NULL column
+                // name, so the byte check above cannot see them; the widened
+                // value could overflow the key and fail the whole upgrade.
+                $this->logUpdate('warning', 'Skipped utf8mb4 conversion of ' . $table . '.' . $name . ': functional index requires manual review.');
+
+                continue;
+            }
+            $literalUnitDefault = null;
+            if ($name === 'unit' && in_array($table, ['product', 'client_order', 'invoice_item'], true)
+                && $column['Default'] !== null && $column['Extra'] === ''
+                && preg_match('/^varchar\([0-9]+\)$/', $column['Type'])) {
+                $connection = $this->di['em']->getConnection();
+                // MySQL marks expression defaults DEFAULT_GENERATED. MariaDB quotes
+                // literal strings in information_schema (but not SHOW FULL COLUMNS).
+                // Never turn an expression into a quoted string default.
+                $isMariaDb = $connection->getDatabasePlatform() instanceof \Doctrine\DBAL\Platforms\MariaDBPlatform;
+                $defaultDefinition = $isMariaDb ? $this->fetchOne(
+                    'SELECT COLUMN_DEFAULT FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table AND COLUMN_NAME = :column',
+                    ['table' => $table, 'column' => $name],
+                ) : $column['Default'];
+                if (!$isMariaDb || (is_string($defaultDefinition) && str_starts_with($defaultDefinition, "'") && str_ends_with($defaultDefinition, "'"))) {
+                    $default = $connection->createSchemaManager()->listTableColumns($table)[$name]->getDefault();
+                    if (is_string($default)) {
+                        $literalUnitDefault = $default;
+                    }
+                }
+            }
+            if ($column['Extra'] !== ''
+                || ($column['Default'] !== null && $literalUnitDefault === null)
+                || !preg_match('/^(?:varchar\([0-9]+\)|tinytext|text|mediumtext|longtext)$/', $column['Type'])) {
+                $this->logUpdate('warning', 'Skipped utf8mb4 conversion of ' . $table . '.' . $name . ': customized column or index requires manual review.');
+
+                continue;
+            }
+
+            $definition = sprintf('MODIFY COLUMN `%s` %s CHARACTER SET utf8mb4 COLLATE %s %s',
+                $this->quoteIdentifier($name),
+                $column['Type'],
+                $this->quoteIdentifier($columnTarget),
+                $column['Null'] === 'YES' ? 'NULL' : 'NOT NULL',
+            );
+            if ($literalUnitDefault !== null) {
+                $definition .= ' DEFAULT ' . $this->di['em']->getConnection()->quote($literalUnitDefault);
+            } elseif ($column['Null'] === 'YES') {
+                $definition .= ' DEFAULT NULL';
+            }
+            $definition .= ' COMMENT ' . $this->di['em']->getConnection()->quote($column['Comment']);
+            $changes[] = $definition;
+        }
+
+        if ($repairTableDefault) {
+            $tableCollation = $this->fetchOne(
+                'SELECT TABLE_COLLATION FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table',
+                ['table' => $table],
+            );
+            if (is_string($tableCollation) && $tableCollation !== $unicodeTarget && $tableCollation !== $binTarget
+                && preg_match('/^utf8(?:mb3)?_/', $tableCollation)) {
+                // DEFAULT changes only future columns; existing text moves via MODIFY COLUMN above.
+                // Binary table defaults keep byte-order comparison via utf8mb4_bin.
+                $defaultTarget = self::resolveConversionTarget($tableCollation, $unicodeTarget, $binTarget, $applicable);
+                if ($defaultTarget === null) {
+                    $this->logUpdate('warning', 'Skipped utf8mb4 default for ' . $table . ': no equivalent utf8mb4 collation is available on this server.');
+                } else {
+                    $changes[] = 'DEFAULT CHARACTER SET utf8mb4 COLLATE ' . $this->quoteIdentifier($defaultTarget);
+                }
+            } elseif (is_string($tableCollation) && !str_starts_with($tableCollation, 'utf8mb4_')) {
+                $this->logUpdate('warning', 'Skipped utf8mb4 default for ' . $table . ': customized character set requires manual review.');
+            }
+        }
+
+        if ($changes !== []) {
+            // One ALTER avoids rebuilding the table for each column. DDL failures stop the
+            // patch sequence, leaving the patch pending; successful reruns skip widened columns.
+            $this->executeSql(sprintf('ALTER TABLE `%s` ', $this->quoteIdentifier($table)) . implode(', ', $changes));
+        }
+    }
+
+    /**
+     * Exact server-side spelling of a wanted utf8mb4 collation, or null when
+     * the server does not offer it. MariaDB lists some collations without the
+     * charset prefix, so both spellings are accepted.
+     */
+    private static function findCollation(array $applicable, string $wanted): ?string
+    {
+        foreach ($applicable as $available) {
+            if ($available === $wanted || 'utf8mb4_' . $available === $wanted) {
+                return $available;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * utf8mb4 equivalent preserving the source collation's comparison rules,
+     * or null when the server offers none. Binary collations keep byte-order
+     * comparison; NO PAD sources keep trailing-space significance by mapping
+     * onto the matching utf8mb4 nopad collation, or onto utf8mb4_0900_bin for
+     * binary ones (byte-order comparison is identical there either way).
+     */
+    private static function resolveConversionTarget(string $collation, ?string $unicodeTarget, ?string $binTarget, array $applicable): ?string
+    {
+        if (str_contains($collation, 'nopad')) {
+            if (preg_match('/^utf8(?:mb3)?_(.+)$/', $collation, $matches)) {
+                $native = self::findCollation($applicable, 'utf8mb4_' . $matches[1]);
+                if ($native !== null) {
+                    return $native;
+                }
+            }
+
+            return str_ends_with($collation, '_bin') ? self::findCollation($applicable, 'utf8mb4_0900_bin') : null;
+        }
+
+        if (str_ends_with($collation, '_bin')) {
+            return $binTarget;
+        }
+
+        return $unicodeTarget;
+    }
+
+    /**
+     * Whether any functional (expression) index on the table references the
+     * column. Those parts report a NULL column name, so the byte-limit check
+     * cannot measure them; widening blindly could overflow the key and fail
+     * the upgrade, so such columns are left for manual review instead.
+     */
+    private function isReferencedByExpressionIndex(string $column, array $indexes): bool
+    {
+        foreach ($indexes as $index) {
+            $expression = $index['Expression'] ?? null;
+            if (!is_string($expression) || $expression === '') {
+                continue;
+            }
+            if (preg_match('/(^|[^A-Za-z0-9_])' . preg_quote($column, '/') . '([^A-Za-z0-9_]|$)/i', $expression) === 1) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Whether any of the column's indexes is a multi-column FULLTEXT index,
+     * which can never convert no matter how small the key is.
+     */
+    private function hasUnsupportedFulltextIndex(array $columnIndexes, array $indexes): bool
+    {
+        foreach ($columnIndexes as $index) {
+            if ($index['Index_type'] !== 'FULLTEXT') {
+                continue;
+            }
+            $members = array_filter($indexes, static fn (array $candidate): bool => $candidate['Key_name'] === $index['Key_name']);
+            if (count($members) !== 1) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Whether every index containing a text column still fits the server's
+     * key length once that column widens to 4 bytes per character.
+     *
+     * Single-column FULLTEXT indexes rebuild with the table and are always
+     * safe; a null limit (no verifiable bound, e.g. small-block COMPRESSED)
+     * rejects everything else. Unknown column types or oversized indexes keep
+     * their old definition instead of failing the upgrade.
+     */
+    private function canConvertIndexedColumn(array $columnIndexes, array $indexes, array $liveColumns, array $columns, ?int $byteLimit): bool
+    {
+        foreach ($columnIndexes as $index) {
+            $members = array_filter($indexes, static fn (array $candidate): bool => $candidate['Key_name'] === $index['Key_name']);
+            if ($index['Index_type'] === 'FULLTEXT') {
+                if (count($members) !== 1) {
+                    return false;
+                }
+
+                continue;
+            }
+            if ($byteLimit === null) {
+                return false;
+            }
+            $bytes = 0;
+            foreach ($members as $member) {
+                $memberBytes = $this->utf8mb4IndexColumnBytes($member, $liveColumns, $columns);
+                if ($memberBytes === null) {
+                    return false;
+                }
+                $bytes += $memberBytes;
+            }
+            if ($bytes > $byteLimit) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Worst-case key bytes for one indexed column after conversion, or null
+     * when the size cannot be determined (treated as unsafe by the caller).
+     */
+    private function utf8mb4IndexColumnBytes(array $index, array $liveColumns, array $columns): ?int
+    {
+        $definition = $liveColumns[$index['Column_name']] ?? null;
+        if ($definition === null) {
+            return null;
+        }
+        $type = strtolower((string) ($definition['Type'] ?? ''));
+        $subPart = $index['Sub_part'] !== null ? (int) $index['Sub_part'] : null;
+        $isBinary = str_starts_with($type, 'binary') || str_starts_with($type, 'varbinary') || str_ends_with($type, 'blob');
+        $converting = in_array($definition['Field'], $columns, true);
+
+        if (preg_match('/^(?:var)?char\((\d+)\)$/', $type, $matches)) {
+            $characters = (int) $matches[1];
+            if ($isBinary) {
+                return $subPart ?? $characters;
+            }
+            $factor = $converting ? 4 : self::charsetMaxBytes($definition['Collation'] ?? null);
+            if ($factor === null) {
+                return null;
+            }
+
+            return ($subPart ?? $characters) * $factor;
+        }
+
+        if (in_array($type, ['tinytext', 'text', 'mediumtext', 'longtext'], true)) {
+            // MySQL requires a prefix length to index a TEXT column.
+            if ($subPart === null) {
+                return null;
+            }
+            $factor = $converting ? 4 : self::charsetMaxBytes($definition['Collation'] ?? null);
+
+            return $factor === null ? null : $subPart * $factor;
+        }
+
+        $base = preg_replace('/\(.*$/', '', $type);
+        $fixed = ['tinyint' => 1, 'smallint' => 2, 'mediumint' => 3, 'int' => 4, 'bigint' => 8, 'year' => 1, 'date' => 3, 'float' => 4, 'double' => 8];
+        if (isset($fixed[$base])) {
+            return $fixed[$base];
+        }
+        if (in_array($base, ['datetime', 'timestamp', 'time'], true)) {
+            $bytes = ['time' => 3, 'datetime' => 5, 'timestamp' => 4][$base];
+            if (preg_match('/\((\d+)\)$/', $type, $matches)) {
+                $bytes += intdiv((int) $matches[1] + 1, 2);
+            }
+
+            return $bytes;
+        }
+
+        return null;
+    }
+
+    private static function charsetMaxBytes(?string $collation): ?int
+    {
+        if (!is_string($collation) || $collation === '') {
+            return null;
+        }
+        if (str_starts_with($collation, 'utf8mb4_')) {
+            return 4;
+        }
+        if (preg_match('/^utf8(?:mb3)?_/', $collation)) {
+            return 3;
+        }
+        if (str_starts_with($collation, 'latin1_') || in_array($collation, ['ascii_bin', 'ascii_general_ci', 'binary'], true)) {
+            return 1;
+        }
+
+        return null;
+    }
+
+    private function utf8mb4IndexByteLimit(string $table): ?int
+    {
+        // Match in PHP rather than LIKE: table names contain underscores,
+        // which are single-character wildcards in a LIKE pattern.
+        $engine = '';
+        $rowFormat = '';
+        $createOptions = '';
+        foreach ($this->fetchAll('SHOW TABLE STATUS') as $status) {
+            if (($status['Name'] ?? null) === $table) {
+                $engine = strtolower((string) ($status['Engine'] ?? ''));
+                $rowFormat = strtolower((string) ($status['Row_format'] ?? ''));
+                $createOptions = strtolower((string) ($status['Create_options'] ?? ''));
+
+                break;
+            }
+        }
+        if ($engine !== 'innodb') {
+            return 767;
+        }
+        if ($rowFormat === 'compressed'
+            && preg_match('/key_block_size\s*=\s*(\d+)/', $createOptions, $matches)
+            && (int) $matches[1] < 8
+        ) {
+            // A hand-tuned block size below the server default shrinks what an
+            // index may hold, with no reliable bound to check against. The
+            // null result keeps indexed columns untouched via a dedicated
+            // warning instead of risking a failed ALTER.
+            return null;
+        }
+        if ($rowFormat !== 'dynamic' || !self::supportsLargeIndexPrefixes($this->fetchOne('SELECT VERSION()'))) {
+            return 767;
+        }
+
+        // Unknown page size falls back to the conservative limit rather than
+        // assuming large prefixes: affected indexes skip with a warning
+        // instead of risking a failed ALTER.
+        return match ($this->innoDbPageSize()) {
+            4096 => 768,
+            8192 => 1536,
+            null => 767,
+            default => 3072,
+        };
+    }
+
+    private function innoDbPageSize(): ?int
+    {
+        try {
+            $size = $this->fetchOne('SELECT @@innodb_page_size');
+        } catch (\Throwable) {
+            return null;
+        }
+
+        return is_numeric($size) ? (int) $size : null;
+    }
+
+    private static function supportsLargeIndexPrefixes(mixed $version): bool
+    {
+        if (!is_string($version) || !preg_match('/^(\d+)\.(\d+)\.(\d+)/', $version, $matches)) {
+            return false;
+        }
+        [$major, $minor, $patch] = [(int) $matches[1], (int) $matches[2], (int) $matches[3]];
+        if (stripos($version, 'mariadb') !== false) {
+            return $major > 10 || ($major === 10 && ($minor > 2 || ($minor === 2 && $patch >= 2)));
+        }
+
+        return $major > 5 || ($major === 5 && ($minor > 7 || ($minor === 7 && $patch >= 7)));
+    }
+
+    public function legacyUnicodeColumns(): array
+    {
+        return [
+            'activity_admin_history' => [],
+            'activity_client_email' => ['sender', 'recipients', 'subject', 'content_html', 'content_text', 'attachment_name'],
+            'activity_client_history' => [],
+            'activity_system' => ['message'],
+            'admin' => ['name', 'signature'],
+            'admin_group' => ['name'],
+            'admin_group_member' => [],
+            'admin_password_reset' => [],
+            'cart' => [],
+            'cart_product' => [],
+            'client' => ['first_name', 'last_name', 'company', 'company_vat', 'company_number', 'postcode', 'email', 'billing_email', 'address_1', 'address_2', 'city', 'state', 'notes',
+                'custom_1', 'custom_2', 'custom_3', 'custom_4', 'custom_5', 'custom_6', 'custom_7', 'custom_8', 'custom_9', 'custom_10',
+                'custom_11', 'custom_12', 'custom_13', 'custom_14', 'custom_15', 'custom_16', 'custom_17', 'custom_18', 'custom_19', 'custom_20'],
+            'client_balance' => ['description'],
+            'client_group' => ['title'],
+            'client_group_members' => [],
+            'client_order' => ['title', 'reason', 'notes', 'unit'],
+            'client_order_cancel_request' => ['reason'],
+            'client_order_meta' => ['value'],
+            'client_order_status' => ['notes'],
+            'client_password_reset' => [],
+            'currency' => ['format_pattern', 'code'],
+            'custom_pages' => ['title', 'description', 'keywords', 'content', 'slug'],
+            'email_template' => ['subject', 'content', 'description', 'last_error', 'action_code'],
+            'email_template_group' => [],
+            'email_queue' => ['recipient', 'sender', 'subject', 'content', 'to_name', 'from_name', 'attachment_name'],
+            'extension' => [],
+            'extension_meta' => ['meta_value'],
+            'form' => ['name'],
+            'form_field' => ['label', 'description', 'default_value', 'prefix', 'suffix', 'options'],
+            'invoice' => ['serie', 'notes', 'text_1', 'text_2', 'seller_company', 'seller_company_vat', 'seller_company_number', 'seller_phone', 'seller_email', 'seller_address', 'buyer_first_name', 'buyer_last_name',
+                'buyer_company', 'buyer_company_vat', 'buyer_company_number', 'buyer_zip', 'buyer_phone', 'buyer_email', 'buyer_address', 'buyer_city', 'buyer_state', 'taxname'],
+            'invoice_card_charge' => ['last_error'],
+            'invoice_credit' => [],
+            'invoice_event' => [],
+            'invoice_gateway_charge_attempt' => [],
+            'invoice_gateway_refund_attempt' => [],
+            'invoice_item' => ['title', 'unit'],
+            'json_migration_record' => [],
+            'json_quarantine' => [],
+            'mod_massmailer' => ['from_email', 'from_name', 'subject', 'content'],
+            'pay_gateway' => ['name'],
+            'pay_gateway_customer' => ['default_card'],
+            'pay_gateway_product' => ['name'],
+            'post' => ['title', 'description', 'content', 'section', 'image', 'slug'],
+            'product' => ['title', 'description', 'unit', 'icon_url', 'plugin_config', 'slug'],
+            'product_category' => ['title', 'description', 'icon_url'],
+            'product_payment' => [],
+            'product_payment_period' => [],
+            'promo' => ['description'],
+            'promo_redemption' => ['release_reason'],
+            'service_apikey' => [],
+            'service_custom' => ['plugin_config', 'f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8', 'f9', 'f10'],
+            'service_domain' => ['sld', 'tld', 'ns1', 'ns2', 'ns3', 'ns4', 'transfer_code', 'contact_email', 'contact_company', 'contact_first_name', 'contact_last_name', 'contact_address1', 'contact_address2', 'contact_city', 'contact_state', 'details', 'contact_postcode'],
+            'service_downloadable' => [],
+            'service_downloadable_file' => ['filename', 'label', 'description'],
+            'service_hosting' => ['sld', 'tld', 'username'],
+            'service_hosting_hp' => ['name'],
+            'service_hosting_server' => ['name', 'username', 'password', 'status_url', 'hostname', 'ns1', 'ns2', 'ns3', 'ns4'],
+            'service_license' => ['license_key'],
+            'session' => [],
+            'setting' => ['value'],
+            'subscription' => [],
+            'support_escalation_applied' => [],
+            'support_escalation_rule' => ['name', 'reply'],
+            'support_helpdesk' => ['name', 'signature', 'email'],
+            'support_helpdesk_feedback' => [],
+            'support_helpdesk_hidden' => [],
+            'support_kb_category_hidden' => [],
+            'support_ticket_assignment' => [],
+            'support_ticket_close_event' => [],
+            'support_ticket_feedback_request' => [],
+            'support_ticket_message_rating' => [],
+            'support_ticket_pin' => [],
+            'support_ticket_file' => ['name'],
+            'support_ticket_feedback' => ['comments'],
+            'support_ticket_merge' => ['subject'],
+            'support_ticket_secret' => ['label'],
+            'support_ticket_secret_event' => ['secret_label'],
+            'support_kb_article' => ['title', 'content', 'slug'],
+            'support_kb_article_category' => ['title', 'description', 'slug'],
+            'support_pr' => ['title', 'content'],
+            'support_pr_category' => ['title'],
+            'support_ticket' => ['author_name', 'author_email', 'subject', 'rel_new_value'],
+            'support_ticket_message' => ['content', 'attachment'],
+            'support_ticket_message_history' => ['content'],
+            'support_ticket_note' => ['note'],
+            'tax' => ['name', 'state'],
+            'tld' => ['tld'],
+            'tld_registrar' => ['name'],
+            'transaction' => ['error', 'note', 'output', 'txn_status'],
+        ];
+    }
+
+    public function repairDatabaseDefaultCharset(): void
+    {
+        $database = $this->fetchOne('SELECT DATABASE()');
+        if (!is_string($database) || $database === '') {
+            return;
+        }
+
+        $charset = $this->fetchOne('SELECT DEFAULT_CHARACTER_SET_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = DATABASE()');
+        $collation = $this->fetchOne('SELECT DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = DATABASE()');
+        if (!is_string($charset) || !preg_match('/^utf8(?:mb3)?$/', $charset) || !is_string($collation)) {
+            return;
+        }
+
+        // Normalize to the fresh-install collation; binary database defaults
+        // keep byte-order comparison via utf8mb4_bin instead.
+        $collations = $this->fetchFirstColumn(
+            'SELECT COLLATION_NAME FROM information_schema.COLLATION_CHARACTER_SET_APPLICABILITY WHERE CHARACTER_SET_NAME = :charset',
+            ['charset' => 'utf8mb4']
+        );
+        $targetCollation = self::resolveConversionTarget(
+            $collation,
+            self::findCollation($collations, 'utf8mb4_unicode_ci'),
+            self::findCollation($collations, 'utf8mb4_bin'),
+            $collations
+        );
+        if ($targetCollation === null) {
+            $this->logUpdate('warning', 'Skipped utf8mb4 database default for ' . $database . ': no equivalent utf8mb4 collation is available on this server.');
+
+            return;
+        }
+
+        $this->executeSql('ALTER DATABASE CHARACTER SET utf8mb4 COLLATE ' . $this->quoteIdentifier($targetCollation));
+    }
+
+    public function backfillProductCategoryPriorities(\Doctrine\DBAL\Connection $connection): void
+    {
+        $schemaManager = $connection->createSchemaManager();
+        if (!$schemaManager->tablesExist(['product_category'])
+            || !$schemaManager->introspectTableByUnquotedName('product_category')->hasColumn('priority')) {
+            return;
+        }
+
+        $connection->executeStatement('UPDATE product_category SET priority = id * 10 WHERE priority IS NULL');
+    }
+
+    /**
+     * Backfills invoice_item.order_id from rel_id for rows that reference orders
+     * (see https://github.com/FOSSBilling/FOSSBilling/issues/4688). Portable and
+     * idempotent: the numeric check runs in PHP so no per-platform regex is needed,
+     * and only rows still missing order_id are touched. $maxPages bounds periodic
+     * healing callers: 0 means no limit.
+     *
+     * Only the two shapes this codebase produces for order references are migrated:
+     * type='order' lines and unit='discount' lines (which default to TYPE_CUSTOM but
+     * still name an order). Any other numeric rel_id (invoice/credit-note references,
+     * third-party line types) is deliberately left alone.
+     *
+     * Bounded runs resume from a stored scan position so pages of unresolvable rows
+     * (hook_call JSON, invoice references) never strand later pages behind them;
+     * unbounded runs rescan from zero. Either way the marker is cleared and
+     * completion is recorded once a pass reaches the end. Bounded runs
+     * short-circuit on that flag (so the per-request heal in
+     * Finalization::healSchemaDrift() stays a single indexed lookup once
+     * converged); unbounded runs always rescan, so rows that appeared while
+     * the flag was set - e.g. written by a downgraded codebase that does not
+     * know order_id yet - are still picked up by the next finalization.
+     * Never throws: a failure only logs, and the next run picks up where this
+     * one stopped.
+     */
+    public function backfillInvoiceItemOrderIds(int $maxPages = 0): void
+    {
+        if (!$this->di instanceof \Pimple\Container || !$this->di->offsetExists('em')) {
+            return;
+        }
+
+        try {
+            $dbal = $this->di['em']->getConnection();
+
+            // A recorded completion short-circuits bounded runs only: without it the
+            // rescan below would revisit unresolvable rows on every invocation.
+            // Scope the cursor to the rule as well as the completion flag. An
+            // older rule may have skipped rows even if it never reached the end.
+            $marker = 'invoice_item_order_backfill_last_id_v' . self::INVOICE_ITEM_ORDER_BACKFILL_RULE_VERSION;
+            if ($maxPages !== 0) {
+                $completedRule = $dbal->fetchOne('SELECT value FROM setting WHERE param = :param', ['param' => self::INVOICE_ITEM_ORDER_BACKFILL_DONE]);
+                if ($completedRule === self::INVOICE_ITEM_ORDER_BACKFILL_RULE_VERSION) {
+                    return;
+                }
+            }
+
+            $schemaManager = $dbal->createSchemaManager();
+            if (!$schemaManager->tablesExist(['invoice_item'])
+                || !$schemaManager->introspectTableByUnquotedName('invoice_item')->hasColumn('order_id')) {
+                return;
+            }
+
+            // Page by ID to bound reads. Written rows drop out via order_id IS NULL, and
+            // the conditional UPDATE keeps a racing writer's newer value intact.
+            // Rows whose rel_id isn't an order id advance the keyset without a write.
+            $lastId = 0;
+            if ($maxPages !== 0) {
+                $stored = $this->backfillPosition($dbal, $marker);
+                if ($stored !== null) {
+                    $lastId = $stored;
+                }
+            }
+
+            $updated = 0;
+            $pages = 0;
+            do {
+                $rows = $dbal->fetchAllAssociative(
+                    "SELECT id, invoice_id, type, unit, rel_id FROM invoice_item WHERE order_id IS NULL AND (type = 'order' OR unit = 'discount') AND id > :last ORDER BY id LIMIT 500",
+                    ['last' => $lastId]
+                );
+                if ($rows === []) {
+                    break;
+                }
+                ++$pages;
+
+                foreach ($rows as $row) {
+                    $lastId = (int) $row['id'];
+                    $orderId = \Box\Mod\Invoice\ServiceInvoiceItem::resolveOrderReference($row['type'], $row['unit'], $row['rel_id']);
+                    if ($orderId === null && $row['type'] === \Box\Mod\Invoice\Entity\InvoiceItem::TYPE_ORDER) {
+                        $paidOrderId = \Box\Mod\Invoice\ServiceInvoiceItem::resolveLegacyPaidOrderReference($row['rel_id']);
+                        // Only historical paid items may use this relaxed rule.
+                        if ($paidOrderId !== null && $dbal->fetchOne('SELECT status FROM invoice WHERE id = :id', ['id' => $row['invoice_id']]) === \Box\Mod\Invoice\Entity\Invoice::STATUS_PAID) {
+                            $orderId = $paidOrderId;
+                        }
+                    }
+                    if ($orderId === null) {
+                        continue;
+                    }
+
+                    $updated += (int) (bool) $dbal->executeStatement(
+                        'UPDATE invoice_item SET order_id = :order_id WHERE id = :id AND order_id IS NULL',
+                        ['order_id' => $orderId, 'id' => $row['id']]
+                    );
+                }
+
+                if ($maxPages !== 0) {
+                    $this->storeBackfillPosition($dbal, $marker, $lastId);
+                }
+            } while ($maxPages === 0 || $pages < $maxPages);
+
+            if ($maxPages === 0 || $rows === []) {
+                // Reached the end (unbounded runs always do; bounded ones just did):
+                // nothing eligible is left behind, so clear the resume marker and
+                // record completion for the short-circuit above.
+                $this->clearBackfillPosition($dbal, $marker);
+                $this->recordInvoiceItemOrderBackfillComplete($dbal);
+            }
+
+            if ($updated > 0) {
+                $this->logUpdate('info', sprintf('Backfilled invoice item order linkage for %d invoice item(s)', $updated));
+            }
+        } catch (\Throwable $e) {
+            // Runs from healSchemaDrift() on every request, which must not throw
+            // (an unreachable database simply reports "nothing to do"). The next
+            // request retries from the stored position.
+            $this->logUpdate('warning', 'Invoice item order linkage backfill skipped: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Records the order_id backfill as complete under the current rule version.
+     * Best-effort like the resume marker: a concurrent healer racing this write
+     * only duplicates an already-true statement. An older recorded version is
+     * upgraded so the next bounded run short-circuits instead of rescanning.
+     */
+    private function recordInvoiceItemOrderBackfillComplete(\Doctrine\DBAL\Connection $dbal): void
+    {
+        try {
+            $now = date('Y-m-d H:i:s');
+            if ($dbal->fetchOne('SELECT value FROM setting WHERE param = :param', ['param' => self::INVOICE_ITEM_ORDER_BACKFILL_DONE]) === false) {
+                $dbal->insert('setting', [
+                    'param' => self::INVOICE_ITEM_ORDER_BACKFILL_DONE,
+                    'value' => self::INVOICE_ITEM_ORDER_BACKFILL_RULE_VERSION,
+                    'public' => 0,
+                    'created_at' => $now,
+                    'updated_at' => $now,
+                ]);
+            } else {
+                $dbal->executeStatement(
+                    'UPDATE setting SET value = :value, updated_at = :updated WHERE param = :param',
+                    ['value' => self::INVOICE_ITEM_ORDER_BACKFILL_RULE_VERSION, 'updated' => $now, 'param' => self::INVOICE_ITEM_ORDER_BACKFILL_DONE]
+                );
+            }
+        } catch (\Throwable $e) {
+            $this->logUpdate('warning', 'Invoice item order linkage backfill completion not recorded: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Re-asserts the product_category.priority column when it is missing
+     * (#4569 follow-up). Idempotent and portable: runs unconditionally from
+     * applyCorePatches() on every driver and from syncPortableSchema() before
+     * the backfill below, while Patch139 keeps the MySQL bookkeeping so
+     * already-finalized installs re-run finalization.
+     */
+    public function ensureProductCategoryPriorityColumn(?\Doctrine\DBAL\Connection $connection = null): void
+    {
+        if ($connection !== null) {
+            $schemaManager = $connection->createSchemaManager();
+            if (!$schemaManager->tablesExist(['product_category'])
+                || $schemaManager->introspectTableByUnquotedName('product_category')->hasColumn('priority')) {
+                return;
+            }
+
+            $connection->executeStatement(
+                $this->isLegacyPatchDriver()
+                    ? 'ALTER TABLE `product_category` ADD COLUMN `priority` BIGINT DEFAULT NULL'
+                    : 'ALTER TABLE product_category ADD COLUMN priority BIGINT DEFAULT NULL'
+            );
+
+            return;
+        }
+
+        if (!$this->tableExists('product_category') || $this->tableHasColumn('product_category', 'priority')) {
+            return;
+        }
+
+        $this->executeSql(
+            $this->isLegacyPatchDriver()
+                ? 'ALTER TABLE `product_category` ADD COLUMN `priority` BIGINT DEFAULT NULL'
+                : 'ALTER TABLE product_category ADD COLUMN priority BIGINT DEFAULT NULL'
+        );
+    }
+
+    /**
+     * Encrypt the secret fields of every stored payment gateway and domain
+     * registrar configuration row. Portable (plain SELECT/UPDATE) and
+     * idempotent, so it runs on every platform: rows that are already
+     * encrypted, have no secrets, or belong to an unknown adapter are left
+     * untouched, making this safe to re-run.
+     */
+    public function migrateEncryptedAdapterSecrets(): void
+    {
+        // The portable update path can run with a minimal container that
+        // lacks the crypt and module services; without them there is nothing
+        // safe to migrate with, so leave the rows for a full run.
+        if (!$this->di instanceof \Pimple\Container || !isset($this->di['crypt'], $this->di['mod_service'])) {
+            return;
+        }
+
+        // Payment gateway and domain registrar secrets were stored as readable
+        // JSON. Encrypt the marked secret fields in place.
+        $this->encryptStoredAdapterSecrets('pay_gateway', 'gateway');
+        $this->encryptStoredAdapterSecrets('tld_registrar', 'registrar');
+    }
+
+    /**
+     * Encrypt the secret fields of every stored adapter configuration row in
+     * the given table.
+     */
+    public function encryptStoredAdapterSecrets(string $table, string $adapterColumn): void
+    {
+        /** @var Crypt $crypt */
+        $crypt = $this->di['crypt'];
+        $salt = Config::getProperty('info.salt');
+
+        $rows = $this->fetchAll(sprintf(
+            'SELECT id, %s AS adapter, config FROM %s',
+            $this->quoteIdentifier($adapterColumn),
+            $this->quoteIdentifier($table)
+        ));
+
+        foreach ($rows as $row) {
+            $config = json_decode((string) ($row['config'] ?? ''), true);
+            if (!is_array($config) || $config === []) {
+                continue;
+            }
+
+            $secretFields = $this->storedAdapterSecretFields($table, (string) ($row['adapter'] ?? ''));
+            if ($secretFields === []) {
+                continue;
+            }
+
+            $encrypted = \FOSSBilling\Core\SecretConfig::encryptSecretFields($config, $secretFields, $crypt, $salt);
+            if ($encrypted === $config) {
+                continue;
+            }
+
+            // Only write when the row still holds what was read: an admin save
+            // racing the migration keeps its newer values instead of being
+            // overwritten, and the row is picked up by a later run.
+            $driver = $this->getPdo()->getAttribute(\PDO::ATTR_DRIVER_NAME);
+            if (in_array($driver, ['pgsql', 'mysql'], true)) {
+                $quote = $driver === 'mysql' ? '`' : '"';
+                $comparison = $driver === 'mysql' ? 'CAST(config AS BINARY) = CAST(:previous AS BINARY)' : 'CAST(config AS TEXT) = :previous';
+                $this->executeSql(sprintf('UPDATE %s%s%s SET config = :config WHERE id = :id AND %s', $quote, $this->quoteIdentifier($table), $quote, $comparison), [
+                    'config' => json_encode($encrypted, JSON_THROW_ON_ERROR), 'id' => $row['id'], 'previous' => $row['config'],
+                ]);
+            } else {
+                $this->updateTable($table, ['config' => json_encode($encrypted)], ['id' => $row['id'], 'config' => $row['config']]);
+            }
+        }
+    }
+
+    /**
+     * @return list<string>
+     */
+    public function storedAdapterSecretFields(string $table, string $adapter): array
+    {
+        if ($adapter === '') {
+            return [];
+        }
+
+        if ($table === 'pay_gateway') {
+            $model = new \Box\Mod\Invoice\Entity\PayGateway();
+            $model->setGateway($adapter);
+
+            try {
+                return $this->di['mod_service']('invoice', 'PayGateway')->getSecretFields($model);
+            } catch (\Throwable) {
+                // Unknown or broken adapter: leave its stored values untouched
+                // rather than aborting the migration for the remaining rows.
+                return [];
+            }
+        }
+
+        $model = new \Box\Mod\Servicedomain\Entity\TldRegistrar();
+        $model->setRegistrar($adapter);
+
+        return $this->di['mod_service']('servicedomain')->registrarGetSecretFields($model);
+    }
+}

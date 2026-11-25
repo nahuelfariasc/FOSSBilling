@@ -11,13 +11,13 @@ use Symfony\Component\Filesystem\Path;
 test('maps the existing client activity history table', function (): void {
     $config = ORMSetup::createAttributeMetadataConfig([Path::join(__DIR__, '..', '..', '..', 'Entity')], true);
     $config->setProxyDir(sys_get_temp_dir());
-    $config->setProxyNamespace('FOSSBilling\\Tests\\DoctrineProxies');
+    $config->setProxyNamespace('FOSSBilling\\Core\\Tests\\DoctrineProxies');
     $entityManager = new EntityManager(DriverManager::getConnection(['driver' => 'pdo_sqlite', 'memory' => true]), $config);
     $metadata = $entityManager->getClassMetadata(ActivityClientHistory::class);
 
     expect($metadata->getTableName())->toBe('activity_client_history')
         ->and($metadata->getColumnNames())->toBe(['id', 'client_id', 'ip', 'created_at'])
-        ->and($metadata->table['indexes']['client_id_idx']['columns'])->toBe(['client_id']);
+        ->and($metadata->table['indexes']['activity_client_history_client_id_idx']['columns'])->toBe(['client_id']);
 });
 
 test('stores client activity history and initializes its timestamp', function (): void {
@@ -30,5 +30,5 @@ test('stores client activity history and initializes its timestamp', function ()
     expect($history->getId())->toBeNull()
         ->and($history->getClientId())->toBe(3)
         ->and($history->getIp())->toBe('192.0.2.2')
-        ->and($history->getCreatedAt())->toBeInstanceOf(DateTime::class);
+        ->and($history->getCreatedAt())->toBeInstanceOf(DateTimeImmutable::class);
 });

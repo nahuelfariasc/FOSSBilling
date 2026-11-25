@@ -1,0 +1,52 @@
+name: Playwright Tests
+
+on:
+  workflow_call:
+
+jobs:
+  playwright-tests:
+    name: 'Playwright Tests'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 'Checkout Repository'
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Set up Node'
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 26
+          cache: npm
+
+      - name: 'Typecheck Test Suite'
+        run: npm ci --no-audit --no-fund && npm run pw:tsc
+
+      - name: 'Build Admin Widget Assets'
+        run: NODE_ENV=production npm run build-admin_default
+
+      - name: 'Set up Docker Compose'
+        uses: docker/setup-compose-action@v2.4.0
+
+      # Reuses the image already built once in the PHP Build and Test (8.5) job.
+      - name: 'Download Test Image Artifact'
+        uses: actions/download-artifact@v8.0.2
+        with:
+          name: test-image-8.5.tar.zst
+          path: /tmp
+
+      - name: 'Load Test Image'
+        run: zstd --decompress --stdout /tmp/test-image-8.5.tar.zst | docker load
+
+      - name: 'Run Playwright Tests'
+        run: bash ./.github/scripts/run-docker-playwright-tests.sh fossbilling:test-8.5
+
+      - name: 'Upload Playwright Artifacts'
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: playwright-artifacts
+          if-no-files-found: ignore
+          path: |
+            tests/E2E/Playwright/artifacts

@@ -10,8 +10,8 @@ declare(strict_types=1);
  */
 require_once __DIR__ . DIRECTORY_SEPARATOR . 'load.php';
 
-use FOSSBilling\Http\ApiResponseFactory;
-use FOSSBilling\Http\ResponseFactory;
+use FOSSBilling\Core\Http\ApiResponseFactory;
+use FOSSBilling\Core\Http\ResponseFactory;
 use Symfony\Component\Filesystem\Path;
 use Symfony\Component\HttpFoundation\JsonResponse;
 
@@ -39,7 +39,11 @@ if ($gatewayID !== null) {
     }
 }
 
-$rawBody = $request->getContent();
+// Read a bounded stream before collecting or persisting callback data.
+$rawBody = stream_get_contents($request->getContent(true), Box\Mod\Invoice\ServiceTransaction::MAX_CALLBACK_BODY_SIZE + 1);
+if ($rawBody === false || strlen($rawBody) > Box\Mod\Invoice\ServiceTransaction::MAX_CALLBACK_BODY_SIZE) {
+    emitResponse(new JsonResponse(['result' => null, 'error' => ['message' => 'Callback body is too large']], 413));
+}
 
 $ipn = [
     'invoice_id' => $invoiceID,
@@ -78,6 +82,9 @@ try {
 
     $output = $service->createAndProcess($ipn);
     $response = $apiResponseFactory->create($output);
+} catch (Box\Mod\Invoice\Exception\RetryableCallbackException $e) {
+    $response = $apiResponseFactory->create(null, $e);
+    emitResponse($response);
 } catch (Exception $e) {
     $response = $apiResponseFactory->create(null, $e);
 }

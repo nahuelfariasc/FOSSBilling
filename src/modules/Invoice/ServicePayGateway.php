@@ -11,17 +11,36 @@ declare(strict_types=1);
 
 namespace Box\Mod\Invoice;
 
+use Box\Mod\Invoice\Entity\Invoice;
 use Box\Mod\Invoice\Entity\PayGateway;
+use Box\Mod\Invoice\Entity\Subscription;
+use Box\Mod\Invoice\Entity\Transaction;
 use Box\Mod\Invoice\Repository\PayGatewayRepository;
-use FOSSBilling\InjectionAwareInterface;
-use FOSSBilling\Tools;
+use Doctrine\DBAL\LockMode;
+use FOSSBilling\Core\Container\InjectionAwareInterface;
+use FOSSBilling\Core\Doctrine\RowLock;
+use FOSSBilling\Core\Sanitizer\GatewaySvgSanitizer;
 use Symfony\Component\Filesystem\Filesystem;
 use Symfony\Component\Filesystem\Path;
 use Symfony\Component\Finder\Exception\DirectoryNotFoundException;
 use Symfony\Component\Finder\Finder;
+use Symfony\Component\HttpClient\Exception\TransportException;
+use Symfony\Component\HttpClient\NoPrivateNetworkHttpClient;
+use Symfony\Component\HttpFoundation\File\UploadedFile;
+use Symfony\Contracts\HttpClient\Exception\ExceptionInterface;
 
 class ServicePayGateway implements InjectionAwareInterface
 {
+    private const int MAX_LOGO_BYTES = 2 * 1024 * 1024;
+    private const int MAX_LOGO_PIXELS = 4_000_000;
+
+    /**
+     * Sent by the admin UI in place of a secret config field's value to mean
+     * "keep the currently stored value". Blank input means the same thing;
+     * this sentinel exists only for clients that can't send an empty string.
+     */
+    public const string CREDENTIAL_KEEP_SENTINEL = '__KEEP__';
+
     protected ?\Pimple\Container $di = null;
 
     protected PayGatewayRepository $payGatewayRepository;
@@ -57,7 +76,7 @@ class ServicePayGateway implements InjectionAwareInterface
         $sql = 'SELECT id, gateway, name
             FROM pay_gateway';
 
-        $rows = $this->di['db']->getAll($sql);
+        $rows = $this->di['em']->getConnection()->fetchAllAssociative($sql);
         $result = [];
         foreach ($rows as $row) {
             $result[$row['id']] = $row['name'];
@@ -74,7 +93,7 @@ class ServicePayGateway implements InjectionAwareInterface
         $sql = 'SELECT id, gateway, name
             FROM pay_gateway';
 
-        $rows = $this->di['db']->getAll($sql);
+        $rows = $this->di['em']->getConnection()->fetchAllAssociative($sql);
         $exists = [];
         foreach ($rows as $row) {
             $exists[$row['gateway']] = $row['name'];
@@ -117,7 +136,7 @@ class ServicePayGateway implements InjectionAwareInterface
     {
         $available = $this->getAvailable();
         if (!in_array($code, $available)) {
-            throw new \FOSSBilling\Exception('Payment gateway is not available for installation.');
+            throw new \FOSSBilling\Core\Exception\BaseException('Payment gateway is not available for installation.');
         }
 
         $new = new PayGateway();
@@ -130,7 +149,7 @@ class ServicePayGateway implements InjectionAwareInterface
         $this->di['em']->persist($new);
         $this->di['em']->flush();
 
-        $this->di['logger']->info('Installed new payment gateway %s', $code);
+        $this->di['logger']->info('Installed new payment gateway {code}', ['code' => $code]);
 
         return true;
     }
@@ -148,18 +167,91 @@ class ServicePayGateway implements InjectionAwareInterface
             'accepted_currencies' => $this->getAcceptedCurrencies($model),
         ];
 
-        if ($identity instanceof \Model_Admin) {
+        if ($identity instanceof \Box\Mod\Staff\Entity\Admin) {
+            $config = $model->getConfig() ?? [];
+            $secretFields = $this->getSecretFields($model);
+            foreach ($secretFields as $field) {
+                $value = $config[$field] ?? null;
+                $config[$field] = null;
+                $config[$field . '_set'] = $value !== null && $value !== '';
+            }
+
             $result['supports_one_time_payments'] = $single;
             $result['supports_subscriptions'] = $recurrent;
-            $result['config'] = json_decode($model->getConfig() ?? '', true) ?? [];
+            $result['config'] = $config;
+            $result['secret_fields'] = $secretFields;
             $result['form'] = $this->getFormElements($model);
             $result['description'] = $this->getDescription($model);
             $result['enabled'] = $model->isEnabled();
             $result['test_mode'] = $model->isTestMode();
             $result['callback'] = $this->getCallbackUrl($model);
+            $result['custom_logo_url'] = $this->getCustomLogoUrl($model);
+            $result['custom_logo_avif_url'] = $this->getCustomLogoUrl($model, true);
         }
 
         return $result;
+    }
+
+    /**
+     * Config field names for this gateway's adapter whose stored values must
+     * be hidden in the API and admin UI: the adapter's own declared secrets
+     * plus any form field marked `'secret' => true`.
+     *
+     * @return string[]
+     */
+    public function getSecretFields(PayGateway $model): array
+    {
+        $secrets = [];
+
+        try {
+            $class = $this->getAdapterClassName($model);
+            if (is_callable($class . '::getSecretFields')) {
+                $declared = $class::getSecretFields();
+                $secrets = array_merge($secrets, $declared);
+            }
+        } catch (\FOSSBilling\Core\Exception\BaseException) {
+            // Gateway adapter could not be resolved; fall back to the form's own 'secret' flags below.
+        }
+
+        $form = $this->getAdapterConfig($model)['form'] ?? [];
+        if (is_array($form)) {
+            foreach ($form as $name => $element) {
+                $options = $element[1] ?? [];
+                if (!empty($options['secret'])) {
+                    $secrets[] = (string) $name;
+                }
+            }
+        }
+
+        return array_values(array_unique([...$secrets, ...$this->secretCodec()->names($model->getConfig() ?? [])]));
+    }
+
+    private function secretCodec(): \FOSSBilling\Core\Security\SecretFields
+    {
+        return new \FOSSBilling\Core\Security\SecretFields($this->di['crypt']);
+    }
+
+    public function migrateConfigSecrets(bool $onlyPlaintext = false): void
+    {
+        foreach ($this->getPayGatewayRepository()->findAll() as $model) {
+            $stored = $model->getConfig() ?? [];
+
+            try {
+                $fields = $this->getSecretFields($model);
+            } catch (\FOSSBilling\Core\Exception\BaseException) {
+                $this->di['logger']->warning('Credential encryption deferred for unavailable gateway adapter #{id}', ['id' => $model->getId()]);
+
+                continue;
+            }
+            // Plaintext rows are the durable deferred work. Cron retries them after an adapter returns.
+            $protected = $onlyPlaintext
+                ? array_replace($stored, $this->secretCodec()->store(array_filter($stored, is_string(...)), $fields))
+                : $this->secretCodec()->store($stored, $fields);
+            if ($protected !== $stored) {
+                $model->setConfig($protected);
+            }
+        }
+        $this->di['em']->flush();
     }
 
     public function copy(PayGateway $model): int
@@ -171,45 +263,173 @@ class ServicePayGateway implements InjectionAwareInterface
         $new->setAcceptedCurrencies($model->getAcceptedCurrencies());
         $new->setTestMode($model->isTestMode());
         $new->setConfig($model->getConfig());
+        $new->setCustomLogo($model->getCustomLogo());
         $this->di['em']->persist($new);
         $this->di['em']->flush();
         $newId = (int) $new->getId();
-        $this->di['logger']->info('Copied payment gateway #%s - %s', $newId, $model->getGateway());
+        $this->di['logger']->info('Copied payment gateway #{gateway_id} - {gateway}', ['gateway_id' => $newId, 'gateway' => $model->getGateway()]);
 
         return $newId;
     }
 
-    public function update(PayGateway $model, array $data): bool
+    public function update(PayGateway $model, array $data, ?UploadedFile $file = null): bool
     {
-        $model->setName($data['title'] ?? $model->getName());
-
-        $newEnabled = isset($data['enabled']) ? (bool) $data['enabled'] : $model->isEnabled();
-        $newTestMode = isset($data['test_mode']) ? (bool) $data['test_mode'] : $model->isTestMode();
-        $mergedConfig = json_decode($model->getConfig() ?? '', true) ?? [];
+        $existingConfig = $model->getConfig() ?? [];
+        $mergedConfig = $existingConfig;
+        $secretFields = [];
         if (isset($data['config']) && is_array($data['config'])) {
-            $mergedConfig = array_merge($mergedConfig, $data['config']);
+            $secretFields = $this->getSecretFields($model);
+            foreach ($data['config'] as $key => $value) {
+                $mergedConfig[$key] = in_array($key, $secretFields, true)
+                    ? $this->normalizeSecretValue($key, $value, $existingConfig[$key] ?? null, $model)
+                    : $value;
+            }
+            if (array_key_exists('fee', $data['config'])) {
+                $mergedConfig['fee'] = ServiceGatewayFees::clean(is_array($data['config']['fee']) ? $data['config']['fee'] : []);
+            }
         }
 
-        if ($newEnabled) {
-            $this->validateGatewayConfig($model, $mergedConfig, $newTestMode);
+        $customLogo = $model->getCustomLogo();
+        $logoChanged = \FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($data['remove_custom_logo'] ?? false) || $file !== null || (!empty($data['logo_url']));
+        if (\FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($data['remove_custom_logo'] ?? false)) {
+            $customLogo = null;
+        } elseif ($file !== null) {
+            $customLogo = $this->storeUploadedLogo($file);
+        } elseif (array_key_exists('logo_url', $data) && $data['logo_url'] !== '') {
+            $customLogo = $this->importGatewayLogo($data['logo_url']);
         }
 
-        if (isset($data['config']) && is_array($data['config'])) {
-            $model->setConfig(json_encode($mergedConfig));
-        }
+        $this->withGatewayTransaction(function () use ($model, $data, $customLogo, $logoChanged, $mergedConfig): void {
+            $replacementId = isset($data['replacement_id']) && $data['replacement_id'] !== '' ? (int) $data['replacement_id'] : null;
+            if ($model->getId() !== null) {
+                $this->lockGatewayRows([$model->getId(), $replacementId]);
+                $this->di['em']->refresh($model, LockMode::PESSIMISTIC_WRITE);
+            }
+            $wasEnabled = $model->isEnabled();
+            $newEnabled = isset($data['enabled']) ? (bool) $data['enabled'] : $wasEnabled;
+            $newTestMode = isset($data['test_mode']) ? (bool) $data['test_mode'] : $model->isTestMode();
+            if ($newEnabled) {
+                $this->validateGatewayConfig($model, $this->secretCodec()->reveal($mergedConfig), $newTestMode);
+            }
+            // Validate and move unpaid invoices before disabling the gateway.
+            // Any failure rolls back both migration and gateway configuration.
+            if ($wasEnabled && !$newEnabled) {
+                $this->moveUnpaidInvoicesLocked((int) $model->getId(), $replacementId);
+            }
 
-        if (isset($data['accepted_currencies']) && is_array($data['accepted_currencies'])) {
-            $model->setAcceptedCurrencies(json_encode($data['accepted_currencies']));
-        }
+            $model->setName($data['title'] ?? $model->getName());
+            if ($logoChanged) {
+                $model->setCustomLogo($customLogo);
+            }
+            if (isset($data['config']) && is_array($data['config'])) {
+                $model->setConfig($this->secretCodec()->store($mergedConfig, $this->getSecretFields($model)));
+            }
+            if (isset($data['accepted_currencies']) && is_array($data['accepted_currencies'])) {
+                $model->setAcceptedCurrencies($data['accepted_currencies']);
+            }
+            $model->setEnabled($newEnabled);
+            $model->setAllowSingle((bool) ($data['allow_single'] ?? $model->isAllowSingle()));
+            $model->setAllowRecurrent((bool) ($data['allow_recurrent'] ?? $model->isAllowRecurrent()));
+            $model->setTestMode($newTestMode);
+            $this->di['em']->flush();
+        });
 
-        $model->setEnabled($newEnabled);
-        $model->setAllowSingle((bool) ($data['allow_single'] ?? $model->isAllowSingle()));
-        $model->setAllowRecurrent((bool) ($data['allow_recurrent'] ?? $model->isAllowRecurrent()));
-        $model->setTestMode($newTestMode);
-        $this->di['em']->flush();
-        $this->di['logger']->info('Updated payment gateway %s', $model->getGateway());
+        $this->di['logger']->info('Updated payment gateway {model_gateway}', ['model_gateway' => $model->getGateway()]);
 
         return true;
+    }
+
+    /**
+     * Move a gateway's unpaid invoices to an enabled replacement, re-pricing
+     * each one's fee line. Throws when unpaid invoices exist without a valid
+     * replacement.
+     */
+    public function moveUnpaidInvoices(int $gatewayId, ?int $replacementId): void
+    {
+        $this->withGatewayTransaction(fn () => $this->moveUnpaidInvoicesLocked($gatewayId, $replacementId));
+    }
+
+    private function withGatewayTransaction(callable $action): void
+    {
+        $connection = $this->di['em']->getConnection();
+        $mysql = $connection->getDatabasePlatform() instanceof \Doctrine\DBAL\Platforms\AbstractMySQLPlatform;
+        $isolation = $mysql ? $connection->getTransactionIsolation() : null;
+        if ($connection->isTransactionActive()) {
+            if ($mysql && $isolation !== \Doctrine\DBAL\TransactionIsolationLevel::READ_COMMITTED) {
+                throw new \FOSSBilling\Core\Exception\InformationException('Gateway changes require a fresh READ COMMITTED transaction. Retry the whole operation outside the current transaction.');
+            }
+            $this->di['em']->wrapInTransaction($action);
+
+            return;
+        }
+        if ($mysql) {
+            $connection->setTransactionIsolation(\Doctrine\DBAL\TransactionIsolationLevel::READ_COMMITTED);
+        }
+
+        try {
+            $this->di['em']->wrapInTransaction($action);
+        } finally {
+            if ($mysql) {
+                $connection->setTransactionIsolation($isolation);
+            }
+        }
+    }
+
+    private function moveUnpaidInvoicesLocked(int $gatewayId, ?int $replacementId): void
+    {
+        $this->lockGatewayRows([$gatewayId, $replacementId]);
+        $invoiceRepository = $this->di['em']->getRepository(Invoice::class);
+        $invoices = $invoiceRepository->findUnpaidByGatewayId($gatewayId);
+        if ($invoices === []) {
+            return;
+        }
+
+        $replacement = $replacementId !== null && $replacementId !== $gatewayId
+            ? $this->di['em']->getRepository(PayGateway::class)->find($replacementId)
+            : null;
+        if ($replacement instanceof PayGateway) {
+            $this->di['em']->refresh($replacement, LockMode::PESSIMISTIC_WRITE);
+        }
+        if (!$replacement instanceof PayGateway || !$replacement->isEnabled()) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Choose an enabled gateway for the unpaid invoices of this gateway.');
+        }
+
+        $feesService = $this->di['mod_service']('Invoice', 'GatewayFees');
+        foreach ($invoices as $invoice) {
+            $moveInvoice = function () use ($invoiceRepository, $invoice, $gatewayId, $replacement, $feesService): void {
+                $state = $invoiceRepository->lockAndGetState((int) $invoice->getId());
+                if ($state === null || $state['status'] !== Invoice::STATUS_UNPAID) {
+                    return;
+                }
+                // A plain refresh can reuse an older MySQL transaction snapshot.
+                $this->di['em']->refresh($invoice, LockMode::PESSIMISTIC_WRITE);
+                // Selection may precede a concurrent payment or gateway change.
+                if ($invoice->getStatus() !== Invoice::STATUS_UNPAID || $invoice->getGateway()?->getId() !== $gatewayId) {
+                    return;
+                }
+                if (PendingPayments::forInvoice($this->di['em']->getConnection(), (int) $invoice->getId()) !== null) {
+                    throw new \FOSSBilling\Core\Exception\InformationException('A payment is still clearing on this gateway. Retry the gateway change after it settles.');
+                }
+                $invoice->setGateway($replacement);
+                $this->di['em']->persist($invoice);
+                $this->di['em']->flush();
+                $feesService->apply($invoice, $replacement);
+            };
+            $moveInvoice();
+        }
+
+        $this->di['logger']->info('Moved {count} unpaid invoices from gateway #{gateway_id} to gateway #{replacement_id}', ['count' => count($invoices), 'gateway_id' => $gatewayId, 'replacement_id' => $replacementId]);
+    }
+
+    /** Gateway rows precede invoice locks; every updater uses the same ID order. */
+    private function lockGatewayRows(array $ids): void
+    {
+        $ids = array_unique(array_filter($ids, static fn (?int $id): bool => $id !== null && $id > 0));
+        sort($ids, SORT_NUMERIC);
+        $connection = $this->di['em']->getConnection();
+        foreach ($ids as $id) {
+            $connection->fetchOne('SELECT id FROM pay_gateway WHERE id = ?' . RowLock::suffix($connection), [$id]);
+        }
     }
 
     /**
@@ -230,18 +450,65 @@ class ServicePayGateway implements InjectionAwareInterface
             }
             new $class($adapterConfig);
         } catch (\Payment_Exception $e) {
-            throw new \FOSSBilling\Exception($e->getMessage(), null, 819);
+            throw new \FOSSBilling\Core\Exception\BaseException($e->getMessage(), null, 819);
         } catch (\Throwable $e) {
-            throw new \FOSSBilling\Exception('Payment gateway configuration error: ' . $e->getMessage(), null, 819);
+            throw new \FOSSBilling\Core\Exception\BaseException('Payment gateway configuration error: ' . $e->getMessage(), null, 819);
         }
+    }
+
+    /**
+     * Returns the value to store for a secret config field. Blank, whitespace-only
+     * or {@see CREDENTIAL_KEEP_SENTINEL} inputs preserve the existing value;
+     * everything else replaces it. A successful rotation is logged (the value
+     * itself is never logged).
+     */
+    private function normalizeSecretValue(string $field, mixed $incoming, mixed $existing, PayGateway $model): mixed
+    {
+        if ($incoming === null || !is_scalar($incoming)) {
+            return $existing;
+        }
+
+        $incoming = (string) $incoming;
+
+        if (trim($incoming) === '' || $incoming === self::CREDENTIAL_KEEP_SENTINEL) {
+            return $existing;
+        }
+
+        if ($incoming !== $existing) {
+            $adminId = $this->di['loggedin_admin']->getId() ?? 'unknown';
+            $this->di['logger']->info('Rotated {field} for payment gateway {gateway_id} by admin {admin_id}', ['field' => $field, 'gateway_id' => (string) $model->getId(), 'admin_id' => (string) $adminId]);
+        }
+
+        return $incoming;
     }
 
     public function delete(PayGateway $model): bool
     {
-        $id = $model->getId();
+        $id = (int) $model->getId();
+
+        if ($this->di['em']->getRepository(Invoice::class)->existsByGatewayId($id)) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Cannot remove payment gateway with existing invoices');
+        }
+
+        if ($this->di['em']->getRepository(Subscription::class)->existsByGatewayId($id)) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Cannot remove payment gateway with existing subscriptions');
+        }
+
+        if ($this->di['em']->getRepository(Transaction::class)->existsByGatewayId($id)) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Cannot remove payment gateway with existing transactions');
+        }
+
+        // These rows are only caches with no standalone meaning once their
+        // gateway is gone. The entity mappings declare onDelete CASCADE, but
+        // the schema has never had real foreign keys, so nothing cascades
+        // for them - delete them explicitly to avoid orphaned rows.
+        $connection = $this->di['em']->getConnection();
+        $connection->executeStatement('DELETE FROM pay_gateway_customer WHERE pay_gateway_id = ?', [$id]);
+        $connection->executeStatement('DELETE FROM pay_gateway_product WHERE pay_gateway_id = ?', [$id]);
+
         $this->di['em']->remove($model);
         $this->di['em']->flush();
-        $this->di['logger']->info('Removed payment gateway %s', $id);
+        $this->di['logger']->info('Removed payment gateway {id}', ['id' => $id]);
 
         return true;
     }
@@ -265,7 +532,22 @@ class ServicePayGateway implements InjectionAwareInterface
 
                 if (!empty($config['logo'])) {
                     $gateway['logo'] = $config['logo'];
-                    $gateway['logo']['logo'] = $this->resolveGatewayLogo($config['logo']);
+                    $gateway['logo']['logo'] = $this->resolveGatewayLogo($config['logo'], $gtw->getGateway());
+                } else {
+                    // Templates read gtw.logo.logo/height/width unconditionally,
+                    // so always provide the key even when the adapter ships no logo.
+                    $gateway['logo'] = [
+                        'logo' => $this->resolveGatewayLogo([], $gtw->getGateway()),
+                        'height' => '50px',
+                        'width' => '50px',
+                    ];
+                }
+
+                if (($customLogoUrl = $this->getCustomLogoUrl($gtw)) !== null) {
+                    // Custom images keep their aspect ratio; width follows the adapter size, height capped in templates.
+                    $height = $gateway['logo']['height'] ?? '50px';
+                    $width = $gateway['logo']['width'] ?? '150px';
+                    $gateway['logo'] = ['logo' => $customLogoUrl, 'avif' => $this->getCustomLogoUrl($gtw, true), 'height' => $height, 'width' => $width, 'custom' => true];
                 }
 
                 $result[] = $gateway;
@@ -275,22 +557,184 @@ class ServicePayGateway implements InjectionAwareInterface
         return $result;
     }
 
-    public function resolveGatewayLogo(array $logoConfig): string
+    private function getCustomLogoUrl(PayGateway $model, bool $avif = false): ?string
+    {
+        $filename = $model->getCustomLogo();
+        if ($avif) {
+            if ($filename === null || !str_ends_with($filename, '.png')) {
+                return null;
+            }
+            $filename = substr($filename, 0, -4) . '.avif';
+        }
+        if ($filename === null || !preg_match('/\A[a-f0-9]{64}\.(?:png|jpg|webp|avif|svg)\z/', $filename)
+            || !$this->filesystem->exists(Path::join(PATH_ROOT, 'public', 'gateways', 'custom', $filename))) {
+            return null;
+        }
+
+        return $this->di['url']->link('/public/gateways/custom/' . $filename);
+    }
+
+    /** Import once; client pages always use the stored local image. */
+    private function importGatewayLogo(mixed $url): string
+    {
+        if (!is_string($url) || strlen($url) > 2048 || !filter_var($url, FILTER_VALIDATE_URL)
+            || !in_array(strtolower((string) parse_url($url, PHP_URL_SCHEME)), ['http', 'https'], true)
+            || parse_url($url, PHP_URL_USER) !== null || parse_url($url, PHP_URL_PASS) !== null) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Enter a valid HTTP or HTTPS image URL without credentials.');
+        }
+
+        $client = new NoPrivateNetworkHttpClient($this->di['http_client']);
+        $response = null;
+
+        try {
+            $response = $client->request('GET', $url, [
+                'max_redirects' => 3,
+                'timeout' => 5,
+                'max_duration' => 10,
+                'on_progress' => static function (int $downloaded, int $size): void {
+                    if ($downloaded > self::MAX_LOGO_BYTES || $size > self::MAX_LOGO_BYTES) {
+                        throw new TransportException('Payment gateway image is too large.');
+                    }
+                },
+            ]);
+            if ($response->getStatusCode() !== 200) {
+                throw new \FOSSBilling\Core\Exception\InformationException('Could not download the payment gateway image.');
+            }
+            $bytes = '';
+            foreach ($client->stream($response) as $chunk) {
+                $bytes .= $chunk->getContent();
+                if (strlen($bytes) > self::MAX_LOGO_BYTES) {
+                    throw new \FOSSBilling\Core\Exception\InformationException('Payment gateway images must be no larger than 2 MB.');
+                }
+            }
+        } catch (ExceptionInterface) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Could not download the payment gateway image. Use a publicly accessible image URL, no larger than 2 MB.');
+        } finally {
+            $response?->cancel();
+        }
+
+        return $this->storeGatewayLogo($bytes);
+    }
+
+    private function storeUploadedLogo(UploadedFile $file): string
+    {
+        if (!$file->isValid()) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Payment gateway image upload failed.');
+        }
+        if ($file->getSize() > self::MAX_LOGO_BYTES) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Payment gateway images must be no larger than 2 MB.');
+        }
+
+        return $this->storeGatewayLogo($this->filesystem->readFile($file->getPathname()));
+    }
+
+    private function storeGatewayLogo(string $bytes): string
+    {
+        if (strlen($bytes) > self::MAX_LOGO_BYTES) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Payment gateway images must be no larger than 2 MB.');
+        }
+
+        $avif = null;
+        $image = @getimagesizefromstring($bytes);
+        $extension = $image === false ? null : match ($image['mime']) {
+            'image/png' => 'png',
+            'image/jpeg' => 'jpg',
+            'image/webp' => 'webp',
+            'image/avif' => 'avif',
+            default => null,
+        };
+        if ($image === false) {
+            $bytes = GatewaySvgSanitizer::sanitize($bytes);
+            $extension = 'svg';
+        } elseif ($extension === null || $image[0] <= 0 || $image[1] <= 0 || $image[0] * $image[1] > self::MAX_LOGO_PIXELS) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Use a PNG, JPEG, WebP, AVIF, or SVG image with no more than 4 million pixels.');
+        } else {
+            [$bytes, $extension, $avif] = $this->normalizeRasterLogo($bytes, $extension);
+        }
+        if (strlen($bytes) > self::MAX_LOGO_BYTES || ($avif !== null && strlen($avif) > self::MAX_LOGO_BYTES)) {
+            throw new \FOSSBilling\Core\Exception\InformationException('The processed payment gateway image exceeds 2 MB. Use a smaller image.');
+        }
+
+        // Gateway copies share stored images.
+        $basename = hash('sha256', $bytes);
+        $filename = $basename . '.' . $extension;
+        $this->filesystem->dumpFile(Path::join(PATH_ROOT, 'public', 'gateways', 'custom', $filename), $bytes);
+        if ($avif !== null) {
+            $this->filesystem->dumpFile(Path::join(PATH_ROOT, 'public', 'gateways', 'custom', $basename . '.avif'), $avif);
+        }
+
+        return $filename;
+    }
+
+    /** @return array{string, string, ?string} PNG fallback (or unsupported original), extension, optional AVIF. */
+    private function normalizeRasterLogo(string $bytes, string $extension): array
+    {
+        if (!function_exists('imagecreatefromstring') || !function_exists('imagepng')) {
+            return [$bytes, $extension, null];
+        }
+        $type = match ($extension) {
+            'png' => IMG_PNG,
+            'jpg' => IMG_JPG,
+            'webp' => IMG_WEBP,
+            'avif' => IMG_AVIF,
+            default => throw new \LogicException('Unsupported raster image format.'),
+        };
+        if (!(imagetypes() & $type) || !(imagetypes() & IMG_PNG)) {
+            return [$bytes, $extension, null];
+        }
+        $image = @imagecreatefromstring($bytes);
+        if ($image === false) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Could not decode the payment gateway image.');
+        }
+        imagepalettetotruecolor($image);
+        imagesavealpha($image, true);
+        $png = $this->encodeRasterLogo($image, 'imagepng', 6);
+        $avif = function_exists('imageavif') && (imagetypes() & IMG_AVIF)
+            ? $this->encodeRasterLogo($image, 'imageavif', 80)
+            : null;
+
+        return [$png, 'png', $avif];
+    }
+
+    private function encodeRasterLogo(\GdImage $image, string $encoder, int $quality): string
+    {
+        ob_start();
+
+        try {
+            if (!@$encoder($image, null, $quality) || ob_get_length() === 0) {
+                throw new \FOSSBilling\Core\Exception\InformationException('Could not process the payment gateway image.');
+            }
+
+            return (string) ob_get_contents();
+        } finally {
+            ob_end_clean();
+        }
+    }
+
+    public function resolveGatewayLogo(array $logoConfig, ?string $gateway = null): string
     {
         $filename = $logoConfig['logo'] ?? 'default.png';
+        $encodedFilename = implode('/', array_map(rawurlencode(...), explode('/', $filename)));
+
+        if ($gateway !== null && $gateway !== '') {
+            $nestedPath = Path::join(PATH_LIBRARY, 'Payment', 'Adapter', $gateway, $filename);
+            if ($this->filesystem->exists($nestedPath)) {
+                return $this->di['url']->link("/library/Payment/Adapter/{$gateway}/{$encodedFilename}");
+            }
+        }
 
         $libraryPath = Path::join(PATH_LIBRARY, 'Payment', 'Adapter', $filename);
         $publicPath = Path::join(PATH_ROOT, 'public', 'gateways', $filename);
 
         if ($this->filesystem->exists($libraryPath)) {
-            return $this->di['tools']->url("/library/Payment/Adapter/{$filename}");
+            return $this->di['url']->link("/library/Payment/Adapter/{$encodedFilename}");
         }
 
         if ($this->filesystem->exists($publicPath)) {
-            return $this->di['tools']->url("/public/gateways/{$filename}");
+            return $this->di['url']->link("/public/gateways/{$encodedFilename}");
         }
 
-        return $this->di['tools']->url('/public/gateways/default.png');
+        return $this->di['url']->link('/public/gateways/default.png');
     }
 
     public function canPerformRecurrentPayment(PayGateway $model): bool
@@ -303,9 +747,30 @@ class ServicePayGateway implements InjectionAwareInterface
         return $model->isAllowSingle();
     }
 
-    public function getPaymentAdapter(PayGateway $pg, ?\Model_Invoice $model = null, $optional = []): object
+    /**
+     * Whether the gateway settles payments through explicit admin approval
+     * instead of a verifiable gateway callback.
+     *
+     * Resolved from the adapter class without instantiating it, so a
+     * misconfigured automated gateway (missing API keys) still reports its
+     * capability. Unknown or legacy adapters default to automated handling.
+     */
+    public static function isManualApprovalGateway(?string $code): bool
     {
-        $config = json_decode($pg->getConfig() ?? '', true) ?? [];
+        if ($code === null || $code === '') {
+            return false;
+        }
+        $class = "Payment_Adapter_{$code}";
+        if (!class_exists($class) || !is_callable([$class, 'requiresManualApproval'])) {
+            return false;
+        }
+
+        return (bool) $class::requiresManualApproval();
+    }
+
+    public function getPaymentAdapter(PayGateway $pg, ?Invoice $model = null, $optional = []): object
+    {
+        $config = $this->secretCodec()->reveal($pg->getConfig() ?? []);
         $defaults = [];
         $defaults['auto_redirect'] = false;
         $defaults['gateway_id'] = (int) $pg->getId();
@@ -314,11 +779,11 @@ class ServicePayGateway implements InjectionAwareInterface
         $defaults['cancel_url'] = $this->getCancelUrl($pg, $model);
         $defaults['notify_url'] = $this->getCallbackUrl($pg, $model);
         $defaults['redirect_url'] = $this->getCallbackRedirect($pg, $model);
-        $defaults['continue_shopping_url'] = $this->di['tools']->url('/order');
+        $defaults['continue_shopping_url'] = $this->di['url']->link('/order');
         $defaults['single_page'] = true;
-        if ($model instanceof \Model_Invoice) {
-            $defaults['thankyou_url'] = $this->di['url']->link("/invoice/thank-you/{$model->hash}", ['restore_token' => Tools::createSessionRestoreToken(session_id())]);
-            $defaults['invoice_url'] = $this->di['tools']->url("/invoice/{$model->hash}");
+        if ($model instanceof Invoice) {
+            $defaults['thankyou_url'] = $this->getPaymentReturnUrl($model, 'thankyou');
+            $defaults['invoice_url'] = $this->di['url']->link("/invoice/{$model->getHash()}");
         }
 
         if (isset($optional['auto_redirect'])) {
@@ -331,7 +796,7 @@ class ServicePayGateway implements InjectionAwareInterface
         $class = $this->getAdapterClassName($pg);
 
         if (!class_exists($class)) {
-            throw new \FOSSBilling\Exception('Payment gateway :adapter was not found.', [':adapter' => $class]);
+            throw new \FOSSBilling\Core\Exception\BaseException('Payment gateway :adapter was not found.', [':adapter' => $class]);
         }
 
         $adapter = new $class($config);
@@ -360,11 +825,11 @@ class ServicePayGateway implements InjectionAwareInterface
         $class = $this->getAdapterClassName($pg);
 
         if (!class_exists($class)) {
-            throw new \FOSSBilling\Exception('Payment gateway :adapter was not found', [':adapter' => $pg->getGateway()]);
+            throw new \FOSSBilling\Core\Exception\BaseException('Payment gateway :adapter was not found', [':adapter' => $pg->getGateway()]);
         }
 
         if (!method_exists($class, 'getConfig')) {
-            error_log("Payment $class gateway does not have getConfig method");
+            $this->di['logger']->error("Payment $class gateway does not have getConfig method");
 
             return [];
         }
@@ -377,7 +842,7 @@ class ServicePayGateway implements InjectionAwareInterface
     {
         $gateway = $pg->getGateway();
         if ($gateway === null || $gateway === '') {
-            throw new \FOSSBilling\Exception('Payment gateway :adapter was not found', [':adapter' => '']);
+            throw new \FOSSBilling\Core\Exception\BaseException('Payment gateway :adapter was not found', [':adapter' => '']);
         }
         $class = "Payment_Adapter_{$gateway}";
 
@@ -398,7 +863,7 @@ class ServicePayGateway implements InjectionAwareInterface
     public function getAcceptedCurrencies(PayGateway $model): array
     {
         $accepted = $model->getAcceptedCurrencies();
-        if ($accepted === null || empty($accepted)) {
+        if ($accepted === null) {
             $currencyService = $this->di['mod_service']('currency');
             /** @var \Box\Mod\Currency\Repository\CurrencyRepository $currencyRepository */
             $currencyRepository = $currencyService->getCurrencyRepository();
@@ -406,9 +871,7 @@ class ServicePayGateway implements InjectionAwareInterface
             return array_keys($currencyRepository->getPairs());
         }
 
-        $decoded = json_decode($accepted, true);
-
-        return is_array($decoded) ? $decoded : [];
+        return $accepted;
     }
 
     public function getFormElements(PayGateway $model): array
@@ -428,57 +891,47 @@ class ServicePayGateway implements InjectionAwareInterface
         return $config['description'] ?? null;
     }
 
-    /**
-     * @param \Model_Invoice $model
-     */
-    public function getCallbackUrl(PayGateway $pg, $model = null): string
+    public function getCallbackUrl(PayGateway $pg, ?Invoice $model = null): string
     {
         $p = [
             'gateway_id' => $pg->getId(),
         ];
-        if ($model instanceof \Model_Invoice) {
-            $p['invoice_id'] = $model->id;
+        if ($model instanceof Invoice) {
+            $p['invoice_id'] = $model->getId();
         }
 
         return SYSTEM_URL . 'ipn.php?' . http_build_query($p);
     }
 
-    /**
-     * @param \Model_Invoice $model
-     */
-    private function getReturnUrl(PayGateway $pg, $model = null): string
+    private function getReturnUrl(PayGateway $pg, ?Invoice $model = null): string
     {
-        if ($model instanceof \Model_Invoice) {
-            return $this->di['url']->link("/invoice/{$model->hash}", ['status' => 'ok', 'restore_token' => Tools::createSessionRestoreToken(session_id())]);
-        }
-
-        return $this->di['url']->link('/invoice', ['status' => 'ok', 'restore_token' => Tools::createSessionRestoreToken(session_id())]);
+        return $this->getPaymentReturnUrl($model, 'ok');
     }
 
-    /**
-     * @param \Model_Invoice $model
-     */
-    private function getCancelUrl(PayGateway $pg, $model = null): string
+    private function getCancelUrl(PayGateway $pg, ?Invoice $model = null): string
     {
-        if ($model instanceof \Model_Invoice) {
-            return $this->di['url']->link("/invoice/{$model->hash}", ['status' => 'cancel', 'restore_token' => Tools::createSessionRestoreToken(session_id())]);
-        }
-
-        return $this->di['url']->link('/invoice', ['status' => 'cancel', 'restore_token' => Tools::createSessionRestoreToken(session_id())]);
+        return $this->getPaymentReturnUrl($model, 'cancel');
     }
 
-    /**
-     * @param \Model_Invoice $model
-     */
-    private function getCallbackRedirect(PayGateway $pg, $model = null): string
+    private function getPaymentReturnUrl(?Invoice $model, string $status): string
+    {
+        $params = ['status' => $status];
+        if ($model instanceof Invoice) {
+            $params['hash'] = $model->getHash();
+        }
+
+        return $this->di['url']->link('/invoice/payment-return', $params);
+    }
+
+    private function getCallbackRedirect(PayGateway $pg, ?Invoice $model = null): string
     {
         $p = [
             'gateway_id' => $pg->getId(),
         ];
 
-        if ($model instanceof \Model_Invoice) {
-            $p['invoice_id'] = $model->id;
-            $p['invoice_hash'] = $model->hash;
+        if ($model instanceof Invoice) {
+            $p['invoice_id'] = $model->getId();
+            $p['invoice_hash'] = $model->getHash();
             $p['redirect'] = 1;
         }
 

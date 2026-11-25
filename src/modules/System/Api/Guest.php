@@ -15,12 +15,13 @@ declare(strict_types=1);
 
 namespace Box\Mod\System\Api;
 
-use FOSSBilling\i18n;
-use FOSSBilling\Validation\Api\RequiredParams;
+use FOSSBilling\Core\I18n\I18n;
+use FOSSBilling\Core\Period;
+use FOSSBilling\Core\Validation\Api\RequiredParams;
 use PrinsFrank\Standards\CountryCallingCode\CountryCallingCode;
 use Symfony\Component\Intl\Countries;
 
-class Guest extends \FOSSBilling\Api\AbstractApi
+class Guest extends \FOSSBilling\Core\Api\AbstractApi
 {
     /**
      * Returns company information.
@@ -77,7 +78,7 @@ class Guest extends \FOSSBilling\Api\AbstractApi
         }
 
         $countries = [];
-        foreach (preg_split('/\R/', $configuredCountries) as $line) {
+        foreach (preg_split('/\R/u', $configuredCountries) as $line) {
             $parts = explode('=', trim($line), 2);
             if (count($parts) !== 2) {
                 continue;
@@ -113,7 +114,7 @@ class Guest extends \FOSSBilling\Api\AbstractApi
      */
     public function periods()
     {
-        return \Box_Period::getPredefined();
+        return Period::getPredefined();
     }
 
     /**
@@ -158,7 +159,7 @@ class Guest extends \FOSSBilling\Api\AbstractApi
         $limit = (int) ($data['per_page'] ?? 20);
         $itemsCount = (int) ($data['total'] ?? 0);
 
-        $p = new \FOSSBilling\Paginator($itemsCount, $current_page, $limit, $midrange);
+        $p = new \FOSSBilling\Core\Pagination\ViewPaginator($itemsCount, $current_page, $limit, $midrange);
 
         return $p->toArray();
     }
@@ -175,16 +176,19 @@ class Guest extends \FOSSBilling\Api\AbstractApi
 
     /**
      * Check if passed file name template exists for client area.
-     *
-     * @return bool
      */
-    public function template_exists($data)
+    public function template_exists($data): bool
     {
-        if (!isset($data['file'])) {
+        if (!isset($data['file']) || !is_string($data['file'])) {
             return false;
         }
 
-        return $this->getService()->templateExists($data['file']);
+        $file = trim($data['file']);
+        if ($file === '' || str_contains($file, "\0")) {
+            return false;
+        }
+
+        return $this->getService()->templateExists($file);
     }
 
     /**
@@ -192,7 +196,7 @@ class Guest extends \FOSSBilling\Api\AbstractApi
      */
     public function locale(): string
     {
-        return i18n::getActiveLocale($this->getDi()['request'], true, $this->getDi()['cookie_queue']);
+        return I18n::getActiveLocale($this->getDi()['request'], true, $this->getDi()['cookie_queue']);
     }
 
     /**
@@ -202,7 +206,7 @@ class Guest extends \FOSSBilling\Api\AbstractApi
      */
     public function timezones(): array
     {
-        return i18n::getTimezones();
+        return I18n::getTimezones();
     }
 
     public function get_pending_messages()

@@ -11,9 +11,16 @@ declare(strict_types=1);
 
 namespace Box\Mod\Antispam;
 
+use Box\Mod\Client\Event\BeforeAdminClientUpdateEvent;
+use Box\Mod\Client\Event\BeforeClientLoginEvent;
+use Box\Mod\Client\Event\BeforeClientSignUpEvent;
+use Box\Mod\Profile\Event\BeforeClientProfileUpdateEvent;
+use Box\Mod\Staff\Event\BeforeAdminLoginEvent;
+use Box\Mod\Support\Event\BeforeGuestTicketCreateEvent;
 use EmailChecker\Adapter;
 use EmailChecker\Utilities;
-use FOSSBilling\InjectionAwareInterface;
+use FOSSBilling\Core\Container\InjectionAwareInterface;
+use Symfony\Component\EventDispatcher\Attribute\AsEventListener;
 use Symfony\Component\Filesystem\Filesystem;
 use Symfony\Component\Filesystem\Path;
 use Symfony\Contracts\Cache\ItemInterface;
@@ -58,82 +65,77 @@ class Service implements InjectionAwareInterface
         ];
     }
 
-    public static function onBeforeClientSignUp(\Box_Event $event): void
+    #[AsEventListener]
+    public function onBeforeClientSignUp(BeforeClientSignUpEvent $event): void
     {
-        $di = $event->getDi();
-        $antispamService = $di['mod_service']('Antispam');
-        $antispamService->isBlockedIp($event);
-        $antispamService->isSpam($event);
-        $antispamService->isTemp($event);
-        $antispamService->checkHoneypot($event);
+        // Client\Api\Guest::create() already verifies the CAPTCHA before firing
+        // this event. CAPTCHA tokens are single-use, so checking it again here
+        // would reject every genuine signup.
+        $di = $this->di ?? throw new \LogicException('Antispam service must be initialized before handling events.');
+        $this->checkBlockedIp($di);
+        $this->checkSpam($di, $event->input);
+        $this->checkTempEmail($di, $event->input);
+        $this->checkHoneypot($di, $event->input);
     }
 
-    public static function onBeforeClientOpenTicket(\Box_Event $event): void
+    #[AsEventListener]
+    public function onBeforeGuestTicketCreate(BeforeGuestTicketCreateEvent $event): void
     {
-        if ($event->getParameters()['author_role'] !== 'guest') {
+        if (($event->input['author_role'] ?? null) !== 'guest') {
             return;
         }
 
-        $di = $event->getDi();
-        $antispamService = $di['mod_service']('Antispam');
-        $antispamService->isBlockedIp($event);
-        $antispamService->isSpam($event);
-        $antispamService->isTemp($event);
+        $di = $this->di ?? throw new \LogicException('Antispam service must be initialized before handling events.');
+
+        $this->checkBlockedIp($di);
+        $this->checkCaptcha($event->input);
+        $this->checkSpam($di, $event->input);
+        $this->checkTempEmail($di, $event->input);
     }
 
-    public static function onBeforeClientProfileUpdate(\Box_Event $event): void
+    #[AsEventListener]
+    public function onBeforeClientProfileUpdate(BeforeClientProfileUpdateEvent $event): void
     {
-        $di = $event->getDi();
-        $antispamService = $di['mod_service']('Antispam');
-        $antispamService->isBlockedIp($event);
+        $di = $this->di ?? throw new \LogicException('Antispam service must be initialized before handling events.');
+        $this->checkBlockedIp($di);
     }
 
-    public static function onBeforeAdminClientUpdate(\Box_Event $event): void
+    #[AsEventListener]
+    public function onBeforeAdminClientUpdate(BeforeAdminClientUpdateEvent $event): void
     {
-        $di = $event->getDi();
-        $antispamService = $di['mod_service']('Antispam');
-        $antispamService->isBlockedIp($event);
+        $di = $this->di ?? throw new \LogicException('Antispam service must be initialized before handling events.');
+        $this->checkBlockedIp($di);
     }
 
-    public static function onBeforeClientUpdate(\Box_Event $event): void
+    #[AsEventListener]
+    public function onBeforeClientLogin(BeforeClientLoginEvent $event): void
     {
-        $di = $event->getDi();
-        $antispamService = $di['mod_service']('Antispam');
-        $antispamService->isBlockedIp($event);
+        $di = $this->di ?? throw new \LogicException('Antispam service must be initialized before handling events.');
+        $this->checkBlockedIp($di);
     }
 
-    public static function onBeforeClientLogin(\Box_Event $event): void
+    #[AsEventListener]
+    public function onBeforeAdminLogin(BeforeAdminLoginEvent $event): void
     {
-        $di = $event->getDi();
-        $antispamService = $di['mod_service']('Antispam');
-        $antispamService->isBlockedIp($event);
+        $di = $this->di ?? throw new \LogicException('Antispam service must be initialized before handling events.');
+        $this->checkBlockedIp($di);
     }
 
-    public static function onBeforeAdminLogin(\Box_Event $event): void
+    private function checkBlockedIp(\Pimple\Container $di): void
     {
-        $di = $event->getDi();
-        $antispamService = $di['mod_service']('Antispam');
-        $antispamService->isBlockedIp($event);
-    }
-
-    public function isBlockedIp(\Box_Event $event): void
-    {
-        $di = $event->getDi();
         $config = $di['mod_config']('Antispam');
         if (isset($config['block_ips']) && $config['block_ips'] && isset($config['blocked_ips'])) {
             $blocked_ips = explode(PHP_EOL, $config['blocked_ips']);
             $blocked_ips = array_map(trim(...), $blocked_ips);
             if (in_array($di['request']->getClientIp(), $blocked_ips)) {
-                throw new \FOSSBilling\InformationException('Your IP address (:ip) is blocked. Please contact our support to lift your block.', [':ip' => $di['request']->getClientIp()], 403);
+                throw new \FOSSBilling\Core\Exception\InformationException('Your IP address (:ip) is blocked. Please contact our support to lift your block.', [':ip' => $di['request']->getClientIp()], 403);
             }
         }
     }
 
-    public function isSpam(\Box_Event $event): void
+    /** @param array<string, mixed> $params */
+    private function checkSpam(\Pimple\Container $di, array $params): void
     {
-        $di = $event->getDi();
-        $params = $event->getParameters();
-
         $data = [
             'ip' => $params['ip'] ?? null,
             'email' => $params['email'] ?? null,
@@ -141,11 +143,14 @@ class Service implements InjectionAwareInterface
 
         $config = $di['mod_config']('Antispam');
 
-        $this->checkCaptcha($params);
-
         if (isset($config['sfs']) && $config['sfs']) {
             $antispamService = $di['mod_service']('Antispam');
             $antispamService->isInStopForumSpamDatabase($data);
+        }
+
+        if (isset($config['abuseipdb_enabled']) && $config['abuseipdb_enabled']) {
+            $antispamService = $di['mod_service']('Antispam');
+            $antispamService->isInAbuseIPDBDatabase((string) ($data['ip'] ?? ''));
         }
     }
 
@@ -159,11 +164,11 @@ class Service implements InjectionAwareInterface
 
             if ($provider === 'recaptcha_v2' || $provider === 'recaptcha_v3') {
                 if (!isset($config['captcha_recaptcha_privatekey']) || $config['captcha_recaptcha_privatekey'] == '') {
-                    throw new \FOSSBilling\InformationException("To use reCAPTCHA you must get an API key from <a href='https://www.google.com/recaptcha/admin/create'>here</a>");
+                    throw new \FOSSBilling\Core\Exception\InformationException("To use reCAPTCHA you must get an API key from <a href='https://www.google.com/recaptcha/admin/create'>here</a>");
                 }
 
                 if (!isset($params['g-recaptcha-response']) || $params['g-recaptcha-response'] == '') {
-                    throw new \FOSSBilling\InformationException('You have to complete the CAPTCHA to continue');
+                    throw new \FOSSBilling\Core\Exception\InformationException('You have to complete the CAPTCHA to continue');
                 }
 
                 $httpClient = $di['http_client'];
@@ -177,7 +182,7 @@ class Service implements InjectionAwareInterface
                 $content = $response->toArray();
 
                 if (!isset($content['success']) || $content['success'] !== true) {
-                    throw new \FOSSBilling\InformationException('reCAPTCHA verification failed.');
+                    throw new \FOSSBilling\Core\Exception\InformationException('reCAPTCHA verification failed.');
                 }
 
                 if ($provider === 'recaptcha_v3') {
@@ -189,24 +194,24 @@ class Service implements InjectionAwareInterface
                     $score = isset($content['score']) ? (float) $content['score'] : 0.0;
 
                     if ($score < $threshold) {
-                        throw new \FOSSBilling\InformationException('reCAPTCHA verification failed.');
+                        throw new \FOSSBilling\Core\Exception\InformationException('reCAPTCHA verification failed.');
                     }
 
                     $expectedAction = 'fossbilling_submit';
                     $action = $params['g-recaptcha-action'] ?? $expectedAction;
 
                     if ($action !== $expectedAction || ($content['action'] ?? null) !== $expectedAction) {
-                        throw new \FOSSBilling\InformationException('reCAPTCHA verification failed.');
+                        throw new \FOSSBilling\Core\Exception\InformationException('reCAPTCHA verification failed.');
                     }
                 }
             } elseif ($provider === 'turnstile') {
                 if (empty($config['turnstile_secret_key'])) {
-                    throw new \FOSSBilling\InformationException('Cloudflare Turnstile secret key is not configured.');
+                    throw new \FOSSBilling\Core\Exception\InformationException('Cloudflare Turnstile secret key is not configured.');
                 }
 
                 $turnstile_response = $params['cf-turnstile-response'] ?? null;
                 if (empty($turnstile_response)) {
-                    throw new \FOSSBilling\InformationException('Please complete the CAPTCHA verification.');
+                    throw new \FOSSBilling\Core\Exception\InformationException('Please complete the CAPTCHA verification.');
                 }
 
                 $httpClient = $di['http_client'];
@@ -220,16 +225,16 @@ class Service implements InjectionAwareInterface
                 $content = $response->toArray();
 
                 if (!isset($content['success']) || $content['success'] !== true) {
-                    throw new \FOSSBilling\InformationException('CAPTCHA verification failed. Please try again.');
+                    throw new \FOSSBilling\Core\Exception\InformationException('CAPTCHA verification failed. Please try again.');
                 }
             } elseif ($provider === 'hcaptcha') {
                 if (empty($config['hcaptcha_secret_key'])) {
-                    throw new \FOSSBilling\InformationException('hCaptcha secret key is not configured.');
+                    throw new \FOSSBilling\Core\Exception\InformationException('hCaptcha secret key is not configured.');
                 }
 
                 $hcaptcha_response = $params['h-captcha-response'] ?? null;
                 if (empty($hcaptcha_response)) {
-                    throw new \FOSSBilling\InformationException('Please complete the CAPTCHA verification.');
+                    throw new \FOSSBilling\Core\Exception\InformationException('Please complete the CAPTCHA verification.');
                 }
 
                 $httpClient = $di['http_client'];
@@ -243,41 +248,39 @@ class Service implements InjectionAwareInterface
                 $content = $response->toArray();
 
                 if (!isset($content['success']) || $content['success'] !== true) {
-                    throw new \FOSSBilling\InformationException('CAPTCHA verification failed. Please try again.');
+                    throw new \FOSSBilling\Core\Exception\InformationException('CAPTCHA verification failed. Please try again.');
                 }
             }
         }
     }
 
-    public function isTemp(\Box_Event $event): void
+    /** @param array<string, mixed> $params */
+    private function checkTempEmail(\Pimple\Container $di, array $params): void
     {
-        $di = $event->getDi();
         $config = $di['mod_config']('Antispam');
 
         $check = $config['check_temp_emails'] ?? true;
         if ($check) {
-            $antispamService = $di['mod_service']('Antispam');
-            $params = $event->getParameters();
             $email = $params['email'] ?? '';
 
+            $antispamService = $di['mod_service']('Antispam');
             $antispamService->isATempEmail($email, true);
         }
     }
 
-    public function checkHoneypot(\Box_Event $event): void
+    /** @param array<string, mixed> $params */
+    private function checkHoneypot(\Pimple\Container $di, array $params): void
     {
-        $di = $event->getDi();
         $config = $di['mod_config']('Antispam');
 
         $enabled = $config['honeypot_enabled'] ?? true;
         if ($enabled) {
-            $params = $event->getParameters();
             $honeypotField = $config['honeypot_field'] ?? 'bio';
 
             if (!empty($params[$honeypotField])) {
-                $this->di['logger']->info('Potential spam registration blocked. Reason: honeypot field was not empty.');
+                $di['logger']->info('Potential spam registration blocked. Reason: honeypot field was not empty.');
 
-                throw new \FOSSBilling\InformationException('Registration failed.');
+                throw new \FOSSBilling\Core\Exception\InformationException('Registration failed.');
             }
         }
     }
@@ -306,16 +309,116 @@ class Service implements InjectionAwareInterface
         }
 
         if (isset($json->username->appears) && $json->username->appears) {
-            throw new \FOSSBilling\InformationException('Your username is blacklisted in the Stop Forum Spam database');
+            throw new \FOSSBilling\Core\Exception\InformationException('Your username is blacklisted in the Stop Forum Spam database');
         }
         if (isset($json->email->appears) && $json->email->appears) {
-            throw new \FOSSBilling\InformationException('Your e-mail is blacklisted in the Stop Forum Spam database');
+            throw new \FOSSBilling\Core\Exception\InformationException('Your e-mail is blacklisted in the Stop Forum Spam database');
         }
         if (isset($json->ip->appears) && $json->ip->appears) {
-            throw new \FOSSBilling\InformationException('Your IP address is blacklisted in the Stop Forum Spam database');
+            throw new \FOSSBilling\Core\Exception\InformationException('Your IP address is blacklisted in the Stop Forum Spam database');
         }
 
         return true;
+    }
+
+    /**
+     * Checks an IP address against the AbuseIPDB database.
+     *
+     * Throws when the reported abuse confidence score meets the configured
+     * threshold. Missing configuration, private/reserved IPs, and API
+     * failures fail open (return false) so signups are never blocked by
+     * an unavailable reputation service.
+     */
+    public function isInAbuseIPDBDatabase(string $ip): bool
+    {
+        $config = $this->di['mod_config']('Antispam');
+
+        if (empty($config['abuseipdb_enabled'])) {
+            return false;
+        }
+
+        $apiKey = trim((string) ($config['abuseipdb_api_key'] ?? ''));
+        if ($apiKey === '') {
+            return false;
+        }
+
+        $ip = trim($ip);
+        if ($ip === '' || filter_var($ip, FILTER_VALIDATE_IP) === false) {
+            return false;
+        }
+
+        // Skip private and reserved ranges (local dev, CI, internal networks).
+        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) {
+            return false;
+        }
+
+        $threshold = $config['abuseipdb_threshold'] ?? 75;
+        $threshold = is_numeric($threshold) ? (int) $threshold : 75;
+        $threshold = min(100, max(0, $threshold));
+
+        $maxAge = $config['abuseipdb_max_age'] ?? 30;
+        $maxAge = is_numeric($maxAge) ? (int) $maxAge : 30;
+        $maxAge = min(365, max(1, $maxAge));
+
+        $score = $this->getAbuseIPDBScore($ip, $apiKey, $maxAge);
+        if ($score === null) {
+            return false;
+        }
+
+        if ($score >= $threshold) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Your IP address is blacklisted in the AbuseIPDB database');
+        }
+
+        return true;
+    }
+
+    private function getAbuseIPDBScore(string $ip, string $apiKey, int $maxAge): ?int
+    {
+        $cacheKey = 'abuseipdb_' . hash('xxh3', $ip . '_' . $maxAge);
+
+        return $this->di['cache']->get($cacheKey, function (ItemInterface $item) use ($ip, $apiKey, $maxAge) {
+            $item->expiresAfter(86400); // Scores are cached for 24 hours to stay within the free API quota.
+
+            try {
+                $response = $this->di['http_client']->request('GET', 'https://api.abuseipdb.com/api/v2/check', [
+                    'headers' => [
+                        'Key' => $apiKey,
+                        'Accept' => 'application/json',
+                    ],
+                    'query' => [
+                        'ipAddress' => $ip,
+                        'maxAgeInDays' => $maxAge,
+                    ],
+                    // Bound the user-facing wait: without these, a stalled
+                    // connection hangs signups until Symfony's 60s idle
+                    // timeout instead of failing open quickly.
+                    'timeout' => 5,
+                    'max_duration' => 10,
+                ]);
+
+                if ($response->getStatusCode() !== 200) {
+                    $item->expiresAfter(3600);
+                    $this->di['logger']->warning('AbuseIPDB check failed for IP :ip with status :status', [':ip' => $ip, ':status' => $response->getStatusCode()]);
+
+                    return null;
+                }
+
+                $content = $response->toArray(false);
+                $score = $content['data']['abuseConfidenceScore'] ?? null;
+                if (!is_numeric($score)) {
+                    $item->expiresAfter(3600);
+
+                    return null;
+                }
+
+                return min(100, max(0, (int) $score));
+            } catch (\Throwable $e) {
+                $item->expiresAfter(3600);
+                $this->di['logger']->warning('AbuseIPDB check failed for IP :ip: :error', [':ip' => $ip, ':error' => $e->getMessage()]);
+
+                return null;
+            }
+        });
     }
 
     /**
@@ -345,7 +448,7 @@ class Service implements InjectionAwareInterface
         }
         $invalid = $adapter->isThrowawayDomain($domain);
         if ($invalid && $throw) {
-            throw new \FOSSBilling\InformationException('Disposable email addresses are not allowed');
+            throw new \FOSSBilling\Core\Exception\InformationException('Disposable email addresses are not allowed');
         }
 
         return $invalid;

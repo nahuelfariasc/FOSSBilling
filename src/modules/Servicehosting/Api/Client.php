@@ -11,12 +11,13 @@ declare(strict_types=1);
 
 namespace Box\Mod\Servicehosting\Api;
 
+use Box\Mod\Order\Entity\Order;
 use Box\Mod\Servicehosting\Entity\ServiceHosting;
 
 /**
  * Hosting service management.
  */
-class Client extends \FOSSBilling\Api\AbstractApi
+class Client extends \FOSSBilling\Core\Api\AbstractApi
 {
     /**
      * Change hosting account username.
@@ -57,11 +58,15 @@ class Client extends \FOSSBilling\Api\AbstractApi
     /**
      * Get hosting plans pairs. Usually for select box.
      *
+     * Scoped to plans referenced by at least one enabled hosting product, so
+     * clients can only enumerate plans that are actually orderable. Use the
+     * admin API for the full list.
+     *
      * @return array
      */
     public function hp_get_pairs($data)
     {
-        return $this->getService()->getHpPairs();
+        return $this->getService()->getOrderableHpPairs();
     }
 
     /**
@@ -81,19 +86,19 @@ class Client extends \FOSSBilling\Api\AbstractApi
     public function _getService($data): array
     {
         if (!isset($data['order_id'])) {
-            throw new \FOSSBilling\Exception('Order ID is required');
+            throw new \FOSSBilling\Core\Exception\BaseException('Order ID is required');
         }
         $identity = $this->getIdentity();
-        $order = $this->getDi()['db']->findOne('ClientOrder', 'id = ? and client_id = ?', [$data['order_id'], $identity->id]);
-        if (!$order instanceof \Model_ClientOrder) {
-            throw new \FOSSBilling\InformationException('Order not found');
+        $order = $this->getDi()['em']->getRepository(Order::class)->findOneBy(['id' => $data['order_id'], 'clientId' => $identity->getId()]);
+        if (!$order instanceof Order) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Order not found');
         }
 
         $orderService = $this->getDi()['mod_service']('order');
         $orderService->assertOrderUsable($order);
         $s = $orderService->getOrderService($order);
-        if (!$s instanceof ServiceHosting || $order->status !== \Model_ClientOrder::STATUS_ACTIVE) {
-            throw new \FOSSBilling\InformationException('Order is not activated');
+        if (!$s instanceof ServiceHosting || $order->getStatus() !== Order::STATUS_ACTIVE) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Order is not activated');
         }
 
         return [$order, $s];

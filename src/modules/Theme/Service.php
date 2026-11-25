@@ -13,9 +13,9 @@ namespace Box\Mod\Theme;
 
 use Box\Mod\Extension\Entity\ExtensionMeta;
 use Box\Mod\Extension\Repository\ExtensionMetaRepository;
-use FOSSBilling\InjectionAwareInterface;
-use FOSSBilling\Sanitizer\BrowserHtmlSanitizer;
-use FOSSBilling\Twig\SandboxedStringRenderer;
+use FOSSBilling\Core\Container\InjectionAwareInterface;
+use FOSSBilling\Core\HtmlSanitizerFactory;
+use FOSSBilling\Core\Twig\SandboxedStringRenderer;
 use Symfony\Component\Filesystem\Filesystem;
 use Symfony\Component\Filesystem\Path;
 use Symfony\Component\Finder\Finder;
@@ -90,7 +90,7 @@ class Service implements InjectionAwareInterface
     {
         if ($this->extensionMetaRepository === null) {
             if ($this->di === null) {
-                throw new \FOSSBilling\Exception('The dependency injection container has not been set.');
+                throw new \FOSSBilling\Core\Exception\BaseException('The dependency injection container has not been set.');
             }
 
             $this->extensionMetaRepository = $this->di['em']->getRepository(ExtensionMeta::class);
@@ -157,7 +157,7 @@ class Service implements InjectionAwareInterface
     public function getThemePresets(Model\Theme $theme): array
     {
         $presets = [];
-        $metaRows = $this->getExtensionMetaRepository()->findByExtensionAndScope('mod_theme', null, 'settings', $theme->getName(), ['metaKey' => 'ASC']);
+        $metaRows = $this->getExtensionMetaRepository()->findByExtensionAndScope('mod_theme', null, 'settings', $theme->getName(), ['metaKey' => \SortDirection::Ascending]);
         foreach ($metaRows as $meta) {
             $presets[$meta->getMetaKey()] = $meta->getMetaKey();
         }
@@ -168,7 +168,7 @@ class Service implements InjectionAwareInterface
             $presets = [];
             foreach ($core_presets as $preset => $params) {
                 $presets[$preset] = $preset;
-                $this->updateSettings($theme, $preset, $params);
+                $this->persistSettings($theme, $preset, $params);
             }
         }
 
@@ -182,19 +182,38 @@ class Service implements InjectionAwareInterface
 
     public function getThemeSettings(Model\Theme $theme, $preset = null)
     {
-        if (is_null($preset)) {
-            $preset = $this->getCurrentThemePreset($theme);
-        }
+        $preset ??= $this->getCurrentThemePreset($theme);
+
+        // A preset created in the admin has no entry in settings_data.json. Fall back to the
+        // shipped defaults so the settings are complete and templates need no defaults of their
+        // own. Prefer the 'Default' preset over the file's current preset, which may name another
+        // custom preset once the admin has saved one.
+        $defaults = $theme->getPresetFromSettingsDataFile($preset)
+            ?: $theme->getPresetFromSettingsDataFile('Default')
+            ?: $theme->getPresetFromSettingsDataFile($theme->getCurrentPreset());
 
         $meta = $this->getExtensionMetaRepository()->findOneByExtensionAndScope('mod_theme', (string) $preset, 'settings', $theme->getName());
-        if ($meta instanceof ExtensionMeta) {
-            return json_decode($meta->getMetaValue() ?? '', true) ?? [];
+        if (!$meta instanceof ExtensionMeta) {
+            return $defaults;
         }
 
-        return $theme->getPresetFromSettingsDataFile($preset);
+        // Saved presets predate settings added in later releases: fall back
+        // to the shipped defaults for keys the saved preset does not define,
+        // so templates never hit missing keys after an update adds settings.
+        $saved = json_decode($meta->getMetaValue() ?? '', true) ?? [];
+
+        return array_merge($defaults, $saved);
     }
 
     public function updateSettings(Model\Theme $theme, $preset, array $params): bool
+    {
+        $this->di['mod_service']('Staff')->checkPermissionsAndThrowException('theme', 'manage_settings');
+
+        return $this->persistSettings($theme, $preset, $params);
+    }
+
+    /** Persist settings from an authorized write or shipped preset initialization. */
+    private function persistSettings(Model\Theme $theme, $preset, array $params): bool
     {
         $meta = $this->getExtensionMetaRepository()->findOneByExtensionAndScope('mod_theme', (string) $preset, 'settings', $theme->getName());
 
@@ -269,19 +288,19 @@ class Service implements InjectionAwareInterface
             ['settings' => $settings],
             'Theme settings template',
             function (\Twig\Sandbox\SecurityError $e) use ($theme): void {
-                $this->di['logger']->setChannel('security')->warning('Theme settings template sandbox violation', [
+                $this->di['logger']->withChannel('security')->warning('Theme settings template sandbox violation', [
                     'theme' => $theme->getName(),
                     'error' => $e->getMessage(),
                 ]);
             }
         );
 
-        return BrowserHtmlSanitizer::sanitizeThemeSettingsHtml($rendered);
+        return HtmlSanitizerFactory::sanitize($rendered, 'theme_settings');
     }
 
     public function getCurrentAdminAreaTheme(): array
     {
-        $default = 'admin_default';
+        $default = 'default/admin';
 
         if (self::$adminThemeCache !== null) {
             // Apply default logic when returning from cache
@@ -297,7 +316,7 @@ class Service implements InjectionAwareInterface
                 FROM setting
                 WHERE param = :param
                ';
-        $theme = $this->di['dbal']->fetchOne($query, ['param' => 'admin_theme']);
+        $theme = $this->di['em']->getConnection()->fetchOne($query, ['param' => 'admin_theme']);
         $theme = is_string($theme) ? $theme : null;
         // Cache the raw database value (use empty string instead of null to mark as cached)
         self::$adminThemeCache = $theme ?? '';
@@ -322,18 +341,23 @@ class Service implements InjectionAwareInterface
     {
         if (self::$clientThemeCache !== null) {
             // Apply default logic when returning from cache
-            return !empty(self::$clientThemeCache) ? self::$clientThemeCache : 'huraga';
+            return !empty(self::$clientThemeCache) ? self::$clientThemeCache : 'default/client';
         }
 
-        $theme = $this->di['dbal']->fetchOne("SELECT value FROM setting WHERE param = 'theme' ");
+        $theme = $this->di['em']->getConnection()->fetchOne("SELECT value FROM setting WHERE param = 'theme' ");
         $theme = is_string($theme) ? $theme : null;
         // Cache the raw database value (use empty string instead of null to mark as cached)
         self::$clientThemeCache = $theme ?? '';
 
-        return !empty($theme) ? $theme : 'huraga';
+        return !empty($theme) ? $theme : 'default/client';
     }
 
     /**
+     * A theme directory is either flat (`{name}/html`, classified by the
+     * legacy `str_contains($name, 'admin')` naming) or a package
+     * (`{name}/admin/html` and/or `{name}/client/html`, each area listed
+     * under its own bucket via the resolved code `{name}/{area}`).
+     *
      * @return mixed[]
      */
     public function getThemes($client = true): array
@@ -343,30 +367,54 @@ class Service implements InjectionAwareInterface
 
         $finder = new Finder();
         $finder->directories()->in($path)->depth('== 0')->ignoreDotFiles(true);
-        foreach ($finder as $file) {
+        foreach ($finder as $dir) {
+            $name = $dir->getFilename();
+
             try {
-                if (!$client && str_contains($file->getFilename(), 'admin')) {
-                    $list[] = $this->buildThemeConfig($file->getFilename());
+                if ($this->filesystem->exists(Path::join($dir->getPathname(), 'html'))) {
+                    // Flat theme: unchanged legacy behavior.
+                    if ($client === !str_contains($name, 'admin')) {
+                        $list[] = $this->buildThemeConfig($name);
+                    }
+
+                    continue;
                 }
 
-                if ($client && !str_contains($file->getFilename(), 'admin')) {
-                    $list[] = $this->buildThemeConfig($file->getFilename());
+                $area = $client ? 'client' : 'admin';
+                if ($this->filesystem->exists(Path::join($dir->getPathname(), $area, 'html'))) {
+                    $list[] = $this->buildThemeConfig("$name/$area");
                 }
             } catch (\Exception $e) {
-                error_log($e->getMessage());
+                $this->di['logger']->error($e->getMessage());
             }
         }
 
         return $list;
     }
 
+    /**
+     * Resolve a theme package's `shared/html` fallback directory from one
+     * area's already-resolved code (e.g. `'default/admin'`). A code with no
+     * `/` is a flat theme and has no package to share with.
+     */
+    public function getPackageSharedHtmlPath(string $code): ?string
+    {
+        if (!str_contains($code, '/')) {
+            return null;
+        }
+
+        $packagePath = Path::getDirectory(Path::join($this->getThemesPath(), $code));
+
+        return Path::join($packagePath, 'shared', 'html');
+    }
+
     public function getThemeConfig($client = true, $mod = null)
     {
         if ($client) {
-            $default = 'huraga';
+            $default = 'default/client';
             $theme = $this->getCurrentClientAreaThemeCode();
         } else {
-            $default = 'admin_default';
+            $default = 'default/admin';
             $systemService = $this->di['mod_service']('system');
             $theme = $systemService->getParamValue('admin_theme', $default);
         }
@@ -384,7 +432,7 @@ class Service implements InjectionAwareInterface
         return $this->buildThemeConfig($code, $client, $mod);
     }
 
-    public function getThemesPath()
+    public function getThemesPath(): string
     {
         return PATH_THEMES;
     }
@@ -394,7 +442,7 @@ class Service implements InjectionAwareInterface
         $theme_path = Path::join($this->getThemesPath(), $theme);
 
         if (!$this->filesystem->exists($theme_path)) {
-            throw new \FOSSBilling\Exception('Theme was not found in path :path', [':path' => $theme_path]);
+            throw new \FOSSBilling\Core\Exception\BaseException('Theme was not found in path :path', [':path' => $theme_path]);
         }
         $manifest = Path::join($theme_path, 'manifest.json');
 
@@ -411,7 +459,7 @@ class Service implements InjectionAwareInterface
         }
 
         if (!is_array($config)) {
-            throw new \FOSSBilling\Exception('Unable to decode theme manifest file :file', [':file' => $manifest]);
+            throw new \FOSSBilling\Core\Exception\BaseException('Unable to decode theme manifest file :file', [':file' => $manifest]);
         }
 
         $paths = [Path::join($theme_path, 'html')];

@@ -12,19 +12,18 @@ declare(strict_types=1);
 
 use Box\Mod\Activity\Entity\ActivityAdminHistory;
 use Box\Mod\Activity\Repository\ActivityAdminHistoryRepository;
+use Box\Mod\Staff\Entity\Admin;
 use Box\Mod\Staff\Entity\AdminGroup;
 use Box\Mod\Staff\Repository\AdminGroupMemberRepository;
 use Box\Mod\Staff\Repository\AdminGroupRepository;
+use Box\Mod\Staff\Repository\AdminRepository;
 use Doctrine\ORM\EntityManagerInterface;
 
 use function Tests\Helpers\container;
 
-function staffAdminIdentity(): Model_Admin
+function staffAdminIdentity(): Admin
 {
-    $admin = new Model_Admin();
-    $admin->loadBean(new Tests\Helpers\DummyBean());
-
-    return $admin;
+    return \Tests\Helpers\admin();
 }
 
 function staffAdminSetEntityId(object $entity, int $id): void
@@ -51,30 +50,26 @@ test('get list', function (): void {
     ->atLeast()->once()
     ->andReturn(['sqlString', []]);
     $serviceMock
-    ->shouldReceive('toModel_AdminApiArray')
+    ->shouldReceive('toApiArray')
     ->atLeast()->once()
     ->andReturn([]);
 
     $resultSet = [
         'list' => ['id' => 1],
     ];
-    $pagerMock = Mockery::mock(FOSSBilling\Pagination::class)->makePartial();
+    $pagerMock = Mockery::mock(FOSSBilling\Core\Pagination\Service::class)->makePartial();
     $pagerMock
     ->shouldReceive('getPaginatedResultSet')
     ->atLeast()->once()
     ->andReturn($resultSet);
 
-    $adminModel = new Model_Admin();
-    $adminModel->loadBean(new Tests\Helpers\DummyBean());
-    $dbMock = Mockery::mock('\Box_Database');
-    $dbMock
-    ->shouldReceive('getExistingModelById')
-    ->atLeast()->once()
-    ->andReturn($adminModel);
+    $adminModel = \Tests\Helpers\admin();
+    $adminRepository = Mockery::mock(AdminRepository::class);
+    $adminRepository->shouldReceive('find')->atLeast()->once()->andReturn($adminModel);
 
     $di = container();
     $di['pager'] = $pagerMock;
-    $di['db'] = $dbMock;
+    $di['em']->shouldReceive('getRepository')->with(Admin::class)->andReturn($adminRepository);
 
     $api->setDi($di);
     $api->setService($serviceMock);
@@ -89,18 +84,15 @@ test('get', function (): void {
 
     $serviceMock = Mockery::mock(Box\Mod\Staff\Service::class);
     $serviceMock
-    ->shouldReceive('toModel_AdminApiArray')
+    ->shouldReceive('toApiArray')
     ->atLeast()->once()
     ->andReturn([]);
 
-    $dbMock = Mockery::mock('\Box_Database');
-    $dbMock
-    ->shouldReceive('getExistingModelById')
-    ->atLeast()->once()
-    ->andReturn(staffAdminIdentity());
+    $adminRepository = Mockery::mock(AdminRepository::class);
+    $adminRepository->shouldReceive('find')->atLeast()->once()->andReturn(staffAdminIdentity());
 
     $di = container();
-    $di['db'] = $dbMock;
+    $di['em']->shouldReceive('getRepository')->with(Admin::class)->andReturn($adminRepository);
 
     $api->setService($serviceMock);
     $api->setDi($di);
@@ -119,14 +111,11 @@ test('update', function (): void {
     ->atLeast()->once()
     ->andReturn(true);
 
-    $dbMock = Mockery::mock('\Box_Database');
-    $dbMock
-    ->shouldReceive('getExistingModelById')
-    ->atLeast()->once()
-    ->andReturn(staffAdminIdentity());
+    $adminRepository = Mockery::mock(AdminRepository::class);
+    $adminRepository->shouldReceive('find')->atLeast()->once()->andReturn(staffAdminIdentity());
 
     $di = container();
-    $di['db'] = $dbMock;
+    $di['em']->shouldReceive('getRepository')->with(Admin::class)->andReturn($adminRepository);
 
     $api->setDi($di);
     $api->setService($serviceMock);
@@ -146,14 +135,11 @@ test('delete', function (): void {
     ->atLeast()->once()
     ->andReturn(true);
 
-    $dbMock = Mockery::mock('\Box_Database');
-    $dbMock
-    ->shouldReceive('getExistingModelById')
-    ->atLeast()->once()
-    ->andReturn(staffAdminIdentity());
+    $adminRepository = Mockery::mock(AdminRepository::class);
+    $adminRepository->shouldReceive('find')->atLeast()->once()->andReturn(staffAdminIdentity());
 
     $di = container();
-    $di['db'] = $dbMock;
+    $di['em']->shouldReceive('getRepository')->with(Admin::class)->andReturn($adminRepository);
 
     $api->setDi($di);
     $api->setService($serviceMock);
@@ -171,7 +157,7 @@ test('change password', function (): void {
         'password_confirm' => 'test!23A',
     ];
 
-    $validatorMock = Mockery::mock(FOSSBilling\Validate::class);
+    $validatorMock = Mockery::mock(FOSSBilling\Core\Validation\Validator::class);
     $validatorMock
     ->shouldReceive('passwordsMatch')
     ->atLeast()->once();
@@ -186,15 +172,12 @@ test('change password', function (): void {
     ->atLeast()->once()
     ->andReturn(true);
 
-    $dbMock = Mockery::mock('\Box_Database');
-    $dbMock
-    ->shouldReceive('getExistingModelById')
-    ->atLeast()->once()
-    ->andReturn(staffAdminIdentity());
+    $adminRepository = Mockery::mock(AdminRepository::class);
+    $adminRepository->shouldReceive('find')->atLeast()->once()->andReturn(staffAdminIdentity());
 
     $di = container();
     $di['validator'] = $validatorMock;
-    $di['db'] = $dbMock;
+    $di['em']->shouldReceive('getRepository')->with(Admin::class)->andReturn($adminRepository);
 
     $api->setDi($di);
     $api->setService($serviceMock);
@@ -214,7 +197,7 @@ test('change password password do not match', function (): void {
     $di = container();
     $api->setDi($di);
     expect(fn () => $api->change_password($data))
-        ->toThrow(FOSSBilling\Exception::class, 'Passwords do not match');
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class, 'Passwords do not match');
 });
 
 test('change password weak password', function (): void {
@@ -225,21 +208,21 @@ test('change password weak password', function (): void {
         'password_confirm' => 'weak',
     ];
 
-    $validatorMock = Mockery::mock(FOSSBilling\Validate::class);
+    $validatorMock = Mockery::mock(FOSSBilling\Core\Validation\Validator::class);
     $validatorMock
         ->shouldReceive('passwordsMatch')
         ->atLeast()->once();
     $validatorMock
         ->shouldReceive('isPasswordStrong')
         ->atLeast()->once()
-        ->andThrow(new FOSSBilling\InformationException('Password is too weak.'));
+        ->andThrow(new FOSSBilling\Core\Exception\InformationException('Password is too weak.'));
 
     $di = container();
     $di['validator'] = $validatorMock;
 
     $api->setDi($di);
     expect(fn () => $api->change_password($data))
-        ->toThrow(FOSSBilling\Exception::class);
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class);
 });
 
 test('create', function (): void {
@@ -259,7 +242,7 @@ test('create', function (): void {
     ->atLeast()->once()
     ->andReturn($newStaffId);
 
-    $validatorMock = Mockery::mock(FOSSBilling\Validate::class);
+    $validatorMock = Mockery::mock(FOSSBilling\Core\Validation\Validator::class);
     $validatorMock
     ->shouldReceive('isPasswordStrong')
     ->atLeast()->once()
@@ -267,10 +250,6 @@ test('create', function (): void {
 
     $di = container();
     $di['validator'] = $validatorMock;
-
-    $toolsMock = Mockery::mock(FOSSBilling\Tools::class);
-    $toolsMock->shouldReceive('validateAndSanitizeEmail')->atLeast()->once();
-    $di['tools'] = $toolsMock;
 
     $api->setDi($di);
     $api->setService($serviceMock);
@@ -534,11 +513,11 @@ test('group member add', function (): void {
     $serviceMock->shouldReceive('getAdminGroupRepository')->once()->andReturn($groupRepository);
     $serviceMock->shouldReceive('addAdminToGroup')->once()->with($admin, $group)->andReturn(true);
 
-    $dbMock = Mockery::mock('\Box_Database');
-    $dbMock->shouldReceive('getExistingModelById')->once()->with('Admin', 2, 'Staff member not found')->andReturn($admin);
+    $adminRepository = Mockery::mock(AdminRepository::class);
+    $adminRepository->shouldReceive('find')->once()->with(2)->andReturn($admin);
 
     $di = container();
-    $di['db'] = $dbMock;
+    $di['em']->shouldReceive('getRepository')->with(Admin::class)->andReturn($adminRepository);
     $api->setDi($di);
     $api->setService($serviceMock);
 
@@ -559,11 +538,11 @@ test('group member remove', function (): void {
     $serviceMock->shouldReceive('getAdminGroupRepository')->once()->andReturn($groupRepository);
     $serviceMock->shouldReceive('removeAdminFromGroup')->once()->with($admin, $group)->andReturn(true);
 
-    $dbMock = Mockery::mock('\Box_Database');
-    $dbMock->shouldReceive('getExistingModelById')->once()->with('Admin', 2, 'Staff member not found')->andReturn($admin);
+    $adminRepository = Mockery::mock(AdminRepository::class);
+    $adminRepository->shouldReceive('find')->once()->with(2)->andReturn($admin);
 
     $di = container();
-    $di['db'] = $dbMock;
+    $di['em']->shouldReceive('getRepository')->with(Admin::class)->andReturn($adminRepository);
     $api->setDi($di);
     $api->setService($serviceMock);
 
@@ -586,13 +565,13 @@ test('group member get list', function (): void {
     $serviceMock = Mockery::mock(Box\Mod\Staff\Service::class);
     $serviceMock->shouldReceive('getAdminGroupRepository')->once()->andReturn($groupRepository);
     $serviceMock->shouldReceive('getAdminGroupMemberRepository')->once()->andReturn($groupMemberRepository);
-    $serviceMock->shouldReceive('toModel_AdminApiArray')->once()->with($admin)->andReturn($member);
+    $serviceMock->shouldReceive('toApiArray')->once()->with($admin)->andReturn($member);
 
-    $dbMock = Mockery::mock('\Box_Database');
-    $dbMock->shouldReceive('getExistingModelById')->once()->with('Admin', 2, 'Staff member not found')->andReturn($admin);
+    $adminRepository = Mockery::mock(AdminRepository::class);
+    $adminRepository->shouldReceive('find')->once()->with(2)->andReturn($admin);
 
     $di = container();
-    $di['db'] = $dbMock;
+    $di['em']->shouldReceive('getRepository')->with(Admin::class)->andReturn($adminRepository);
     $api->setDi($di);
     $api->setService($serviceMock);
 
@@ -611,11 +590,11 @@ test('admin group get list', function (): void {
     $serviceMock = Mockery::mock(Box\Mod\Staff\Service::class);
     $serviceMock->shouldReceive('getAdminGroupMemberRepository')->once()->andReturn($groupMemberRepository);
 
-    $dbMock = Mockery::mock('\Box_Database');
-    $dbMock->shouldReceive('getExistingModelById')->once()->with('Admin', 2, 'Staff member not found')->andReturn($admin);
+    $adminRepository = Mockery::mock(AdminRepository::class);
+    $adminRepository->shouldReceive('find')->once()->with(2)->andReturn($admin);
 
     $di = container();
-    $di['db'] = $dbMock;
+    $di['em']->shouldReceive('getRepository')->with(Admin::class)->andReturn($adminRepository);
     $api->setDi($di);
     $api->setService($serviceMock);
 
@@ -656,7 +635,7 @@ test('login history get list', function (): void {
         'name' => 'Administrator',
         'email' => 'admin@example.test',
     ]]];
-    $pagerMock = Mockery::mock(FOSSBilling\Pagination::class)->makePartial();
+    $pagerMock = Mockery::mock(FOSSBilling\Core\Pagination\Service::class)->makePartial();
     $pagerMock
     ->shouldReceive('getPaginatedResultSet')
     ->atLeast()->once()

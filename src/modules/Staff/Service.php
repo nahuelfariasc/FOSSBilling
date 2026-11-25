@@ -12,17 +12,40 @@ declare(strict_types=1);
 namespace Box\Mod\Staff;
 
 use Box\Mod\Activity\Entity\ActivityAdminHistory;
+use Box\Mod\Client\Event\AfterClientSignUpEvent;
+use Box\Mod\Order\Event\AfterAdminOrderSuspendEvent;
+use Box\Mod\Order\Event\AfterClientOrderCreateEvent;
 use Box\Mod\Staff\Entity\Admin;
 use Box\Mod\Staff\Entity\AdminGroup;
 use Box\Mod\Staff\Entity\AdminGroupMember;
+use Box\Mod\Staff\Entity\AdminPasswordReset;
+use Box\Mod\Staff\Event\AdminLoginFailedEvent;
+use Box\Mod\Staff\Event\AfterAdminLoginEvent;
+use Box\Mod\Staff\Event\AfterAdminStaffCreateEvent;
+use Box\Mod\Staff\Event\AfterAdminStaffDeleteEvent;
+use Box\Mod\Staff\Event\AfterAdminStaffPasswordChangeEvent;
+use Box\Mod\Staff\Event\AfterAdminStaffUpdateEvent;
+use Box\Mod\Staff\Event\BeforeAdminLoginEvent;
+use Box\Mod\Staff\Event\BeforeAdminStaffCreateEvent;
+use Box\Mod\Staff\Event\BeforeAdminStaffDeleteEvent;
+use Box\Mod\Staff\Event\BeforeAdminStaffPasswordChangeEvent;
+use Box\Mod\Staff\Event\BeforeAdminStaffUpdateEvent;
 use Box\Mod\Staff\Repository\AdminGroupMemberRepository;
 use Box\Mod\Staff\Repository\AdminGroupRepository;
+use Box\Mod\Staff\Repository\AdminPasswordResetRepository;
+use Box\Mod\Staff\Repository\AdminRepository;
 use Box\Mod\Support\Entity\Helpdesk;
 use Box\Mod\Support\Entity\SupportTicket;
-use FOSSBilling\i18n;
-use FOSSBilling\InjectionAwareInterface;
-use FOSSBilling\PaginationOptions;
-use FOSSBilling\Tools;
+use Box\Mod\Support\Event\AfterTicketClosedEvent;
+use Box\Mod\Support\Event\AfterTicketOpenedEvent;
+use Box\Mod\Support\Event\AfterTicketRepliedEvent;
+use Box\Mod\Support\Event\TicketActorRole;
+use Doctrine\DBAL\Exception\UniqueConstraintViolationException;
+use FOSSBilling\Core\Container\InjectionAwareInterface;
+use FOSSBilling\Core\I18n\I18n;
+use FOSSBilling\Core\Pagination\Options;
+use FOSSBilling\Core\SortOptions;
+use Symfony\Component\EventDispatcher\Attribute\AsEventListener;
 
 class Service implements InjectionAwareInterface
 {
@@ -30,6 +53,7 @@ class Service implements InjectionAwareInterface
 
     private AdminGroupRepository $adminGroupRepository;
     private AdminGroupMemberRepository $adminGroupMemberRepository;
+    private AdminPasswordResetRepository $adminPasswordResetRepository;
 
     protected ?\Pimple\Container $di = null;
 
@@ -38,6 +62,7 @@ class Service implements InjectionAwareInterface
         $this->di = $di;
         $this->adminGroupRepository = $di['em']->getRepository(AdminGroup::class);
         $this->adminGroupMemberRepository = $di['em']->getRepository(AdminGroupMember::class);
+        $this->adminPasswordResetRepository = $di['em']->getRepository(AdminPasswordReset::class);
     }
 
     public function getDi(): ?\Pimple\Container
@@ -104,31 +129,27 @@ class Service implements InjectionAwareInterface
 
     public function login($email, $password, $ip): array
     {
-        $event_params = [];
-        $event_params['email'] = $email;
-        $event_params['ip'] = $ip;
-
-        $this->di['events_manager']->fire(['event' => 'onBeforeAdminLogin', 'params' => $event_params]);
+        $this->di['event_dispatcher']->dispatch(new BeforeAdminLoginEvent($ip));
 
         $model = $this->authorizeAdmin($email, $password);
-        if (!$model instanceof \Model_Admin) {
-            $this->di['events_manager']->fire(['event' => 'onEventAdminLoginFailed', 'params' => $event_params]);
+        if (!$model instanceof Admin) {
+            $this->di['event_dispatcher']->dispatch(new AdminLoginFailedEvent($ip));
 
-            throw new \FOSSBilling\InformationException('Check your login details', null, 403);
+            throw new \FOSSBilling\Core\Exception\InformationException('Check your login details', null, 403);
         }
 
-        $this->di['events_manager']->fire(['event' => 'onAfterAdminLogin', 'params' => ['id' => $model->id, 'ip' => $ip]]);
+        $this->di['event_dispatcher']->dispatch(new AfterAdminLoginEvent((int) $model->getId(), $ip));
 
         $result = [
-            'id' => $model->id,
-            'email' => $model->email,
-            'name' => $model->name,
+            'id' => $model->getId(),
+            'email' => $model->getEmail(),
+            'name' => $model->getName(),
         ];
 
         $this->di['session']->regenerateId();
         $this->di['session']->set('admin', $result);
 
-        $this->di['logger']->info(sprintf('Staff member %s logged in', $model->id));
+        $this->di['logger']->info('Staff member {admin_id} logged in', ['admin_id' => $model->getId()]);
 
         return $result;
     }
@@ -147,7 +168,7 @@ class Service implements InjectionAwareInterface
 
         $sql .= sprintf(' ORDER BY name ASC LIMIT %u', $limit);
 
-        return $this->di['dbal']->fetchAllKeyValue($sql, $params);
+        return $this->di['em']->getConnection()->fetchAllKeyValue($sql, $params);
     }
 
     public function getPermissions($member_id): array
@@ -168,30 +189,28 @@ class Service implements InjectionAwareInterface
     /**
      * Determines if a staff member has the required permissions.
      *
-     * @param \Model_Admin|null $member     The model for the staff member to check. If you pass null, FOSSBilling will automatically get the currently authenticated staff member.
-     * @param string            $module     what module to check permission for
-     * @param string|null       $key        the permission key for the associated module
-     * @param mixed             $constraint if the permission key allows for multiple options, specify the one you want to use as a constraint here
+     * @param Admin|null  $member     The entity for the staff member to check. If you pass null, FOSSBilling will automatically get the currently authenticated staff member.
+     * @param string      $module     what module to check permission for
+     * @param string|null $key        the permission key for the associated module
+     * @param mixed       $constraint if the permission key allows for multiple options, specify the one you want to use as a constraint here
      */
-    public function hasPermission(?\Model_Admin $member, string $module, ?string $key = null, mixed $constraint = null): bool
+    public function hasPermission(?Admin $member, string $module, ?string $key = null, mixed $constraint = null): bool
     {
         $alwaysAllowed = ['index', 'dashboard', 'profile'];
 
-        if (is_null($member)) {
-            $member = $this->getLoggedInAdminOrCronAdmin();
-        }
+        $member ??= $this->getLoggedInAdminOrCronAdmin();
 
         if ($member->isCron() || in_array($module, $alwaysAllowed)) {
             return true;
         }
 
-        if ($this->isSuperAdministrator($member->id)) {
+        if ($this->isSuperAdministrator($member->getId())) {
             return true;
         }
 
         $extensionService = $this->di['mod_service']('Extension');
         $modulePermissions = $extensionService->getSpecificModulePermissions($module);
-        $permissions = $this->getPermissions($member->id);
+        $permissions = $this->getPermissions($member->getId());
         $canAlwaysAccess = $modulePermissions['can_always_access'] ?? false;
 
         if (!$canAlwaysAccess) {
@@ -226,27 +245,30 @@ class Service implements InjectionAwareInterface
     /**
      * Acts as an alias to `hasPermission`, but it'll also throw an exception stating the staff member doesn't have permission if they don't.
      *
-     * @param string            $module     what module to check permission for
-     * @param string|null       $key        the permission key for the associated module
-     * @param mixed             $constraint if the permission key allows for multiple options, specify the one you want to use as a constraint here
-     * @param \Model_Admin|null $member     the staff member to check permissions for, or null to use the currently logged-in staff member
+     * @param string      $module     what module to check permission for
+     * @param string|null $key        the permission key for the associated module
+     * @param mixed       $constraint if the permission key allows for multiple options, specify the one you want to use as a constraint here
+     * @param Admin|null  $member     the staff member to check permissions for, or null to use the currently logged-in staff member
      */
-    public function checkPermissionsAndThrowException(string $module, ?string $key = null, mixed $constraint = null, ?\Model_Admin $member = null): void
+    public function checkPermissionsAndThrowException(string $module, ?string $key = null, mixed $constraint = null, ?Admin $member = null): void
     {
         if (!$this->hasPermission($member, $module, $key, $constraint)) {
             $requiredPermission = is_null($key) ? $module : "{$module}.{$key}";
 
-            throw new \FOSSBilling\InformationException("You need the \"{$requiredPermission}\" permission to perform this action", [], 403);
+            throw new \FOSSBilling\Core\Exception\InformationException("You need the \"{$requiredPermission}\" permission to perform this action", [], 403);
         }
     }
 
-    public static function onAfterClientOrderCreate(\Box_Event $event): void
+    #[AsEventListener]
+    public function notifyStaffAfterClientOrderCreate(AfterClientOrderCreateEvent $event): void
     {
-        $di = $event->getDi();
-        $params = $event->getParameters();
+        $di = $this->di ?? throw new \LogicException('Staff service must be initialized before handling events.');
 
         try {
-            $orderModel = $di['db']->load('ClientOrder', $params['id']);
+            $orderModel = $di['em']->getRepository(\Box\Mod\Order\Entity\Order::class)->find($event->orderId);
+            if (!$orderModel instanceof \Box\Mod\Order\Entity\Order) {
+                return;
+            }
             $orderTicketService = $di['mod_service']('order');
             $order = $orderTicketService->toApiArray($orderModel, true);
 
@@ -257,19 +279,19 @@ class Service implements InjectionAwareInterface
             $emailService = $di['mod_service']('email');
             $emailService->sendTemplate($email);
         } catch (\Exception $exc) {
-            $di['logger']->setChannel('email')->error('Failed to send staff order notification email', ['exception' => $exc->getMessage()]);
+            $di['logger']->withChannel('email')->error('Failed to send staff order notification email', ['exception' => $exc]);
         }
     }
 
-    public static function onAfterAdminOrderSuspend(\Box_Event $event): void
+    #[AsEventListener]
+    public function notifyStaffAfterOrderSuspend(AfterAdminOrderSuspendEvent $event): void
     {
-        $di = $event->getDi();
-        $params = $event->getParameters();
+        $di = $this->di ?? throw new \LogicException('Staff service must be initialized before handling events.');
 
         try {
-            $order = $di['em']->getRepository(\Box\Mod\Order\Entity\Order::class)->find((int) $params['id']);
+            $order = $di['em']->getRepository(\Box\Mod\Order\Entity\Order::class)->find($event->orderId);
             if (!$order instanceof \Box\Mod\Order\Entity\Order) {
-                throw new \FOSSBilling\Exception('Order not found');
+                throw new \FOSSBilling\Core\Exception\BaseException('Order not found');
             }
 
             $orderService = $di['mod_service']('order');
@@ -280,20 +302,24 @@ class Service implements InjectionAwareInterface
                 'order' => $orderService->toApiArray($order, false),
             ]);
         } catch (\Throwable $exception) {
-            $di['logger']->setChannel('email')->error('Failed to send staff order suspension notification email', [
-                'exception' => $exception->getMessage(),
+            $di['logger']->withChannel('email')->error('Failed to send staff order suspension notification email', [
+                'exception' => $exception,
             ]);
         }
     }
 
-    public static function onAfterClientOpenTicket(\Box_Event $event): void
+    #[AsEventListener]
+    public function notifyStaffAfterTicketOpened(AfterTicketOpenedEvent $event): void
     {
-        $di = $event->getDi();
-        $params = $event->getParameters();
+        if ($event->actor === TicketActorRole::ADMIN) {
+            return;
+        }
+
+        $di = $this->di ?? throw new \LogicException('The Staff service dependency injection container has not been set.');
 
         try {
             $supportTicketService = $di['mod_service']('support');
-            $ticketModel = $supportTicketService->getTicketById((int) $params['id']);
+            $ticketModel = $supportTicketService->getTicketById($event->ticketId);
             $ticket = self::getTicketEmailVars($di, $ticketModel);
 
             $helpdeskId = $ticketModel->getSupportHelpdeskId();
@@ -315,18 +341,22 @@ class Service implements InjectionAwareInterface
             $email['ticket'] = $ticket;
             $emailService->sendTemplate($email);
         } catch (\Exception $exc) {
-            $di['logger']->setChannel('email')->error('Failed to send staff ticket notification email', ['exception' => $exc->getMessage()]);
+            $di['logger']->withChannel('email')->error('Failed to send staff ticket notification email', ['exception' => $exc]);
         }
     }
 
-    public static function onAfterClientReplyTicket(\Box_Event $event): void
+    #[AsEventListener]
+    public function notifyStaffAfterTicketReplied(AfterTicketRepliedEvent $event): void
     {
-        $params = $event->getParameters();
-        $di = $event->getDi();
+        if ($event->actor === TicketActorRole::ADMIN) {
+            return;
+        }
+
+        $di = $this->di ?? throw new \LogicException('The Staff service dependency injection container has not been set.');
 
         try {
             $supportTicketService = $di['mod_service']('support');
-            $ticketModel = $supportTicketService->getTicketById((int) $params['id']);
+            $ticketModel = $supportTicketService->getTicketById($event->ticketId);
             $ticket = self::getTicketEmailVars($di, $ticketModel);
 
             $email = [];
@@ -337,18 +367,22 @@ class Service implements InjectionAwareInterface
             $emailService = $di['mod_service']('email');
             $emailService->sendTemplate($email);
         } catch (\Exception $exc) {
-            $di['logger']->setChannel('email')->error('Failed to send staff ticket reply notification email', ['exception' => $exc->getMessage()]);
+            $di['logger']->withChannel('email')->error('Failed to send staff ticket reply notification email', ['exception' => $exc]);
         }
     }
 
-    public static function onAfterClientCloseTicket(\Box_Event $event): void
+    #[AsEventListener]
+    public function notifyStaffAfterTicketClosed(AfterTicketClosedEvent $event): void
     {
-        $params = $event->getParameters();
-        $di = $event->getDi();
+        if ($event->actor === TicketActorRole::ADMIN) {
+            return;
+        }
+
+        $di = $this->di ?? throw new \LogicException('The Staff service dependency injection container has not been set.');
 
         try {
             $supportTicketService = $di['mod_service']('support');
-            $ticketModel = $supportTicketService->getTicketById((int) $params['id']);
+            $ticketModel = $supportTicketService->getTicketById($event->ticketId);
             $ticket = self::getTicketEmailVars($di, $ticketModel);
             $email = [];
             $email['to_staff'] = true;
@@ -358,7 +392,7 @@ class Service implements InjectionAwareInterface
             $emailService = $di['mod_service']('email');
             $emailService->sendTemplate($email);
         } catch (\Exception $exc) {
-            $di['logger']->setChannel('email')->error('Failed to send staff ticket close notification email', ['exception' => $exc->getMessage()]);
+            $di['logger']->withChannel('email')->error('Failed to send staff ticket close notification email', ['exception' => $exc]);
         }
     }
 
@@ -373,19 +407,25 @@ class Service implements InjectionAwareInterface
 
             try {
                 $client = $clientService->get(['id' => $clientId]);
-            } catch (\FOSSBilling\InformationException) {
+            } catch (\FOSSBilling\Core\Exception\InformationException) {
                 return $ticket;
             }
-            $ticket['client'] = $clientService->toApiArray($client);
+            $clientDetails = $clientService->toApiArray($client);
+            $ticket['client'] = array_intersect_key($clientDetails, array_flip([
+                'id',
+                'email',
+                'first_name',
+                'last_name',
+            ]));
         }
 
         return $ticket;
     }
 
-    public static function onAfterClientSignUp(\Box_Event $event): bool
+    #[AsEventListener]
+    public function onAfterClientSignUp(AfterClientSignUpEvent $event): void
     {
-        $params = $event->getParameters();
-        $di = $event->getDi();
+        $di = $this->di ?? throw new \LogicException('Staff service must be initialized before handling events.');
 
         try {
             $clientService = $di['mod_service']('client');
@@ -393,165 +433,202 @@ class Service implements InjectionAwareInterface
             $email = [];
             $email['to_staff'] = true;
             $email['code'] = 'mod_staff_client_signup';
-            $client = $clientService->get(['id' => $params['id']]);
+            $client = $clientService->get(['id' => $event->clientId]);
             $email['c'] = $clientService->toApiArray($client);
             $emailService = $di['mod_service']('email');
             $emailService->sendTemplate($email);
         } catch (\Exception $exc) {
-            $di['logger']->setChannel('email')->error('Failed to send staff client signup notification email', ['exception' => $exc->getMessage()]);
+            $di['logger']->withChannel('email')->error('Failed to send staff client signup notification email', ['exception' => $exc]);
         }
-
-        return true;
     }
 
     public function getList($data)
     {
         [$query, $params] = $this->getSearchQuery($data);
 
-        return $this->di['pager']->getPaginatedResultSet($query, $params, PaginationOptions::fromArray($data));
+        return $this->di['pager']->getPaginatedResultSet($query, $params, Options::fromArray($data));
     }
 
     public function getSearchQuery($data): array
     {
-        $query = 'SELECT * FROM admin';
+        // `admin` also holds `pass` and `api_token` - list columns explicitly instead of
+        // `SELECT *` so listing never exposes them.
+        $query = 'SELECT id, system_name, email, name, signature, status, timezone, created_at, updated_at FROM admin';
 
         $id = $data['id'] ?? null;
         $search = $data['search'] ?? null;
         $status = $data['status'] ?? null;
-        $no_cron = Tools::normalizeBoolean($data['no_cron'] ?? null, true);
+        $no_cron = \FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($data['no_cron'] ?? null, true);
 
         $where = [];
         $bindings = [];
 
         if ($id !== null && $id !== '') {
             $where[] = 'id = :id';
-            $bindings[':id'] = (int) $id;
+            $bindings['id'] = (int) $id;
         }
 
         if ($search) {
             $search = "%$search%";
             $where[] = '(name LIKE :name OR email LIKE :email )';
-            $bindings[':name'] = $search;
-            $bindings[':email'] = $search;
+            $bindings['name'] = $search;
+            $bindings['email'] = $search;
         }
 
         if ($status) {
             $where[] = 'status = :status';
-            $bindings[':status'] = $status;
+            $bindings['status'] = $status;
         }
 
         if ($no_cron) {
             $where[] = '(system_name IS NULL OR system_name != :system_name)';
-            $bindings[':system_name'] = \Model_Admin::SYSTEM_CRON;
+            $bindings['system_name'] = Admin::SYSTEM_CRON;
         }
 
         if (!empty($where)) {
             $query = $query . ' WHERE ' . implode(' AND ', $where);
         }
-        $query .= ' ORDER BY id ASC';
+
+        $sort = SortOptions::fromArray($data, [
+            'id' => 'id',
+            'email' => 'email',
+            'name' => 'name',
+            'status' => 'status',
+            'created_at' => 'created_at',
+            'updated_at' => 'updated_at',
+        ]);
+        $orderBy = $sort->toOrderByClause('id') ?? 'id ASC';
+        $query .= " ORDER BY {$orderBy}";
 
         return [$query, $bindings];
     }
 
-    /**
-     * @return \Model_Admin
-     */
-    public function getCronAdmin()
+    public function getCronAdmin(): Admin
     {
-        $cron = $this->di['db']->findOne('Admin', 'system_name = :system_name', [':system_name' => \Model_Admin::SYSTEM_CRON]);
-        if ($cron instanceof \Model_Admin) {
+        $cron = $this->getAdminRepository()->findOneBy(['systemName' => Admin::SYSTEM_CRON]);
+        if ($cron instanceof Admin) {
             return $cron;
         }
 
-        $cronEmail = $this->di['tools']->generatePassword() . '@' . $this->di['tools']->generatePassword() . '.com';
+        $cronEmail = \FOSSBilling\Core\Security\Credential::generatePassword() . '@' . \FOSSBilling\Core\Security\Credential::generatePassword() . '.com';
         $cronEmail = filter_var($cronEmail, FILTER_SANITIZE_EMAIL);
 
-        $cronPass = $this->di['tools']->generatePassword(256, 4);
+        $cronPass = $this->di['password']->hashIt(\FOSSBilling\Core\Security\Credential::generatePassword(256, true));
 
-        $cron = $this->di['db']->dispense('Admin');
-        $cron->system_name = \Model_Admin::SYSTEM_CRON;
-        $cron->email = $cronEmail;
-        $cron->pass = $this->di['password']->hashIt($cronPass);
-        $cron->name = 'System Cron Job';
-        $cron->signature = '';
-        $cron->status = 'active';
-        $cron->created_at = date('Y-m-d H:i:s');
-        $cron->updated_at = date('Y-m-d H:i:s');
-        $this->di['db']->store($cron);
+        // Two cron runs can race to create the cron admin. Insert via the DBAL
+        // connection (not an ORM flush) so a constraint violation doesn't close the
+        // EntityManager for the rest of this cron run; on conflict, re-read the
+        // winner's row below.
+        $now = date('Y-m-d H:i:s');
+        $connection = $this->di['em']->getConnection();
 
-        return $cron;
+        try {
+            $connection->insert('admin', [
+                'system_name' => Admin::SYSTEM_CRON,
+                'email' => $cronEmail,
+                'pass' => $cronPass,
+                'name' => 'System Cron Job',
+                'signature' => '',
+                'status' => Admin::STATUS_ACTIVE,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ]);
+        } catch (UniqueConstraintViolationException) {
+            // A concurrent request created the cron admin; fall through to re-read it.
+        }
+
+        $cron = $this->getAdminRepository()->findOneBy(['systemName' => Admin::SYSTEM_CRON]);
+        if ($cron instanceof Admin) {
+            return $cron;
+        }
+
+        throw new \FOSSBilling\Core\Exception\BaseException('The cron administrator account could not be created');
     }
 
-    public function toModel_AdminApiArray(\Model_Admin $model, $deep = false): array
+    public function toApiArray(Admin $model, $deep = false): array
     {
         $data = [
-            'id' => $model->id,
-            'email' => $model->email,
-            'name' => $model->name,
-            'system_name' => $model->system_name,
-            'status' => $model->status,
-            'signature' => $model->signature,
-            'timezone' => $model->timezone,
-            'created_at' => $model->created_at,
-            'updated_at' => $model->updated_at,
+            'id' => $model->getId(),
+            'email' => $model->getEmail(),
+            'name' => $model->getName(),
+            'system_name' => $model->getSystemName(),
+            'status' => $model->getStatus(),
+            'signature' => $model->getSignature(),
+            'timezone' => $model->getTimezone(),
+            'created_at' => $model->getCreatedAt()?->format('Y-m-d H:i:s'),
+            'updated_at' => $model->getUpdatedAt()?->format('Y-m-d H:i:s'),
         ];
 
         $data['groups'] = array_map(
             static fn (AdminGroup $group): array => $group->toApiArray(),
-            $this->adminGroupMemberRepository->findGroupsForAdmin((int) $model->id),
+            $this->adminGroupMemberRepository->findGroupsForAdmin((int) $model->getId()),
         );
 
         return $data;
     }
 
-    public function update(\Model_Admin $model, $data): bool
+    public function update(Admin $model, $data): bool
     {
-        $this->di['events_manager']->fire(['event' => 'onBeforeAdminStaffUpdate', 'params' => ['id' => $model->id]]);
+        $this->di['event_dispatcher']->dispatch(new BeforeAdminStaffUpdateEvent((int) $model->getId()));
 
         $this->checkPermissionsAndThrowException('staff', 'create_and_edit_staff');
 
-        $previousStatus = $model->status;
-        $newStatus = $data['status'] ?? $model->status;
+        $previousStatus = $model->getStatus();
+        $newStatus = strtolower((string) ($data['status'] ?? $model->getStatus()));
+        if (!in_array($newStatus, [Admin::STATUS_ACTIVE, Admin::STATUS_INACTIVE], true)) {
+            $newStatus = Admin::STATUS_ACTIVE;
+        }
 
-        if ((int) $this->di['loggedin_admin']->id === (int) $model->id && $previousStatus === \Model_Admin::STATUS_ACTIVE && $newStatus !== \Model_Admin::STATUS_ACTIVE) {
-            throw new \FOSSBilling\InformationException('You cannot deactivate your own staff account');
+        if ((int) $this->di['loggedin_admin']->getId() === (int) $model->getId() && $previousStatus === Admin::STATUS_ACTIVE && $newStatus !== Admin::STATUS_ACTIVE) {
+            throw new \FOSSBilling\Core\Exception\InformationException('You cannot deactivate your own staff account');
         }
 
         $this->assertCanManageAdmin($model);
 
-        if ($previousStatus === \Model_Admin::STATUS_ACTIVE && $newStatus !== \Model_Admin::STATUS_ACTIVE) {
+        if ($previousStatus === Admin::STATUS_ACTIVE && $newStatus !== Admin::STATUS_ACTIVE) {
             $this->assertCanRemoveActiveSuperAdministrator($model);
         }
 
-        $model->email = $data['email'] ?? $model->email;
-        $model->name = $data['name'] ?? $model->name;
-        $model->status = $newStatus;
-        if ($model->status === \Model_Admin::STATUS_INACTIVE) {
-            $model->api_token = null;
+        $oldEmail = $model->getEmail();
+        $model->setEmail($data['email'] ?? $model->getEmail());
+        $model->setName($data['name'] ?? $model->getName());
+        $model->setStatus($newStatus);
+        if ($model->getStatus() === Admin::STATUS_INACTIVE) {
+            $model->setApiToken(null);
         }
-        $model->signature = $data['signature'] ?? $model->signature;
+        $model->setSignature($data['signature'] ?? $model->getSignature());
         if (array_key_exists('timezone', $data)) {
-            $model->timezone = i18n::validateTimezone($data['timezone']);
+            $model->setTimezone(I18n::validateTimezone($data['timezone']));
         }
-        $model->updated_at = date('Y-m-d H:i:s');
-        $this->di['db']->store($model);
 
-        if ($model->status !== \Model_Admin::STATUS_ACTIVE && $previousStatus === \Model_Admin::STATUS_ACTIVE) {
+        try {
+            $this->di['em']->persist($model);
+            $this->di['em']->flush();
+        } catch (UniqueConstraintViolationException) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Staff member with email :email is already registered.', [':email' => $model->getEmail()], 788954);
+        }
+
+        // An email edit revokes reset links sent to the old address.
+        if ($model->getEmail() !== $oldEmail) {
+            $this->adminPasswordResetRepository->deleteResetsForAdmin((int) $model->getId());
+        }
+
+        if ($model->getStatus() !== Admin::STATUS_ACTIVE && $previousStatus === Admin::STATUS_ACTIVE) {
             $profileService = $this->di['mod_service']('profile');
-            $profileService->invalidateSessions('admin', (int) $model->id);
+            $profileService->invalidateSessions('admin', (int) $model->getId());
         }
 
-        $this->di['events_manager']->fire(['event' => 'onAfterAdminStaffUpdate', 'params' => ['id' => $model->id]]);
+        $this->di['event_dispatcher']->dispatch(new AfterAdminStaffUpdateEvent((int) $model->getId()));
 
-        $this->di['logger']->info('Updated staff member #%s "%s" details; status is "%s"', $model->id, $model->name, $model->status);
+        $this->di['logger']->info('Updated staff member #{model_id} "{model_name}" details; status is "{model_status}"', ['model_id' => $model->getId(), 'model_name' => $model->getName(), 'model_status' => $model->getStatus()]);
 
         return true;
     }
 
-    public function delete(\Model_Admin $model): bool
+    public function delete(Admin $model): bool
     {
         if ($model->isCron()) {
-            throw new \FOSSBilling\InformationException('The cron administrator account cannot be removed');
+            throw new \FOSSBilling\Core\Exception\InformationException('The cron administrator account cannot be removed');
         }
 
         $this->checkPermissionsAndThrowException('staff', 'delete_staff');
@@ -559,37 +636,39 @@ class Service implements InjectionAwareInterface
 
         $this->assertCanRemoveActiveSuperAdministrator($model);
 
-        $this->di['events_manager']->fire(['event' => 'onBeforeAdminStaffDelete', 'params' => ['id' => $model->id]]);
+        $this->di['event_dispatcher']->dispatch(new BeforeAdminStaffDeleteEvent((int) $model->getId()));
 
-        $id = $model->id;
-        $name = $model->name;
-        $this->adminGroupMemberRepository->deleteMembershipsForAdmin((int) $id);
-        $this->di['db']->trash($model);
+        $id = $model->getId();
+        $name = $model->getName();
+        $this->di['em']->wrapInTransaction(function () use ($model, $id): void {
+            $this->adminGroupMemberRepository->deleteMembershipsForAdmin((int) $id);
+            $this->adminPasswordResetRepository->deleteResetsForAdmin((int) $id);
+            $this->di['em']->remove($model);
+            $this->di['em']->flush();
+        });
 
-        $this->di['events_manager']->fire(['event' => 'onAfterAdminStaffDelete', 'params' => ['id' => $id]]);
+        $this->di['event_dispatcher']->dispatch(new AfterAdminStaffDeleteEvent((int) $id));
 
-        $this->di['logger']->info('Deleted staff member #%s "%s"', $id, $name);
+        $this->di['logger']->info('Deleted staff member #{id} "{name}"', ['id' => $id, 'name' => $name]);
 
         return true;
     }
 
-    public function changePassword(\Model_Admin $model, $password): bool
+    public function changePassword(Admin $model, $password): bool
     {
         $this->checkPermissionsAndThrowException('staff', 'reset_staff_password');
         $this->assertCanManageAdmin($model);
 
-        $this->di['events_manager']->fire(['event' => 'onBeforeAdminStaffPasswordChange', 'params' => ['id' => $model->id]]);
+        $this->di['event_dispatcher']->dispatch(new BeforeAdminStaffPasswordChangeEvent((int) $model->getId()));
 
-        $model->pass = $this->di['password']->hashIt($password);
-        $model->updated_at = date('Y-m-d H:i:s');
-        $this->di['db']->store($model);
+        $this->adminPasswordResetRepository->changePassword($model, $this->di['password']->hashIt($password));
 
         $profileService = $this->di['mod_service']('profile');
-        $profileService->invalidateSessions('admin', (int) $model->id);
+        $profileService->invalidateSessions('admin', (int) $model->getId());
 
-        $this->di['events_manager']->fire(['event' => 'onAfterAdminStaffPasswordChange', 'params' => ['id' => $model->id]]);
+        $this->di['event_dispatcher']->dispatch(new AfterAdminStaffPasswordChangeEvent((int) $model->getId()));
 
-        $this->di['logger']->info('Changed password for staff member #%s "%s"', $model->id, $model->name);
+        $this->di['logger']->info('Changed password for staff member #{model_id} "{model_name}"', ['model_id' => $model->getId(), 'model_name' => $model->getName()]);
 
         return true;
     }
@@ -601,48 +680,51 @@ class Service implements InjectionAwareInterface
         $signature = $data['signature'] ?? null;
         $groupId = (int) ($data['group_id'] ?? 0);
         if ($groupId <= 0) {
-            throw new \FOSSBilling\InformationException('Group ID was not passed');
+            throw new \FOSSBilling\Core\Exception\InformationException('Group ID was not passed');
         }
 
         $group = $this->adminGroupRepository->findById($groupId);
         if (!$group instanceof AdminGroup) {
-            throw new \FOSSBilling\InformationException('Group not found');
+            throw new \FOSSBilling\Core\Exception\InformationException('Group not found');
         }
 
         $this->assertCanManageGroup($group);
 
-        $this->di['events_manager']->fire(['event' => 'onBeforeAdminStaffCreate', 'params' => $data]);
+        $eventInput = array_intersect_key($data, array_flip(['email', 'name', 'status', 'signature', 'timezone', 'group_id']));
+        $this->di['event_dispatcher']->dispatch(new BeforeAdminStaffCreateEvent($eventInput));
 
-        $model = $this->di['db']->dispense('Admin');
-        $model->email = $data['email'];
-        $model->pass = $this->di['password']->hashIt($data['password']);
-        $model->name = $data['name'];
-        $model->status = $model->getStatus($data['status']);
-        $model->signature = $signature;
-        $model->timezone = i18n::validateTimezone($data['timezone'] ?? null);
-        $model->created_at = date('Y-m-d H:i:s');
-        $model->updated_at = date('Y-m-d H:i:s');
+        $model = new Admin();
+        $model->setEmail($data['email']);
+        $model->setPass($this->di['password']->hashIt($data['password']));
+        $model->setName($data['name']);
+        $model->setStatus(strtolower((string) ($data['status'] ?? Admin::STATUS_INACTIVE)));
+        $model->setSignature($signature);
+        $model->setTimezone(I18n::validateTimezone($data['timezone'] ?? null));
 
         try {
-            $newId = $this->di['db']->store($model);
-        } catch (\RedBeanPHP\RedException) {
-            throw new \FOSSBilling\InformationException('Staff member with email :email is already registered.', [':email' => $data['email']], 788954);
+            $this->di['em']->wrapInTransaction(function () use ($model, $group): void {
+                $this->di['em']->persist($model);
+                $this->di['em']->flush();
+                $this->di['em']->persist(new AdminGroupMember($model, $group));
+                $this->di['em']->flush();
+            });
+        } catch (UniqueConstraintViolationException) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Staff member with email :email is already registered.', [':email' => $data['email']], 788954);
         }
 
-        $this->di['em']->persist(new AdminGroupMember((int) $newId, $group));
-        $this->di['em']->flush();
+        $newId = (int) $model->getId();
 
-        $this->di['events_manager']->fire(['event' => 'onAfterAdminStaffCreate', 'params' => ['id' => $newId]]);
+        $this->di['event_dispatcher']->dispatch(new AfterAdminStaffCreateEvent($newId));
 
-        $this->di['logger']->info('Created staff member #%s "%s" in group #%s "%s"', $newId, $model->name, $groupId, $group->getName());
+        $this->di['logger']->info('Created staff member #{admin_id} "{model_name}" in group #{group_id} "{group_name}"', ['admin_id' => $newId, 'model_name' => $model->getName(), 'group_id' => $groupId, 'group_name' => $group->getName()]);
 
-        return (int) $newId;
+        return $newId;
     }
 
     public function createGroup(string $name, ?AdminGroup $parent = null): int
     {
         if (!$this->isSuperAdministrator()) {
-            throw new \FOSSBilling\InformationException('Only super administrators can manage staff groups', [], 403);
+            throw new \FOSSBilling\Core\Exception\InformationException('Only super administrators can manage staff groups', [], 403);
         }
 
         $parent ??= $this->adminGroupRepository->findSuperAdministratorGroup();
@@ -654,7 +736,7 @@ class Service implements InjectionAwareInterface
         $this->di['em']->persist($group);
         $this->di['em']->flush();
 
-        $this->di['logger']->info('Created staff group #%s "%s" under parent group #%s "%s"', $group->getId(), $group->getName(), $parent->getId(), $parent->getName());
+        $this->di['logger']->info('Created staff group #{group_id} "{group_name}" under parent group #{parent_id} "{parent_name}"', ['group_id' => $group->getId(), 'group_name' => $group->getName(), 'parent_id' => $parent->getId(), 'parent_name' => $parent->getName()]);
 
         return (int) $group->getId();
     }
@@ -662,32 +744,32 @@ class Service implements InjectionAwareInterface
     public function deleteGroup(AdminGroup $model): bool
     {
         if (!$this->isSuperAdministrator()) {
-            throw new \FOSSBilling\InformationException('Only super administrators can manage staff groups', [], 403);
+            throw new \FOSSBilling\Core\Exception\InformationException('Only super administrators can manage staff groups', [], 403);
         }
 
         $id = $model->getId();
         $name = $model->getName();
         if ($model->isProtected()) {
-            throw new \FOSSBilling\InformationException('Protected staff groups cannot be removed');
+            throw new \FOSSBilling\Core\Exception\InformationException('Protected staff groups cannot be removed');
         }
 
         if ($this->adminGroupMemberRepository->countMembersInGroup((int) $id) > 0) {
-            throw new \FOSSBilling\InformationException('Cannot remove group which has staff members');
+            throw new \FOSSBilling\Core\Exception\InformationException('Cannot remove group which has staff members');
         }
 
         if ($this->di['mod_service']('email')->getTemplateGroupRepository()->countTemplatesUsingGroup((int) $id) > 0) {
-            throw new \FOSSBilling\InformationException('Cannot remove group which is used to restrict email templates');
+            throw new \FOSSBilling\Core\Exception\InformationException('Cannot remove group which is used to restrict email templates');
         }
 
         if ($this->adminGroupRepository->getDescendantIdsForGroups([(int) $id]) !== []) {
-            throw new \FOSSBilling\InformationException('Cannot remove group which has child groups');
+            throw new \FOSSBilling\Core\Exception\InformationException('Cannot remove group which has child groups');
         }
 
         $this->di['em']->remove($model);
         $this->di['em']->flush();
         $this->permissionCache = [];
 
-        $this->di['logger']->info('Deleted staff group #%s "%s"', $id, $name);
+        $this->di['logger']->info('Deleted staff group #{id} "{name}"', ['id' => $id, 'name' => $name]);
 
         return true;
     }
@@ -695,11 +777,11 @@ class Service implements InjectionAwareInterface
     public function updateGroup(AdminGroup $model, array $data): bool
     {
         if (!$this->isSuperAdministrator()) {
-            throw new \FOSSBilling\InformationException('Only super administrators can manage staff groups', [], 403);
+            throw new \FOSSBilling\Core\Exception\InformationException('Only super administrators can manage staff groups', [], 403);
         }
 
         if ($model->isProtected()) {
-            throw new \FOSSBilling\InformationException('Protected staff groups cannot be modified');
+            throw new \FOSSBilling\Core\Exception\InformationException('Protected staff groups cannot be modified');
         }
 
         $parentChanged = array_key_exists('parent_id', $data);
@@ -711,20 +793,20 @@ class Service implements InjectionAwareInterface
 
         if (array_key_exists('parent_id', $data)) {
             if (empty($data['parent_id'])) {
-                throw new \FOSSBilling\InformationException('Staff groups must have a parent group');
+                throw new \FOSSBilling\Core\Exception\InformationException('Staff groups must have a parent group');
             }
 
             $parent = $this->adminGroupRepository->findById((int) $data['parent_id']);
             if (!$parent instanceof AdminGroup) {
-                throw new \FOSSBilling\InformationException('Parent group not found');
+                throw new \FOSSBilling\Core\Exception\InformationException('Parent group not found');
             }
 
             if ((int) $parent->getId() === (int) $model->getId()) {
-                throw new \FOSSBilling\InformationException('A group cannot be its own parent');
+                throw new \FOSSBilling\Core\Exception\InformationException('A group cannot be its own parent');
             }
 
             if ($this->adminGroupRepository->isDescendantOf((int) $parent->getId(), (int) $model->getId())) {
-                throw new \FOSSBilling\InformationException('A group cannot use one of its subgroups as parent');
+                throw new \FOSSBilling\Core\Exception\InformationException('A group cannot use one of its subgroups as parent');
             }
 
             $model->setParent($parent);
@@ -732,7 +814,7 @@ class Service implements InjectionAwareInterface
 
         if (array_key_exists('permissions', $data)) {
             if (!is_array($data['permissions'])) {
-                throw new \FOSSBilling\InformationException('Parameter "permissions" must be an array');
+                throw new \FOSSBilling\Core\Exception\InformationException('Parameter "permissions" must be an array');
             }
 
             unset($data['permissions']['_submitted']);
@@ -743,45 +825,39 @@ class Service implements InjectionAwareInterface
         $this->di['em']->flush();
         $this->permissionCache = [];
 
-        $this->di['logger']->info(
-            'Updated staff group #%s "%s"; parent changed: %s; permissions changed: %s',
-            $model->getId(),
-            $model->getName(),
-            $parentChanged ? 'yes' : 'no',
-            $permissionsChanged ? 'yes' : 'no',
-        );
+        $this->di['logger']->info('Updated staff group #{model_id} "{model_name}"; parent changed: {parent_changed}; permissions changed: {permissions_changed}', ['model_id' => $model->getId(), 'model_name' => $model->getName(), 'parent_changed' => $parentChanged ? 'yes' : 'no', 'permissions_changed' => $permissionsChanged ? 'yes' : 'no']);
 
         return true;
     }
 
-    public function addAdminToGroup(\Model_Admin $admin, AdminGroup $group): bool
+    public function addAdminToGroup(Admin $admin, AdminGroup $group): bool
     {
         $this->checkPermissionsAndThrowException('staff', 'manage_groups');
         $this->assertCanManageAdmin($admin);
         $this->assertCanManageGroup($group);
 
-        $adminId = (int) $admin->id;
+        $adminId = (int) $admin->getId();
         $groupId = (int) $group->getId();
         if ($this->adminGroupMemberRepository->findMembership($adminId, $groupId) instanceof AdminGroupMember) {
             return true;
         }
 
-        $this->di['em']->persist(new AdminGroupMember($adminId, $group));
+        $this->di['em']->persist(new AdminGroupMember($admin, $group));
         $this->di['em']->flush();
         $this->permissionCache = [];
 
-        $this->di['logger']->info('Added staff member #%s "%s" to group #%s "%s"', $adminId, $admin->name, $groupId, $group->getName());
+        $this->di['logger']->info('Added staff member #{admin_id} "{admin_name}" to group #{group_id} "{group_name}"', ['admin_id' => $adminId, 'admin_name' => $admin->getName(), 'group_id' => $groupId, 'group_name' => $group->getName()]);
 
         return true;
     }
 
-    public function removeAdminFromGroup(\Model_Admin $admin, AdminGroup $group): bool
+    public function removeAdminFromGroup(Admin $admin, AdminGroup $group): bool
     {
         $this->checkPermissionsAndThrowException('staff', 'manage_groups');
         $this->assertCanManageAdmin($admin);
         $this->assertCanManageGroup($group);
 
-        $adminId = (int) $admin->id;
+        $adminId = (int) $admin->getId();
         $groupId = (int) $group->getId();
         $membership = $this->adminGroupMemberRepository->findMembership($adminId, $groupId);
         if (!$membership instanceof AdminGroupMember) {
@@ -796,45 +872,45 @@ class Service implements InjectionAwareInterface
         $this->di['em']->flush();
         $this->permissionCache = [];
 
-        $this->di['logger']->info('Removed staff member #%s "%s" from group #%s "%s"', $adminId, $admin->name, $groupId, $group->getName());
+        $this->di['logger']->info('Removed staff member #{admin_id} "{admin_name}" from group #{group_id} "{group_name}"', ['admin_id' => $adminId, 'admin_name' => $admin->getName(), 'group_id' => $groupId, 'group_name' => $group->getName()]);
 
         return true;
     }
 
     public function isSuperAdministrator(int|string|null $memberId = null): bool
     {
-        $memberId ??= $this->di['loggedin_admin']->id;
+        $memberId ??= $this->di['loggedin_admin']->getId();
 
         return $this->adminGroupMemberRepository->adminBelongsToSystemGroup((int) $memberId, AdminGroup::SYSTEM_SUPER_ADMIN);
     }
 
-    private function actorBypassesHierarchy(\Model_Admin $actor): bool
+    private function actorBypassesHierarchy(Admin $actor): bool
     {
-        return $actor->isCron() || $this->isSuperAdministrator($actor->id);
+        return $actor->isCron() || $this->isSuperAdministrator($actor->getId());
     }
 
-    private function assertCanManageAdmin(\Model_Admin $target): void
+    private function assertCanManageAdmin(Admin $target): void
     {
         $actor = $this->di['loggedin_admin'];
         if ($this->actorBypassesHierarchy($actor)) {
             return;
         }
 
-        if ((int) $actor->id === (int) $target->id) {
-            throw new \FOSSBilling\InformationException('You cannot manage your own staff account here');
+        if ((int) $actor->getId() === (int) $target->getId()) {
+            throw new \FOSSBilling\Core\Exception\InformationException('You cannot manage your own staff account here');
         }
 
         if ($target->isCron()) {
-            throw new \FOSSBilling\InformationException('You can only manage staff accounts in lower groups');
+            throw new \FOSSBilling\Core\Exception\InformationException('You can only manage staff accounts in lower groups');
         }
 
-        $targetGroupIds = $this->adminGroupMemberRepository->getGroupIdsForAdmin((int) $target->id);
+        $targetGroupIds = $this->adminGroupMemberRepository->getGroupIdsForAdmin((int) $target->getId());
         if ($targetGroupIds === []) {
-            throw new \FOSSBilling\InformationException('You can only manage staff accounts in lower groups');
+            throw new \FOSSBilling\Core\Exception\InformationException('You can only manage staff accounts in lower groups');
         }
 
-        if (array_diff($targetGroupIds, $this->adminGroupRepository->getDescendantIdsForGroups($this->adminGroupMemberRepository->getGroupIdsForAdmin((int) $actor->id))) !== []) {
-            throw new \FOSSBilling\InformationException('You can only manage staff accounts in lower groups');
+        if (array_diff($targetGroupIds, $this->adminGroupRepository->getDescendantIdsForGroups($this->adminGroupMemberRepository->getGroupIdsForAdmin((int) $actor->getId()))) !== []) {
+            throw new \FOSSBilling\Core\Exception\InformationException('You can only manage staff accounts in lower groups');
         }
     }
 
@@ -845,23 +921,23 @@ class Service implements InjectionAwareInterface
             return;
         }
 
-        if (!in_array((int) $group->getId(), $this->adminGroupRepository->getDescendantIdsForGroups($this->adminGroupMemberRepository->getGroupIdsForAdmin((int) $actor->id)), true)) {
-            throw new \FOSSBilling\InformationException('You can only manage lower staff groups');
+        if (!in_array((int) $group->getId(), $this->adminGroupRepository->getDescendantIdsForGroups($this->adminGroupMemberRepository->getGroupIdsForAdmin((int) $actor->getId())), true)) {
+            throw new \FOSSBilling\Core\Exception\InformationException('You can only manage lower staff groups');
         }
     }
 
-    private function assertCanRemoveActiveSuperAdministrator(\Model_Admin $admin): void
+    private function assertCanRemoveActiveSuperAdministrator(Admin $admin): void
     {
-        if ($admin->status !== \Model_Admin::STATUS_ACTIVE) {
+        if ($admin->getStatus() !== Admin::STATUS_ACTIVE) {
             return;
         }
 
-        if (!$this->adminGroupMemberRepository->adminBelongsToSystemGroup((int) $admin->id, AdminGroup::SYSTEM_SUPER_ADMIN)) {
+        if (!$this->adminGroupMemberRepository->adminBelongsToSystemGroup((int) $admin->getId(), AdminGroup::SYSTEM_SUPER_ADMIN)) {
             return;
         }
 
         if ($this->adminGroupMemberRepository->countActiveMembersInSystemGroup(AdminGroup::SYSTEM_SUPER_ADMIN) <= 1) {
-            throw new \FOSSBilling\InformationException('Cannot remove the last active super administrator');
+            throw new \FOSSBilling\Core\Exception\InformationException('Cannot remove the last active super administrator');
         }
     }
 
@@ -917,7 +993,14 @@ class Service implements InjectionAwareInterface
         if (!empty($where)) {
             $sql .= ' WHERE ' . implode(' AND ', $where);
         }
-        $sql .= ' ORDER BY m.id DESC';
+
+        $sort = SortOptions::fromArray($data, [
+            'id' => 'm.id',
+            'ip' => 'm.ip',
+            'created_at' => 'm.created_at',
+        ]);
+        $orderBy = $sort->toOrderByClause('m.id') ?? 'm.id DESC';
+        $sql .= " ORDER BY {$orderBy}";
 
         return [$sql, $params];
     }
@@ -961,17 +1044,33 @@ class Service implements InjectionAwareInterface
         return $result;
     }
 
-    public function authorizeAdmin($email, $plainTextPassword)
+    public function authorizeAdmin($email, $plainTextPassword): ?Admin
     {
-        $model = $this->di['db']->findOne('Admin', 'email = ? AND status = ?', [$email, \Model_Admin::STATUS_ACTIVE]);
-        if ($model instanceof \Model_Admin && $model->isCron()) {
+        $model = $this->getAdminRepository()->findOneByEmailAndActive($email);
+        if ($model instanceof Admin && $model->isCron()) {
             $model = null;
         }
 
-        return $this->di['auth']->authorizeUser($model, $plainTextPassword);
+        if ($model === null) {
+            $this->di['password']->dummyVerify($plainTextPassword);
+
+            return null;
+        }
+
+        if ($this->di['password']->verify($plainTextPassword, $model->getPass())) {
+            if ($this->di['password']->needsRehash($model->getPass())) {
+                $model->setPass($this->di['password']->hashIt($plainTextPassword));
+                $this->di['em']->persist($model);
+                $this->di['em']->flush();
+            }
+
+            return $model;
+        }
+
+        return null;
     }
 
-    private function getLoggedInAdminOrCronAdmin(): \Model_Admin
+    private function getLoggedInAdminOrCronAdmin(): Admin
     {
         if (isset($this->di['auth']) && !$this->di['auth']->isAdminLoggedIn()) {
             if (isset($this->di['is_cron']) && $this->di['is_cron'] === true) {
@@ -980,5 +1079,10 @@ class Service implements InjectionAwareInterface
         }
 
         return $this->di['loggedin_admin'];
+    }
+
+    private function getAdminRepository(): AdminRepository
+    {
+        return $this->di['em']->getRepository(Admin::class);
     }
 }

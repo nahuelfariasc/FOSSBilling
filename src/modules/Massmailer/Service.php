@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 /**
- * Copyright 2022-2025 FOSSBilling
+ * Copyright 2022-2026 FOSSBilling
  * SPDX-License-Identifier: Apache-2.0.
  *
  * @copyright FOSSBilling (https://www.fossbilling.org)
@@ -11,15 +11,17 @@ declare(strict_types=1);
 
 namespace Box\Mod\Massmailer;
 
+use Box\Mod\Client\Enum\Status as ClientStatus;
 use Box\Mod\Massmailer\Entity\MassmailerMessage;
 use Box\Mod\Massmailer\Repository\MassmailerMessageRepository;
+use Box\Mod\Order\Enum\Status as OrderStatus;
 use Doctrine\DBAL\ArrayParameterType;
-use FOSSBilling\Enums\ClientOrderStatusEnum;
-use FOSSBilling\Enums\ClientStatusEnum;
-use FOSSBilling\Environment;
-use FOSSBilling\InformationException;
+use Doctrine\DBAL\ParameterType;
+use FOSSBilling\Core\Enums\ExtensionType;
+use FOSSBilling\Core\Exception\InformationException;
+use FOSSBilling\Core\System\Environment;
 
-class Service implements \FOSSBilling\InjectionAwareInterface
+class Service implements \FOSSBilling\Core\Container\InjectionAwareInterface
 {
     private const string FILTER_CLIENT_STATUS = 'client_status';
     private const string FILTER_CLIENT_GROUPS = 'client_groups';
@@ -32,17 +34,17 @@ class Service implements \FOSSBilling\InjectionAwareInterface
         self::FILTER_HAS_ORDER_WITH_STATUS,
     ];
     private const array CLIENT_STATUSES = [
-        ClientStatusEnum::ACTIVE->value,
-        ClientStatusEnum::SUSPENDED->value,
-        ClientStatusEnum::CANCELED->value,
+        ClientStatus::ACTIVE->value,
+        ClientStatus::SUSPENDED->value,
+        ClientStatus::CANCELED->value,
     ];
     private const array ORDER_STATUSES = [
-        ClientOrderStatusEnum::PENDING_SETUP->value,
-        ClientOrderStatusEnum::FAILED_SETUP->value,
-        ClientOrderStatusEnum::FAILED_RENEW->value,
-        ClientOrderStatusEnum::ACTIVE->value,
-        ClientOrderStatusEnum::CANCELED->value,
-        ClientOrderStatusEnum::SUSPENDED->value,
+        OrderStatus::PENDING_SETUP->value,
+        OrderStatus::FAILED_SETUP->value,
+        OrderStatus::FAILED_RENEW->value,
+        OrderStatus::ACTIVE->value,
+        OrderStatus::CANCELED->value,
+        OrderStatus::SUSPENDED->value,
     ];
 
     protected ?\Pimple\Container $di = null;
@@ -63,7 +65,7 @@ class Service implements \FOSSBilling\InjectionAwareInterface
     {
         if ($this->messageRepository === null) {
             if ($this->di === null) {
-                throw new \FOSSBilling\Exception('The dependency injection container has not been set.');
+                throw new \FOSSBilling\Core\Exception\BaseException('The dependency injection container has not been set.');
             }
 
             $this->messageRepository = $this->di['em']->getRepository(MassmailerMessage::class);
@@ -103,22 +105,14 @@ class Service implements \FOSSBilling\InjectionAwareInterface
     {
         $extensionService = $this->di['mod_service']('extension');
 
-        $sql = '
-        CREATE TABLE IF NOT EXISTS `mod_massmailer` (
-        `id` bigint(20) NOT NULL AUTO_INCREMENT,
-        `from_email` varchar(255) DEFAULT NULL,
-        `from_name` varchar(255) DEFAULT NULL,
-        `subject` varchar(255) DEFAULT NULL,
-        `content` text DEFAULT NULL,
-        `filter` text DEFAULT NULL,
-        `status` varchar(255) DEFAULT NULL,
-        `sent_at` varchar(35) DEFAULT NULL,
-        `created_at` varchar(35) DEFAULT NULL,
-        `updated_at` varchar(35) DEFAULT NULL,
-        PRIMARY KEY (`id`)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 AUTO_INCREMENT=1;
-        ';
-        $this->di['dbal']->executeStatement($sql);
+        // Raw MySQL-only DDL here (backticks, ENGINE=InnoDB) would fail outright on
+        // PostgreSQL/SQLite. mod_massmailer already exists in the pre-cutover schema, so this hook is
+        // already redundant on MySQL fresh installs - it's only load-bearing on PG/SQLite,
+        // where nothing else creates the table. SchemaSynchronizer::syncEntities() creates (or
+        // catches up) just this module's own table from current metadata, additively and
+        // safely, scoped so installing this one extension never reports every *other* table in
+        // the app as missing.
+        \FOSSBilling\Core\Doctrine\SchemaSynchronizer::syncEntities($this->di['em'], [MassmailerMessage::class]);
 
         // default config values
         $extensionService->setConfig(['ext' => 'mod_massmailer', 'limit' => '2', 'interval' => '10', 'test_client_id' => 1]);
@@ -133,36 +127,36 @@ class Service implements \FOSSBilling\InjectionAwareInterface
     {
         $filter = $this->normalizeFilter($model->getFilter(), true);
 
-        $query = $this->di['dbal']->createQueryBuilder();
+        $query = $this->di['em']->getConnection()->createQueryBuilder();
         $query
-            ->select('DISTINCT c.id')
+            ->select('DISTINCT c.id, c.email')
             ->from('client', 'c')
             ->leftJoin('c', 'client_order', 'co', 'co.client_id = c.id')
             ->orderBy('c.id', 'DESC');
+        $query
+            ->andWhere('c.email IS NOT NULL AND TRIM(c.email) != :empty_email')
+            ->setParameter('empty_email', '', ParameterType::STRING);
 
         $this->appendInCondition($query, 'c.status', 'client_status', $filter[self::FILTER_CLIENT_STATUS] ?? [], ArrayParameterType::STRING);
-        $this->appendInCondition($query, 'c.client_group_id', 'client_groups', $filter[self::FILTER_CLIENT_GROUPS] ?? [], ArrayParameterType::INTEGER);
+        $this->appendClientGroupCondition($query, $filter[self::FILTER_CLIENT_GROUPS] ?? []);
         $this->appendInCondition($query, 'co.product_id', 'has_order', $filter[self::FILTER_HAS_ORDER] ?? [], ArrayParameterType::INTEGER);
         $this->appendInCondition($query, 'co.status', 'has_order_with_status', $filter[self::FILTER_HAS_ORDER_WITH_STATUS] ?? [], ArrayParameterType::STRING);
 
-        return $query->executeQuery()->fetchAllAssociative();
+        $rows = $query->executeQuery()->fetchAllAssociative();
+
+        $validator = $this->di['validator'];
+
+        return array_values(array_map(
+            static fn (array $row): array => ['id' => (int) $row['id']],
+            array_filter(
+                $rows,
+                static fn (array $row): bool => $validator->isEmailValid(trim((string) $row['email']))
+            )
+        ));
     }
 
     public function normalizeFilter(mixed $filter, bool $strict = false): array
     {
-        if (is_string($filter)) {
-            $filter = trim($filter);
-            if ($filter === '') {
-                return [];
-            }
-
-            try {
-                $filter = json_decode($filter, true, 512, JSON_THROW_ON_ERROR);
-            } catch (\JsonException) {
-                return $this->handleInvalidFilter('filter', $strict);
-            }
-        }
-
         if ($filter === null) {
             return [];
         }
@@ -205,11 +199,6 @@ class Service implements \FOSSBilling\InjectionAwareInterface
         return array_filter($normalized, static fn (array $values): bool => $values !== []);
     }
 
-    public function serializeFilter(mixed $filter): string
-    {
-        return json_encode($this->normalizeFilter($filter, true), JSON_THROW_ON_ERROR);
-    }
-
     public function getParsed(MassmailerMessage $model, int $client_id): array
     {
         $clientService = $this->di['mod_service']('client');
@@ -219,23 +208,29 @@ class Service implements \FOSSBilling\InjectionAwareInterface
         $clientArr = $clientService->toApiArray($client, true, null);
 
         $vars = ['c' => $clientArr];
-        $ps = $systemService->renderEmailTplString($model->getSubject(), $vars);
-        $pc = $systemService->renderEmailTplString($model->getContent(), $vars);
+        $clientTimezone = !empty($clientArr['timezone']) ? (string) $clientArr['timezone'] : null;
+        $clientLocale = !empty($clientArr['lang']) ? (string) $clientArr['lang'] : null;
+        $ps = $systemService->renderEmailSubjectString($model->getSubject(), $vars, $clientTimezone, $clientLocale);
+        $pc = $systemService->renderEmailTplString($model->getContent(), $vars, $clientTimezone, $clientLocale);
 
         return [$ps, $pc];
     }
 
     public function sendMessage(MassmailerMessage $model, int $client_id, bool $sendNow = false): bool
     {
-        [$ps, $pc] = $this->getParsed($model, $client_id);
-
         $clientService = $this->di['mod_service']('client');
-
         $client = $clientService->get(['id' => $client_id]);
 
+        $email = trim((string) $client->getEmail());
+        if (!$this->di['validator']->isEmailValid($email)) {
+            throw new InformationException('Client does not have a valid email address');
+        }
+
+        [$ps, $pc] = $this->getParsed($model, $client_id);
+
         $data = [
-            'to' => $client->email,
-            'to_name' => $client->first_name . ' ' . $client->last_name,
+            'to' => $email,
+            'to_name' => $client->getFirstName() . ' ' . $client->getLastName(),
             'from' => $model->getFromEmail(),
             'from_name' => $model->getFromName(),
             'subject' => $ps,
@@ -244,14 +239,14 @@ class Service implements \FOSSBilling\InjectionAwareInterface
         ];
 
         $extensionService = $this->di['mod_service']('extension');
-        if ($extensionService->isExtensionActive('mod', 'demo')) {
+        if ($extensionService->isExtensionActive(ExtensionType::Module->value, 'demo')) {
             throw new InformationException('Disabled for security reasons (Demo mode enabled)');
         }
 
         if (!Environment::isProduction()) {
             // @phpstan-ignore if.alwaysFalse
             if (DEBUG) {
-                error_log('Skip email sending. Application ENV: ' . Environment::getCurrentEnvironment());
+                $this->di['logger']->debug('Skip email sending. Application ENV: ' . Environment::getCurrentEnvironment());
             }
 
             return true;
@@ -356,7 +351,7 @@ class Service implements \FOSSBilling\InjectionAwareInterface
 
     private function getExistingIds(string $table, array $ids): array
     {
-        $query = $this->di['dbal']->createQueryBuilder();
+        $query = $this->di['em']->getConnection()->createQueryBuilder();
         $query
             ->select('id')
             ->from($table)
@@ -379,6 +374,17 @@ class Service implements \FOSSBilling\InjectionAwareInterface
         $query
             ->andWhere(sprintf('%s IN (:%s)', $column, $parameterName))
             ->setParameter($parameterName, $filterValues, $parameterType);
+    }
+
+    private function appendClientGroupCondition(\Doctrine\DBAL\Query\QueryBuilder $query, array $filterValues): void
+    {
+        if ($filterValues === []) {
+            return;
+        }
+
+        $query
+            ->andWhere('EXISTS (SELECT 1 FROM client_group_members cgm WHERE cgm.client_id = c.id AND cgm.client_group_id IN (:client_groups))')
+            ->setParameter('client_groups', $filterValues, ArrayParameterType::INTEGER);
     }
 
     private function handleInvalidFilter(string $field, bool $strict): array

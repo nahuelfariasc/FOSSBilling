@@ -14,6 +14,8 @@ use Box\Mod\Order\Entity\Order;
 use Box\Mod\Order\Service as OrderService;
 use Box\Mod\Product\Entity\Product;
 use Box\Mod\Servicelicense\Entity\ServiceLicense;
+use Box\Mod\Servicelicense\Event\AfterServiceLicenseResetEvent;
+use Box\Mod\Servicelicense\Event\BeforeServiceLicenseResetEvent;
 use Box\Mod\Servicelicense\Repository\ServiceLicenseRepository;
 use Box\Mod\Servicelicense\Server;
 use Box\Mod\Servicelicense\Service;
@@ -21,8 +23,9 @@ use Doctrine\ORM\EntityManagerInterface;
 
 use function Tests\Helpers\container;
 use function Tests\Helpers\createEntity;
+use function Tests\Helpers\setEntityId;
 
-function serviceLicenseCreateProductEntity(string $config): Product
+function serviceLicenseCreateProductEntity(array $config): Product
 {
     $product = new Product();
     $product->setConfig($config);
@@ -32,7 +35,7 @@ function serviceLicenseCreateProductEntity(string $config): Product
 
 test('attach order config empty product config', function (): void {
     $service = new Service();
-    $productModel = serviceLicenseCreateProductEntity('{}');
+    $productModel = serviceLicenseCreateProductEntity([]);
     $data = [];
 
     $result = $service->attachOrderConfig($productModel, $data);
@@ -42,9 +45,9 @@ test('attach order config empty product config', function (): void {
 
 test('attach order config', function (): void {
     $service = new Service();
-    $productModel = serviceLicenseCreateProductEntity('["hello", "world"]');
+    $productModel = serviceLicenseCreateProductEntity(['hello', 'world']);
     $data = ['testing' => 'phase'];
-    $expected = array_merge(json_decode($productModel->getConfig() ?? '', true) ?? [], $data);
+    $expected = array_merge($productModel->getConfig() ?? [], $data);
 
     $result = $service->attachOrderConfig($productModel, $data);
     expect($result)->toBeArray();
@@ -59,8 +62,7 @@ test('get license plugins', function (): void {
 
 test('action create', function (): void {
     $service = new Service();
-    $clientOrderModel = new Model_ClientOrder();
-    $clientOrderModel->loadBean(new Tests\Helpers\DummyBean());
+    $clientOrderModel = createEntity(Order::class);
 
     $orderServiceMock = Mockery::mock(OrderService::class);
     $orderServiceMock->shouldReceive('getConfig')->atLeast()->once()->andReturn([]);
@@ -81,8 +83,7 @@ test('action create', function (): void {
 
 test('action activate', function (): void {
     $service = new Service();
-    $clientOrderModel = new Model_ClientOrder();
-    $clientOrderModel->loadBean(new Tests\Helpers\DummyBean());
+    $clientOrderModel = createEntity(Order::class);
 
     $serviceLicenseModel = new ServiceLicense();
     $serviceLicenseModel->setPlugin('Simple');
@@ -110,8 +111,7 @@ test('action activate', function (): void {
 
 test('action activate license collision', function (): void {
     $service = new Service();
-    $clientOrderModel = new Model_ClientOrder();
-    $clientOrderModel->loadBean(new Tests\Helpers\DummyBean());
+    $clientOrderModel = createEntity(Order::class);
 
     $serviceLicenseModel = new ServiceLicense();
     $serviceLicenseModel->setPlugin('Simple');
@@ -141,8 +141,7 @@ test('action activate license collision', function (): void {
 
 test('action activate license collision max iterations exception', function (): void {
     $service = new Service();
-    $clientOrderModel = new Model_ClientOrder();
-    $clientOrderModel->loadBean(new Tests\Helpers\DummyBean());
+    $clientOrderModel = createEntity(Order::class);
 
     $serviceLicenseModel = new ServiceLicense();
     $serviceLicenseModel->setPlugin('Simple');
@@ -165,13 +164,12 @@ test('action activate license collision max iterations exception', function (): 
     $service->setDi($di);
 
     expect(fn (): bool => $service->action_activate($clientOrderModel))
-        ->toThrow(FOSSBilling\Exception::class);
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class);
 });
 
 test('action activate plugin not found', function (): void {
     $service = new Service();
-    $clientOrderModel = new Model_ClientOrder();
-    $clientOrderModel->loadBean(new Tests\Helpers\DummyBean());
+    $clientOrderModel = createEntity(Order::class);
 
     $serviceLicenseModel = new ServiceLicense();
     $serviceLicenseModel->setPlugin('TestPlugin');
@@ -181,19 +179,18 @@ test('action activate plugin not found', function (): void {
     $orderServiceMock->shouldReceive('getOrderService')->atLeast()->once()->andReturn($serviceLicenseModel);
 
     $di = container();
-    $di['logger'] = new Box_Log();
+    $di['logger'] = new FOSSBilling\Core\Logging\Logger();
     $di['mod_service'] = $di->protect(fn (): Mockery\MockInterface => $orderServiceMock);
 
     $service->setDi($di);
 
     expect(fn (): bool => $service->action_activate($clientOrderModel))
-        ->toThrow(FOSSBilling\Exception::class, 'License plugin TestPlugin was not found.');
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class, 'License plugin TestPlugin was not found.');
 });
 
 test('action activate order activation exception', function (): void {
     $service = new Service();
-    $clientOrderModel = new Model_ClientOrder();
-    $clientOrderModel->loadBean(new Tests\Helpers\DummyBean());
+    $clientOrderModel = createEntity(Order::class);
 
     $orderServiceMock = Mockery::mock(OrderService::class);
     $orderServiceMock->shouldReceive('getConfig')->atLeast()->once()->andReturn([]);
@@ -205,13 +202,12 @@ test('action activate order activation exception', function (): void {
     $service->setDi($di);
 
     expect(fn (): bool => $service->action_activate($clientOrderModel))
-        ->toThrow(FOSSBilling\Exception::class, 'Could not find associated service license');
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class, 'Could not find associated service license');
 });
 
 test('action delete', function (): void {
     $service = new Service();
-    $clientOrderModel = new Model_ClientOrder();
-    $clientOrderModel->loadBean(new Tests\Helpers\DummyBean());
+    $clientOrderModel = createEntity(Order::class);
 
     $serviceLicenseModel = new ServiceLicense();
 
@@ -232,22 +228,39 @@ test('action delete', function (): void {
 
 test('reset', function (): void {
     $service = new Service();
-    $serviceLicenseModel = new ServiceLicense();
+    $serviceLicenseModel = (new ServiceLicense())->setClientId(17)->setIps(['192.0.2.4']);
+    setEntityId($serviceLicenseModel, 42);
 
-    $eventMock = Mockery::mock(Box_EventManager::class);
-    $eventMock->shouldReceive('fire')->atLeast()->once();
+    $timeline = [];
+    $flushed = false;
+    $eventDispatcher = new Symfony\Component\EventDispatcher\EventDispatcher();
+    $eventDispatcher->addListener(BeforeServiceLicenseResetEvent::class, static function (BeforeServiceLicenseResetEvent $event) use (&$timeline, &$flushed, $serviceLicenseModel): void {
+        expect($flushed)->toBeFalse();
+        expect($serviceLicenseModel->getIps())->toBe(['192.0.2.4']);
+        expect(get_object_vars($event))->toBe(['licenseId' => 42, 'clientId' => 17]);
+        $timeline[] = 'before';
+    });
+    $eventDispatcher->addListener(AfterServiceLicenseResetEvent::class, static function (AfterServiceLicenseResetEvent $event) use (&$timeline, &$flushed): void {
+        expect($flushed)->toBeTrue();
+        expect(get_object_vars($event))->toBe(['licenseId' => 42, 'clientId' => 17]);
+        $timeline[] = 'after';
+    });
 
     $em = Mockery::mock(EntityManagerInterface::class);
-    $em->shouldReceive('flush')->atLeast()->once();
+    $em->shouldReceive('flush')->once()->andReturnUsing(function () use (&$flushed): void {
+        $flushed = true;
+    });
 
     $di = container();
     $di['em'] = $em;
-    $di['logger'] = new Box_Log();
-    $di['events_manager'] = $eventMock;
+    $di['logger'] = new FOSSBilling\Core\Logging\Logger();
+    $di['event_dispatcher'] = $eventDispatcher;
 
     $service->setDi($di);
     $result = $service->reset($serviceLicenseModel);
     expect($result)->toBeTrue();
+    expect($serviceLicenseModel->getIps())->toBe([]);
+    expect($timeline)->toBe(['before', 'after']);
 });
 
 test('is license active', function (): void {
@@ -289,7 +302,7 @@ test('is license inactive when order has expired', function (): void {
 
     $expiredOrder = new Order();
     $expiredOrder->setStatus(Order::STATUS_ACTIVE);
-    $expiredOrder->setExpiresAt(new DateTime(date('Y-m-d H:i:s', time() - 3600)));
+    $expiredOrder->setExpiresAt(new DateTimeImmutable(date('Y-m-d H:i:s', time() - 3600)));
 
     $serviceLicenseModel = new ServiceLicense();
 
@@ -309,7 +322,7 @@ test('is license inactive when order has expired', function (): void {
 test('is valid ip', function (): void {
     $service = new Service();
     $serviceLicenseModel = new ServiceLicense();
-    $serviceLicenseModel->setIps('{}');
+    $serviceLicenseModel->setIps([]);
     $value = '1.1.1.1';
 
     $em = Mockery::mock(EntityManagerInterface::class);
@@ -327,7 +340,7 @@ test('is valid ip', function (): void {
 test('is valid ip when ip is not in allowed list and validation is not enforced returns true', function (): void {
     $service = new Service();
     $serviceLicenseModel = new ServiceLicense();
-    $serviceLicenseModel->setIps('["2.2.2.2"]');
+    $serviceLicenseModel->setIps(['2.2.2.2']);
     $value = '1.1.1.1';
 
     $em = Mockery::mock(EntityManagerInterface::class);
@@ -345,7 +358,7 @@ test('is valid ip when ip is not in allowed list and validation is not enforced 
 test('is valid ip when validate_ip is set and ip does not match returns false', function (): void {
     $service = new Service();
     $serviceLicenseModel = new ServiceLicense();
-    $serviceLicenseModel->setIps('["2.2.2.2"]');
+    $serviceLicenseModel->setIps(['2.2.2.2']);
     $serviceLicenseModel->setValidateIp(true);
     $value = '1.1.1.1';
 
@@ -356,7 +369,7 @@ test('is valid ip when validate_ip is set and ip does not match returns false', 
 test('is valid version', function (): void {
     $service = new Service();
     $serviceLicenseModel = new ServiceLicense();
-    $serviceLicenseModel->setVersions('{}');
+    $serviceLicenseModel->setVersions([]);
     $value = '1.0';
 
     $em = Mockery::mock(EntityManagerInterface::class);
@@ -374,7 +387,7 @@ test('is valid version', function (): void {
 test('is valid version test2', function (): void {
     $service = new Service();
     $serviceLicenseModel = new ServiceLicense();
-    $serviceLicenseModel->setVersions('["2.0"]');
+    $serviceLicenseModel->setVersions(['2.0']);
     $value = '1.0';
 
     $em = Mockery::mock(EntityManagerInterface::class);
@@ -392,7 +405,7 @@ test('is valid version test2', function (): void {
 test('is valid version test3', function (): void {
     $service = new Service();
     $serviceLicenseModel = new ServiceLicense();
-    $serviceLicenseModel->setVersions('["2.0"]');
+    $serviceLicenseModel->setVersions(['2.0']);
     $serviceLicenseModel->setValidateVersion(true);
     $value = '1.0';
 
@@ -403,7 +416,7 @@ test('is valid version test3', function (): void {
 test('is valid path', function (): void {
     $service = new Service();
     $serviceLicenseModel = new ServiceLicense();
-    $serviceLicenseModel->setPaths('{}');
+    $serviceLicenseModel->setPaths([]);
     $value = '/var';
 
     $em = Mockery::mock(EntityManagerInterface::class);
@@ -421,7 +434,7 @@ test('is valid path', function (): void {
 test('is valid path test2', function (): void {
     $service = new Service();
     $serviceLicenseModel = new ServiceLicense();
-    $serviceLicenseModel->setPaths('["/"]');
+    $serviceLicenseModel->setPaths(['/']);
     $value = '/var';
 
     $em = Mockery::mock(EntityManagerInterface::class);
@@ -439,7 +452,7 @@ test('is valid path test2', function (): void {
 test('is valid path test3', function (): void {
     $service = new Service();
     $serviceLicenseModel = new ServiceLicense();
-    $serviceLicenseModel->setPaths('["/"]');
+    $serviceLicenseModel->setPaths(['/']);
     $serviceLicenseModel->setValidatePath(true);
     $value = '/var';
 
@@ -450,7 +463,7 @@ test('is valid path test3', function (): void {
 test('is valid host', function (): void {
     $service = new Service();
     $serviceLicenseModel = new ServiceLicense();
-    $serviceLicenseModel->setHosts('{}');
+    $serviceLicenseModel->setHosts([]);
     $value = 'site.com';
 
     $em = Mockery::mock(EntityManagerInterface::class);
@@ -468,7 +481,7 @@ test('is valid host', function (): void {
 test('is valid host test2', function (): void {
     $service = new Service();
     $serviceLicenseModel = new ServiceLicense();
-    $serviceLicenseModel->setHosts('["fossbilling.org"]');
+    $serviceLicenseModel->setHosts(['fossbilling.org']);
     $value = 'site.com';
 
     $em = Mockery::mock(EntityManagerInterface::class);
@@ -486,7 +499,7 @@ test('is valid host test2', function (): void {
 test('is valid host test3', function (): void {
     $service = new Service();
     $serviceLicenseModel = new ServiceLicense();
-    $serviceLicenseModel->setHosts('["fossbilling.org"]');
+    $serviceLicenseModel->setHosts(['fossbilling.org']);
     $serviceLicenseModel->setValidateHost(true);
     $value = 'site.com';
 
@@ -536,7 +549,7 @@ test('get expiration date', function (): void {
     $expected = '2004-02-12 15:19:21';
 
     $order = new Order();
-    $order->setExpiresAt(new DateTime($expected));
+    $order->setExpiresAt(new DateTimeImmutable($expected));
 
     $serviceLicenseModel = new ServiceLicense();
 
@@ -557,7 +570,7 @@ test('to api array', function (): void {
     $service = new Service();
     $serviceLicenseModel = new ServiceLicense();
 
-    $result = $service->toApiArray($serviceLicenseModel, false, new Model_Admin());
+    $result = $service->toApiArray($serviceLicenseModel, false, \Tests\Helpers\admin());
     expect($result)->toBeArray();
     expect($result)->toHaveKey('license_key');
     expect($result)->toHaveKey('validate_ip');
@@ -600,20 +613,6 @@ test('update', function (): void {
 
 test('check license details format eq 2', function (): void {
     $service = new Service();
-    $setChannelCalled = 0;
-    $loggerMock = new class($setChannelCalled) extends Box_Log {
-        public function __construct(public int &$setChannelCalled)
-        {
-        }
-
-        public function setChannel(string $channel): static
-        {
-            ++$this->setChannelCalled;
-
-            return $this;
-        }
-    };
-
     $data = [
         'format' => 2,
     ];
@@ -622,7 +621,6 @@ test('check license details format eq 2', function (): void {
     $licenseServerMock->shouldReceive('process')->atLeast()->once()->andReturn([]);
 
     $di = container();
-    $di['logger'] = $loggerMock;
     $di['license_server'] = $licenseServerMock;
     $service->setDi($di);
 
@@ -631,24 +629,10 @@ test('check license details format eq 2', function (): void {
     expect($result)->toBeArray();
     expect($result)->toHaveKey('error');
     expect($result)->toHaveKey('error_code');
-    expect($setChannelCalled)->toBeGreaterThanOrEqual(1);
 });
 
 test('check license details', function (): void {
     $service = new Service();
-    $setChannelCalled = 0;
-    $loggerMock = new class($setChannelCalled) extends Box_Log {
-        public function __construct(public int &$setChannelCalled)
-        {
-        }
-
-        public function setChannel(string $channel): static
-        {
-            ++$this->setChannelCalled;
-
-            return $this;
-        }
-    };
 
     $data = [];
 
@@ -656,14 +640,12 @@ test('check license details', function (): void {
     $licenseServerMock->shouldReceive('process')->atLeast()->once()->andReturn([]);
 
     $di = container();
-    $di['logger'] = $loggerMock;
     $di['license_server'] = $licenseServerMock;
     $service->setDi($di);
 
     $result = $service->checkLicenseDetails($data);
 
     expect($result)->toBeArray();
-    expect($setChannelCalled)->toBeGreaterThanOrEqual(1);
 });
 
 test('server process rejects expired license', function (): void {
@@ -687,7 +669,7 @@ test('server process rejects expired license', function (): void {
     $em->shouldReceive('getRepository')->with(ServiceLicense::class)->andReturn($repo);
     $em->shouldReceive('flush')->once();
 
-    $requestMock = Mockery::mock(FOSSBilling\Request::class);
+    $requestMock = Mockery::mock(FOSSBilling\Core\Request::class);
     $requestMock->shouldReceive('getClientIp')->once()->andReturn('127.0.0.1');
 
     $di = container();

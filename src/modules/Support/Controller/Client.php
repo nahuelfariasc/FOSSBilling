@@ -13,7 +13,7 @@ namespace Box\Mod\Support\Controller;
 
 use Symfony\Component\HttpFoundation\Response;
 
-class Client implements \FOSSBilling\InjectionAwareInterface
+class Client implements \FOSSBilling\Core\Container\InjectionAwareInterface
 {
     protected ?\Pimple\Container $di = null;
 
@@ -27,9 +27,12 @@ class Client implements \FOSSBilling\InjectionAwareInterface
         return $this->di;
     }
 
-    public function register(\Box_App &$app): void
+    public function register(\FOSSBilling\Core\Http\App &$app): void
     {
         $app->get('/support', 'get_tickets', [], static::class);
+        $app->get('/support/ticket/:hash/file/:id', 'get_guest_ticket_file', ['hash' => '[a-z0-9]+', 'id' => '[a-f0-9]{32}'], static::class);
+        $app->get('/support/ticket-file/:id', 'get_ticket_file', ['id' => '[a-f0-9]{32}'], static::class);
+        $app->get('/support/feedback/:token', 'get_feedback', ['token' => '[a-f0-9]{64}'], static::class);
         $app->get('/support/ticket/:id', 'get_ticket', [], static::class);
         $app->get('/support/contact-us', 'get_contact_us', [], static::class);
         $app->get('/support/contact-us/conversation/:hash', 'get_ticket_redirect', ['hash' => '[a-z0-9]+'], static::class);
@@ -41,18 +44,21 @@ class Client implements \FOSSBilling\InjectionAwareInterface
         }
     }
 
-    public function get_tickets(\Box_App $app): string
+    public function get_tickets(\FOSSBilling\Core\Http\App $app): string
     {
         $this->di['is_client_logged'];
 
         return $app->render('mod_support_tickets');
     }
 
-    public function get_ticket(\Box_App $app, $id): string
+    public function get_ticket(\FOSSBilling\Core\Http\App $app, $id): string|Response
     {
         $id = (string) $id;
         if (ctype_digit($id) && strlen($id) < 30) {
             $this->di['is_client_logged'];
+            if (($merged = \Box\Mod\Support\TicketMerge::targetForClient($this->di, (int) $id, (int) $this->di['loggedin_client']->getId())) !== null) {
+                return $app->redirect('support/ticket/' . $merged);
+            }
             $ticket = $this->di['api_client']->support_ticket_get(['id' => $id]);
         } else {
             $ticket = $this->di['api_guest']->support_ticket_get(['hash' => $id]);
@@ -61,7 +67,7 @@ class Client implements \FOSSBilling\InjectionAwareInterface
         return $app->render('mod_support_ticket', ['ticket' => $ticket]);
     }
 
-    public function get_contact_us(\Box_App $app): string|Response
+    public function get_contact_us(\FOSSBilling\Core\Http\App $app): string|Response
     {
         if ($this->di['auth']->isClientLoggedIn()) {
             return $app->redirect('support');
@@ -75,20 +81,68 @@ class Client implements \FOSSBilling\InjectionAwareInterface
      *
      * /support/contact-us/conversation/:hash -> /support/ticket/:hash
      */
-    public function get_ticket_redirect(\Box_App $app, $hash): Response
+    public function get_ticket_redirect(\FOSSBilling\Core\Http\App $app, $hash): Response
     {
         return $app->redirect('support/ticket/' . $hash);
+    }
+
+    public function get_feedback(\FOSSBilling\Core\Http\App $app, string $token): string
+    {
+        try {
+            $page = \Box\Mod\Support\TicketFeedback::page($this->di, $token);
+        } catch (\FOSSBilling\Core\Exception\InformationException) {
+            $page = ['ticket' => [], 'staff' => [], 'state' => 'invalid'];
+        }
+
+        return $app->render('mod_support_feedback', ['feedback' => $page, 'feedback_token' => $token]);
+    }
+
+    public function get_ticket_file(\FOSSBilling\Core\Http\App $app, string $id): Response
+    {
+        $this->di['is_client_logged'];
+        $client = $this->di['loggedin_client'];
+
+        $file = \Box\Mod\Support\TicketFiles::find($this->di, $id);
+        if ($file === null || (int) $file['client_id'] !== (int) $client->getId()) {
+            throw new \FOSSBilling\Core\Exception\InformationException('File not found.', [], 404);
+        }
+
+        return $this->serveTicketFile($file);
+    }
+
+    public function get_guest_ticket_file(\FOSSBilling\Core\Http\App $app, string $hash, string $id): Response
+    {
+        $file = \Box\Mod\Support\TicketFiles::findForGuest($this->di, $hash, $id);
+        if ($file === null) {
+            throw new \FOSSBilling\Core\Exception\InformationException('File not found.', [], 404);
+        }
+
+        return $this->serveTicketFile($file);
+    }
+
+    private function serveTicketFile(array $file): Response
+    {
+        $served = \Box\Mod\Support\TicketFiles::serve($file);
+        $response = $served['disposition'] === 'inline'
+            ? $this->di['response_factory']->file($served['name'], $served['content_type'], $served['path'])
+            : $this->di['response_factory']->download($served['name'], $served['path']);
+        $response->headers->set('X-Content-Type-Options', 'nosniff');
+        $response->headers->set('Content-Security-Policy', "default-src 'none'; img-src 'self'; sandbox");
+        $response->headers->set('Cache-Control', 'private, no-store');
+        $response->headers->set('Referrer-Policy', 'no-referrer');
+
+        return $response;
     }
 
     /*
     * Support Knowledge Base.
     */
-    public function get_kb_index(\Box_App $app): string
+    public function get_kb_index(\FOSSBilling\Core\Http\App $app): string
     {
         return $app->render('mod_support_kb_index');
     }
 
-    public function get_kb_category(\Box_App $app, $category): string
+    public function get_kb_category(\FOSSBilling\Core\Http\App $app, $category): string
     {
         $api = $this->di['api_guest'];
         $data = ['slug' => $category];
@@ -97,7 +151,7 @@ class Client implements \FOSSBilling\InjectionAwareInterface
         return $app->render('mod_support_kb_category', ['category' => $model]);
     }
 
-    public function get_kb_article(\Box_App $app, $category, $slug): string
+    public function get_kb_article(\FOSSBilling\Core\Http\App $app, $category, $slug): string
     {
         $api = $this->di['api_guest'];
         $data = ['slug' => $slug];

@@ -18,16 +18,13 @@ test('dependency injection container is properly set and retrieved', function ()
     $controller = new Admin();
 
     $di = container();
-    $dbMock = Mockery::mock('Box_Database');
-
-    $di['db'] = $dbMock;
     $controller->setDi($di);
     $result = $controller->getDi();
     expect($result)->toEqual($di);
 });
 
 test('register method registers routes correctly', function (): void {
-    $boxAppMock = Mockery::mock('\Box_App');
+    $boxAppMock = Mockery::mock(FOSSBilling\Core\Http\App::class);
     $boxAppMock->shouldReceive('get')
         ->once()
         ->with('/currency/manage/:code', 'get_manage', ['code' => '[a-zA-Z]+'], Admin::class);

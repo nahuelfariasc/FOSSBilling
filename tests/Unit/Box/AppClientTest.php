@@ -13,13 +13,13 @@ declare(strict_types=1);
 use Symfony\Component\HttpFoundation\Request;
 
 /**
- * Build a Box_AppClient that overrides render() with a caller-supplied
+ * Build a FOSSBilling\Core\Http\AppClient that overrides render() with a caller-supplied
  * callback, so the get_custom_page catch-block logic can be exercised
  * without spinning up a Twig environment.
  */
-function appClientWithRender(callable $render, bool $clientLoggedIn = false): Box_AppClient
+function appClientWithRender(callable $render, bool $clientLoggedIn = false): FOSSBilling\Core\Http\AppClient
 {
-    $app = new class($render) extends Box_AppClient {
+    $app = new class($render) extends FOSSBilling\Core\Http\AppClient {
         /** @var callable */
         private $renderCallback;
 
@@ -37,7 +37,7 @@ function appClientWithRender(callable $render, bool $clientLoggedIn = false): Bo
 
     $di = new Pimple\Container();
     $di['logger'] = new class {
-        public function setChannel(string $channel): self
+        public function withChannel(string $channel): self
         {
             return $this;
         }
@@ -58,9 +58,9 @@ function appClientWithRender(callable $render, bool $clientLoggedIn = false): Bo
     };
     $di['request'] = Request::create('http://localhost/test');
     $di['mod_service'] = $di->protect(static fn (): object => $extensionService);
-    $di['auth'] = Mockery::mock(Box_Authorization::class)
+    $di['auth'] = Mockery::mock(FOSSBilling\Core\Security\Authorization::class)
         ->shouldReceive('isClientLoggedIn')->andReturn($clientLoggedIn)->getMock();
-    $di['url'] = Mockery::mock(Box_Url::class)
+    $di['url'] = Mockery::mock(FOSSBilling\Core\Url::class)
         ->shouldReceive('link')->andReturnArg(0)->getMock();
     $app->setDi($di);
     $app->setUrl('/test');
@@ -147,12 +147,75 @@ test('get_custom_page still returns 404 when the top-level template is missing',
             return 'error body';
         }
 
-        throw new FOSSBilling\InformationException('Page not found', null, 404);
+        throw new FOSSBilling\Core\Exception\InformationException('Page not found', null, 404);
     });
 
     $response = $app->get_custom_page('signup');
 
     expect($response->getStatusCode())->toBe(404);
+});
+
+test('render() converts a Twig cache write failure into a report:false exception', function (string $message): void {
+    $app = new class extends FOSSBilling\Core\Http\AppClient {
+        public function triggerCacheWriteFailure(RuntimeException $e): never
+        {
+            $this->convertCacheWriteFailure($e);
+        }
+    };
+    $di = new Pimple\Container();
+    $di['request'] = Request::create('http://localhost/test');
+    $di['logger'] = new class {
+        public function withChannel(string $channel): self
+        {
+            return $this;
+        }
+
+        public function error(string|Stringable $message, array $context = []): void
+        {
+        }
+    };
+    $app->setDi($di);
+
+    try {
+        $app->triggerCacheWriteFailure(new RuntimeException($message));
+        expect(false)->toBeTrue('Expected a FOSSBilling\Core\Exception\InformationException to be thrown.');
+    } catch (FOSSBilling\Core\Exception\InformationException $e) {
+        expect($e->getCode())->toBe(5002)
+            ->and(FOSSBilling\Core\Http\ErrorPage::getCodeInfo($e->getCode())['report'])->toBeFalse();
+    }
+})->with([
+    'directory does not exist and cannot be created' => ['Unable to create the cache directory (/var/www/data/cache/7d).'],
+    'directory exists but is not writable' => ['Unable to write in the cache directory (/var/www/data/cache/7d).'],
+    'cache file itself could not be written' => ['Failed to write cache file "/var/www/data/cache/7d/abc123.php".'],
+]);
+
+test('render() rethrows a RuntimeException unrelated to the Twig cache unchanged', function (): void {
+    $app = new class extends FOSSBilling\Core\Http\AppClient {
+        public function triggerCacheWriteFailure(RuntimeException $e): never
+        {
+            $this->convertCacheWriteFailure($e);
+        }
+    };
+    $di = new Pimple\Container();
+    $di['request'] = Request::create('http://localhost/test');
+    $app->setDi($di);
+
+    expect(fn () => $app->triggerCacheWriteFailure(new RuntimeException('Something else entirely.')))
+        ->toThrow(RuntimeException::class, 'Something else entirely.');
+});
+
+test('setUrl normalizes null and empty string to /', function (): void {
+    $app = new FOSSBilling\Core\Http\AppClient();
+    $url = new ReflectionProperty(FOSSBilling\Core\Http\App::class, 'url');
+
+    $app->setUrl(null);
+    expect($url->getValue($app))->toBe('/');
+
+    $app->setUrl('');
+    expect($url->getValue($app))->toBe('/');
+
+    $app->setUrl('//.env');
+    expect($url->getValue($app))->toBe('//.env');
 });
 
 test('numeric custom page paths return a themed 404', function (): void {
@@ -161,7 +224,7 @@ test('numeric custom page paths return a themed 404', function (): void {
             return 'error body';
         }
 
-        throw new FOSSBilling\InformationException('Page not found', null, 404);
+        throw new FOSSBilling\Core\Exception\InformationException('Page not found', null, 404);
     });
     $app->setUrl('/12345');
 

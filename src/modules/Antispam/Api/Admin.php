@@ -11,7 +11,7 @@ declare(strict_types=1);
 
 namespace Box\Mod\Antispam\Api;
 
-class Admin extends \FOSSBilling\Api\AbstractApi
+class Admin extends \FOSSBilling\Core\Api\AbstractApi
 {
     public function get_config($data): array
     {
@@ -32,6 +32,10 @@ class Admin extends \FOSSBilling\Api\AbstractApi
             'hcaptcha_site_key' => $config['hcaptcha_site_key'] ?? null,
             'hcaptcha_secret_key' => $config['hcaptcha_secret_key'] ?? null,
             'sfs' => $config['sfs'] ?? false,
+            'abuseipdb_enabled' => $config['abuseipdb_enabled'] ?? false,
+            'abuseipdb_api_key' => $config['abuseipdb_api_key'] ?? null,
+            'abuseipdb_threshold' => $config['abuseipdb_threshold'] ?? 75,
+            'abuseipdb_max_age' => $config['abuseipdb_max_age'] ?? 30,
             'check_temp_emails' => $config['check_temp_emails'] ?? true,
             'honeypot_enabled' => $config['honeypot_enabled'] ?? true,
             'honeypot_field' => $config['honeypot_field'] ?? 'bio',
@@ -41,16 +45,16 @@ class Admin extends \FOSSBilling\Api\AbstractApi
     private function normalizeIp(mixed $ip): string
     {
         if (!is_string($ip)) {
-            throw new \FOSSBilling\InformationException('IP address is required');
+            throw new \FOSSBilling\Core\Exception\InformationException('IP address is required');
         }
 
         $ip = trim($ip);
         if ($ip === '') {
-            throw new \FOSSBilling\InformationException('IP address is required');
+            throw new \FOSSBilling\Core\Exception\InformationException('IP address is required');
         }
 
         if (filter_var($ip, FILTER_VALIDATE_IP) === false) {
-            throw new \FOSSBilling\InformationException('Invalid IP address');
+            throw new \FOSSBilling\Core\Exception\InformationException('Invalid IP address');
         }
 
         return $ip;
@@ -86,11 +90,11 @@ class Admin extends \FOSSBilling\Api\AbstractApi
         $blocked_ips = $this->getBlockedIpsFromConfig($config);
 
         if (in_array($ip, $blocked_ips, true)) {
-            throw new \FOSSBilling\InformationException(':ip is already blocked.', [':ip' => $ip]);
+            throw new \FOSSBilling\Core\Exception\InformationException(':ip is already blocked.', [':ip' => $ip]);
         }
 
         if ((string) $this->getDi()['request']->getClientIp() === $ip) {
-            throw new \FOSSBilling\InformationException('You cannot block :ip as it is the IP you are making requests from.', [':ip' => $ip]);
+            throw new \FOSSBilling\Core\Exception\InformationException('You cannot block :ip as it is the IP you are making requests from.', [':ip' => $ip]);
         }
 
         $blocked_ips[] = $ip;
@@ -110,7 +114,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
 
         $key = array_search($ip, $blocked_ips, true);
         if ($key === false) {
-            throw new \FOSSBilling\InformationException(':ip is not currently blocked.', [':ip' => $ip]);
+            throw new \FOSSBilling\Core\Exception\InformationException(':ip is not currently blocked.', [':ip' => $ip]);
         }
 
         unset($blocked_ips[$key]);

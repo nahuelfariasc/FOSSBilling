@@ -11,20 +11,64 @@ declare(strict_types=1);
 
 namespace Box\Mod\Invoice;
 
+use Box\Mod\Client\Entity\Client;
 use Box\Mod\Client\Entity\ClientBalance;
+use Box\Mod\Cron\Event\AfterAdminCronRunEvent;
+use Box\Mod\Cron\Event\BeforeAdminCronRunEvent;
 use Box\Mod\Currency\Entity\Currency;
+use Box\Mod\Invoice\Entity\Invoice;
+use Box\Mod\Invoice\Entity\InvoiceCredit;
+use Box\Mod\Invoice\Entity\InvoiceEvent;
 use Box\Mod\Invoice\Entity\InvoiceItem;
 use Box\Mod\Invoice\Entity\PayGateway;
 use Box\Mod\Invoice\Entity\Transaction;
+use Box\Mod\Invoice\Event\AfterAdminGenerateRenewalInvoiceEvent;
+use Box\Mod\Invoice\Event\AfterAdminInvoiceAttachOrderEvent;
+use Box\Mod\Invoice\Event\AfterAdminInvoiceCancelEvent;
+use Box\Mod\Invoice\Event\AfterAdminInvoiceDebitEvent;
+use Box\Mod\Invoice\Event\AfterAdminInvoiceDeleteEvent;
+use Box\Mod\Invoice\Event\AfterAdminInvoiceIssueEvent;
+use Box\Mod\Invoice\Event\AfterAdminInvoicePaymentReceivedEvent;
+use Box\Mod\Invoice\Event\AfterAdminInvoiceRefundEvent;
+use Box\Mod\Invoice\Event\AfterAdminInvoiceReissueEvent;
+use Box\Mod\Invoice\Event\AfterAdminInvoiceReminderRecordedEvent;
+use Box\Mod\Invoice\Event\AfterAdminInvoiceUpdateEvent;
+use Box\Mod\Invoice\Event\AfterInvoiceIsDueEvent;
+use Box\Mod\Invoice\Event\BeforeAdminGenerateRenewalInvoiceEvent;
+use Box\Mod\Invoice\Event\BeforeAdminInvoiceAttachOrderEvent;
+use Box\Mod\Invoice\Event\BeforeAdminInvoiceCancelEvent;
+use Box\Mod\Invoice\Event\BeforeAdminInvoiceDebitEvent;
+use Box\Mod\Invoice\Event\BeforeAdminInvoiceDeleteEvent;
+use Box\Mod\Invoice\Event\BeforeAdminInvoiceIssueEvent;
+use Box\Mod\Invoice\Event\BeforeAdminInvoiceRefundEvent;
+use Box\Mod\Invoice\Event\BeforeAdminInvoiceReissueEvent;
+use Box\Mod\Invoice\Event\BeforeAdminInvoiceSendReminderEvent;
+use Box\Mod\Invoice\Event\BeforeAdminInvoiceSendRemindersEvent;
+use Box\Mod\Invoice\Event\BeforeAdminInvoiceUpdateEvent;
+use Box\Mod\Invoice\Event\BeforeInvoiceIsDueEvent;
+use Box\Mod\Invoice\Repository\InvoiceCreditRepository;
+use Box\Mod\Invoice\Repository\InvoiceEventRepository;
 use Box\Mod\Invoice\Repository\InvoiceItemRepository;
+use Box\Mod\Invoice\Repository\InvoiceRepository;
+use Box\Mod\Invoice\Repository\TransactionRepository;
+use Box\Mod\Order\Entity\Order;
+use Box\Mod\Order\Repository\OrderRepository;
+use Doctrine\DBAL\Connection;
+use Doctrine\ORM\EntityManagerInterface;
 use Dompdf\Dompdf;
 use Dompdf\Options;
-use FOSSBilling\Environment;
-use FOSSBilling\Http\ResponseFactory;
-use FOSSBilling\i18n;
-use FOSSBilling\InformationException;
-use FOSSBilling\InjectionAwareInterface;
-use FOSSBilling\Tools;
+use FOSSBilling\Core\Container\InjectionAwareInterface;
+use FOSSBilling\Core\Doctrine\EntityManagerFactory;
+use FOSSBilling\Core\Doctrine\NamedLock;
+use FOSSBilling\Core\Doctrine\RowLock;
+use FOSSBilling\Core\Doctrine\SqlExpr;
+use FOSSBilling\Core\Exception\InformationException;
+use FOSSBilling\Core\Http\ResponseFactory;
+use FOSSBilling\Core\I18n\I18n;
+use FOSSBilling\Core\Payment\ProcessingFence;
+use FOSSBilling\Core\System\Environment;
+use FOSSBilling\Core\Validation\PriceValidator;
+use Symfony\Component\EventDispatcher\Attribute\AsEventListener;
 use Symfony\Component\Filesystem\Filesystem;
 use Symfony\Component\Filesystem\Path;
 use Symfony\Component\HttpFoundation\HeaderUtils;
@@ -33,36 +77,54 @@ use Twig\Loader\FilesystemLoader;
 
 class Service implements InjectionAwareInterface
 {
+    #[AsEventListener(priority: 100)]
+    public function retryDeferredGatewaySecrets(BeforeAdminCronRunEvent $event): void
+    {
+        $this->di['mod_service']('Invoice', 'PayGateway')->migrateConfigSecrets(onlyPlaintext: true);
+    }
+
     /**
      * Columns on the `invoice` table permitted in CSV exports.
      * The `hash` column (bearer token for public invoice access) is excluded.
      */
     private const array EXPORTABLE_COLUMNS = [
         'id', 'client_id', 'serie', 'nr', 'currency', 'currency_rate',
-        'credit', 'base_income', 'base_refund', 'refund', 'notes',
+        'credit', 'base_income', 'base_refund', 'base_refund_tax', 'refund', 'notes',
         'text_1', 'text_2', 'status', 'seller_company', 'seller_company_vat',
         'seller_company_number', 'seller_address', 'seller_phone', 'seller_email',
         'buyer_first_name', 'buyer_last_name', 'buyer_company', 'buyer_company_vat',
         'buyer_company_number', 'buyer_address', 'buyer_city', 'buyer_state',
-        'buyer_country', 'buyer_zip', 'buyer_phone', 'buyer_phone_cc',
-        'buyer_email', 'gateway_id', 'approved', 'taxname', 'taxrate',
+        'buyer_country', 'buyer_zip', 'buyer_phone',
+        'buyer_email', 'gateway_id', 'issued', 'taxname', 'taxrate',
         'due_at', 'reminded_at', 'paid_at', 'created_at', 'updated_at',
     ];
 
     /** Subset of EXPORTABLE_COLUMNS used when the caller passes no headers. */
+    private const int SUBSCRIPTION_RENEWAL_FAILURE_LIMIT = 3;
+
     private const array DEFAULT_EXPORT_COLUMNS = [
         'id', 'client_id', 'nr', 'currency', 'credit', 'base_income', 'base_refund',
-        'refund', 'notes', 'status', 'buyer_first_name', 'buyer_last_name',
+        'base_refund_tax', 'refund', 'notes', 'status', 'buyer_first_name', 'buyer_last_name',
         'buyer_company', 'buyer_company_vat', 'buyer_company_number', 'buyer_address',
         'buyer_city', 'buyer_state', 'buyer_country', 'buyer_zip', 'buyer_phone',
-        'buyer_phone_cc', 'buyer_email', 'approved', 'taxname', 'taxrate',
+        'buyer_email', 'issued', 'taxname', 'taxrate',
         'due_at', 'reminded_at', 'paid_at',
+    ];
+
+    /** Keys of $data that updateInvoice() actually consumes; routing keys (id, issue) and anything else are ignored. */
+    private const array UPDATABLE_FIELDS = [
+        'gateway_id', 'text_1', 'text_2', 'paid_at', 'due_at', 'serie', 'nr',
+        'status', 'taxrate', 'taxname', 'issued', 'notes', 'created_at',
+        'new_item', 'items',
     ];
 
     protected ?\Pimple\Container $di = null;
     private Filesystem $filesystem;
     private ?int $invoiceNumberPadding = null;
     private ?InvoiceItemRepository $invoiceItemRepository = null;
+    private ?InvoiceRepository $invoiceRepository = null;
+    private ?TransactionRepository $transactionRepository = null;
+    private ?InvoiceCreditRepository $invoiceCreditRepository = null;
 
     public function setDi(\Pimple\Container $di): void
     {
@@ -79,11 +141,46 @@ class Service implements InjectionAwareInterface
 
     public function getInvoiceItemRepository(): InvoiceItemRepository
     {
-        if ($this->invoiceItemRepository === null) {
-            $this->invoiceItemRepository = $this->di['em']->getRepository(InvoiceItem::class);
-        }
+        $this->invoiceItemRepository ??= $this->di['em']->getRepository(InvoiceItem::class);
 
         return $this->invoiceItemRepository;
+    }
+
+    public function getInvoiceRepository(): InvoiceRepository
+    {
+        $this->invoiceRepository ??= $this->di['em']->getRepository(Invoice::class);
+
+        return $this->invoiceRepository;
+    }
+
+    public function getTransactionRepository(): TransactionRepository
+    {
+        $this->transactionRepository ??= $this->di['em']->getRepository(Transaction::class);
+
+        return $this->transactionRepository;
+    }
+
+    public function getInvoiceCreditRepository(): InvoiceCreditRepository
+    {
+        $this->invoiceCreditRepository ??= $this->di['em']->getRepository(InvoiceCredit::class);
+
+        return $this->invoiceCreditRepository;
+    }
+
+    protected function resetEntityManager(): void
+    {
+        $connection = $this->di['em']->getConnection();
+        unset($this->di['em']);
+        $this->di['em'] = $this->createEntityManager($connection);
+        $this->invoiceItemRepository = null;
+        $this->invoiceRepository = null;
+        $this->transactionRepository = null;
+        $this->invoiceCreditRepository = null;
+    }
+
+    protected function createEntityManager(?Connection $connection = null): EntityManagerInterface
+    {
+        return EntityManagerFactory::create($connection);
     }
 
     public function getModulePermissions(): array
@@ -133,150 +230,52 @@ class Service implements InjectionAwareInterface
         $this->filesystem = new Filesystem();
     }
 
-    public function getSearchQuery($data): array
-    {
-        $select = 'p.*';
-        if (!empty($data['summary'])) {
-            $select .= ',
-                (SELECT COALESCE(SUM(COALESCE(invoice_totals.price, 0) * COALESCE(invoice_totals.quantity, 1)), 0)
-                    FROM invoice_item invoice_totals WHERE invoice_totals.invoice_id = p.id) AS list_subtotal,
-                (SELECT COALESCE(SUM(CASE WHEN invoice_taxable.taxed = 1 THEN COALESCE(invoice_taxable.price, 0) * COALESCE(invoice_taxable.quantity, 1) ELSE 0 END), 0)
-                    FROM invoice_item invoice_taxable WHERE invoice_taxable.invoice_id = p.id) AS list_taxable_subtotal';
-        }
-
-        $sql = 'SELECT ' . $select . '
-            FROM invoice p
-            LEFT JOIN invoice_item pi ON (p.id = pi.invoice_id)
-            LEFT JOIN client cl ON (cl.id = p.client_id)
-            WHERE 1 ';
-
-        $params = [];
-
-        $search = $data['search'] ?? null;
-        $order_id = $data['order_id'] ?? null;
-        $id = $data['id'] ?? null;
-        $id_nr = $data['nr'] ?? null;
-        $client_id = $data['client_id'] ?? null;
-        $client = $data['client'] ?? null;
-        $created_at = $data['created_at'] ?? null;
-        $date_from = $data['date_from'] ?? null;
-        $date_to = $data['date_to'] ?? null;
-        $paid_at = $data['paid_at'] ?? null;
-        $status = $data['status'] ?? null;
-        $approved = $data['approved'] ?? null;
-        $currency = $data['currency'] ?? null;
-
-        if ($order_id) {
-            $sql .= ' AND pi.type = :item_type AND pi.rel_id = :order_id';
-            $params['item_type'] = InvoiceItem::TYPE_ORDER;
-            $params['order_id'] = $order_id;
-        }
-
-        if ($id) {
-            $sql .= ' AND p.id = :id';
-            $params['id'] = $id;
-        }
-
-        if ($id_nr) {
-            $sql .= ' AND (p.id = :id_nr OR p.nr = :id_nr)';
-            $params['id_nr'] = $id_nr;
-        }
-
-        if ($approved) {
-            $sql .= ' AND p.approved = :approved';
-            $params['approved'] = (int) $approved;
-        }
-
-        if ($status) {
-            $sql .= ' AND p.status = :status';
-            $params['status'] = $status;
-        }
-
-        if ($currency) {
-            $sql .= ' AND p.currency = :currency';
-            $params['currency'] = $currency;
-        }
-
-        if ($client_id) {
-            $sql .= ' AND p.client_id = :client_id';
-            $params['client_id'] = $client_id;
-        }
-
-        if ($client) {
-            $sql .= ' AND (cl.first_name LIKE :client_search OR cl.last_name LIKE :client_search OR cl.id = :client OR cl.email = :client)';
-            $params['client_search'] = $client . '%';
-            $params['client'] = $client;
-        }
-
-        if ($created_at) {
-            $sql .= " AND DATE_FORMAT(p.created_at, '%Y-%m-%d') = :created_at";
-            $params['created_at'] = date('Y-m-d', (int) strtotime((string) $created_at));
-        }
-
-        if ($date_from) {
-            $sql .= ' AND UNIX_TIMESTAMP(p.created_at) >= :date_from';
-            $params['date_from'] = strtotime((string) $date_from);
-        }
-
-        if ($date_to) {
-            $sql .= ' AND UNIX_TIMESTAMP(p.created_at) <= :date_to';
-            $params['date_to'] = strtotime((string) $date_to);
-        }
-
-        if ($paid_at) {
-            $sql .= " AND DATE_FORMAT(p.paid_at, '%Y-%m-%d') = :paid_at";
-            $params['paid_at'] = date('Y-m-d', (int) strtotime((string) $paid_at));
-        }
-
-        if ($search) {
-            $sql .= ' AND (p.id = :search_numeric_id OR p.nr LIKE :search_like OR p.id LIKE :search OR pi.title LIKE :search_like)';
-            $params['search_numeric_id'] = (int) preg_replace('/[^0-9]/', '', (string) $search);
-            $params['search_like'] = '%' . $search . '%';
-            $params['search'] = $search;
-        }
-
-        $sql .= ' GROUP BY p.id ORDER BY p.id DESC';
-
-        return [$sql, $params];
-    }
-
     /**
-     * Convert an aggregated invoice search result into the fields needed by list views.
+     * Convert an invoice entity into the fields needed by list views.
      *
      * Unlike toApiArray(), this does not load invoice items, orders, products, the client,
      * company details, or subscription information for every invoice in the result set.
+     * The totals come from a grouped aggregate query (`getInvoiceTotals`) rather than
+     * per-invoice loading; keys are absent for invoices without items.
+     *
+     * @param array{subtotal?: float, taxable_subtotal?: float} $totals
      */
-    public function toApiSummaryArray(array $row): array
+    public function toApiSummaryFromEntity(Invoice $invoice, array $totals): array
     {
-        $subtotal = (float) ($row['list_subtotal'] ?? 0);
-        $taxableSubtotal = (float) ($row['list_taxable_subtotal'] ?? 0);
-        $taxRate = (float) ($row['taxrate'] ?? 0);
+        $subtotal = (float) ($totals['subtotal'] ?? 0);
+        $taxableSubtotal = (float) ($totals['taxable_subtotal'] ?? 0);
+        $taxRate = (float) ($invoice->getTaxrate() ?? 0);
         $tax = $taxRate > 0 && $taxableSubtotal !== 0.0 ? round($taxableSubtotal * $taxRate / 100, 2) : 0;
-        $invoiceNumber = is_numeric($row['nr'] ?? null) ? (int) $row['nr'] : (int) $row['id'];
-        $clientId = $row['client_id'] ?? null;
+        $invoiceNumber = is_numeric($invoice->getNr() ?? null) ? (int) $invoice->getNr() : (int) $invoice->getId();
+        $clientId = $invoice->getClientId();
 
         return [
-            'id' => $row['id'],
-            'serie' => $row['serie'],
-            'nr' => $row['nr'],
-            'serie_nr' => $row['serie'] . sprintf('%0' . $this->getInvoiceNumberPadding() . 's', $invoiceNumber),
+            'id' => $invoice->getId(),
+            'serie' => $invoice->getSerie(),
+            'nr' => $invoice->getNr(),
+            'serie_nr' => $invoice->getSerie() . sprintf('%0' . $this->getInvoiceNumberPadding() . 's', $invoiceNumber),
             'client_id' => $clientId,
             'client' => $clientId === null ? null : ['id' => $clientId],
-            'currency' => $row['currency'],
+            'currency' => $invoice->getCurrency(),
             'tax' => $tax,
             'subtotal' => $subtotal,
             'total' => $subtotal + $tax,
-            'status' => $row['status'],
-            'due_at' => $row['due_at'],
-            'paid_at' => $row['paid_at'] ?? null,
-            'created_at' => $row['created_at'],
-            'updated_at' => $row['updated_at'],
+            'status' => $invoice->getStatus(),
+            'due_at' => $invoice->getDueAt()?->format('Y-m-d H:i:s'),
+            'paid_at' => $invoice->getPaidAt()?->format('Y-m-d H:i:s'),
+            'created_at' => $invoice->getCreatedAt()?->format('Y-m-d H:i:s'),
+            'updated_at' => $invoice->getUpdatedAt()?->format('Y-m-d H:i:s'),
             'buyer' => [
-                'first_name' => $row['buyer_first_name'],
-                'last_name' => $row['buyer_last_name'],
-                'email' => $row['buyer_email'],
+                'first_name' => $invoice->getBuyerFirstName(),
+                'last_name' => $invoice->getBuyerLastName(),
+                'email' => $invoice->getBuyerEmail(),
             ],
-            'approved' => (bool) ($row['approved'] ?? false),
+            'issued' => $invoice->isIssued(),
+            'cancellable' => $invoice->isIssued()
+                && $invoice->getStatus() === Invoice::STATUS_UNPAID
+                && $invoice->getCreditNoteForInvoiceId() === null
+                && $invoice->getDebitNoteForInvoiceId() === null
+                && $invoice->getReplacedByInvoiceId() === null,
         ];
     }
 
@@ -290,10 +289,64 @@ class Service implements InjectionAwareInterface
         return $this->invoiceNumberPadding;
     }
 
-    public function toApiArray(\Model_Invoice $invoice, $deep = true, $identity = null, bool $includeClientBillingEmail = false): array
+    private function formatSerieNr(?string $serie, int|string|null $nr): string
+    {
+        return $serie . sprintf('%0' . $this->getInvoiceNumberPadding() . 's', $nr ?? '');
+    }
+
+    public function toApiArray(Invoice $invoice, $deep = true, $identity = null, bool $includeClientBillingEmail = false): array
     {
         $this->ensureValidHash($invoice);
-        $row = $this->di['db']->toArray($invoice);
+        $row = [
+            'id' => $invoice->getId(),
+            'client_id' => $invoice->getClientId(),
+            'serie' => $invoice->getSerie(),
+            'nr' => $invoice->getNr(),
+            'hash' => $invoice->getHash(),
+            'currency' => $invoice->getCurrency(),
+            'currency_rate' => $invoice->getCurrencyRate(),
+            'credit' => $invoice->getCredit(),
+            'base_income' => $invoice->getBaseIncome(),
+            'base_refund' => $invoice->getBaseRefund(),
+            'base_refund_tax' => $invoice->getBaseRefundTax(),
+            'refund' => $invoice->getRefund(),
+            'notes' => $invoice->getNotes(),
+            'text_1' => $invoice->getText1(),
+            'text_2' => $invoice->getText2(),
+            'status' => $invoice->getStatus(),
+            'seller_company' => $invoice->getSellerCompany(),
+            'seller_company_vat' => $invoice->getSellerCompanyVat(),
+            'seller_company_number' => $invoice->getSellerCompanyNumber(),
+            'seller_address' => $invoice->getSellerAddress(),
+            'seller_phone' => $invoice->getSellerPhone(),
+            'seller_email' => $invoice->getSellerEmail(),
+            'buyer_first_name' => $invoice->getBuyerFirstName(),
+            'buyer_last_name' => $invoice->getBuyerLastName(),
+            'buyer_company' => $invoice->getBuyerCompany(),
+            'buyer_company_vat' => $invoice->getBuyerCompanyVat(),
+            'buyer_company_number' => $invoice->getBuyerCompanyNumber(),
+            'buyer_address' => $invoice->getBuyerAddress(),
+            'buyer_city' => $invoice->getBuyerCity(),
+            'buyer_state' => $invoice->getBuyerState(),
+            'buyer_country' => $invoice->getBuyerCountry(),
+            'buyer_zip' => $invoice->getBuyerZip(),
+            'buyer_phone' => $invoice->getBuyerPhone(),
+            'buyer_email' => $invoice->getBuyerEmail(),
+            'gateway_id' => $invoice->getGateway()?->getId(),
+            'issued' => $invoice->isIssued(),
+            'credit_note_for_invoice_id' => $invoice->getCreditNoteForInvoiceId(),
+            'debit_note_for_invoice_id' => $invoice->getDebitNoteForInvoiceId(),
+            'replaces_invoice_id' => $invoice->getReplacesInvoiceId(),
+            'replaced_by_invoice_id' => $invoice->getReplacedByInvoiceId(),
+            'taxname' => $invoice->getTaxname(),
+            'taxrate' => $invoice->getTaxrate(),
+            'due_at' => $invoice->getDueAt()?->format('Y-m-d H:i:s'),
+            'reminded_at' => $invoice->getRemindedAt()?->format('Y-m-d H:i:s'),
+            'paid_at' => $invoice->getPaidAt()?->format('Y-m-d H:i:s'),
+            'created_at' => $invoice->getCreatedAt()?->format('Y-m-d H:i:s'),
+            'updated_at' => $invoice->getUpdatedAt()?->format('Y-m-d H:i:s'),
+            'hash_expires_at' => $invoice->getHashExpiresAt()?->format('Y-m-d H:i:s'),
+        ];
 
         $items = $this->getInvoiceItemRepository()->findByInvoiceId((int) $row['id']);
         $lines = [];
@@ -330,7 +383,7 @@ class Service implements InjectionAwareInterface
             $lines[] = $line;
         }
 
-        $current_invoice_tax_rate = $row['taxrate'];
+        $current_invoice_tax_rate = (float) $row['taxrate'];
         if ($current_invoice_tax_rate > 0 && $taxable_subtotal != 0) {
             $tax = round($taxable_subtotal * $current_invoice_tax_rate / 100, 2);
         } else {
@@ -341,10 +394,10 @@ class Service implements InjectionAwareInterface
         $result['id'] = $row['id'];
         $result['serie'] = $row['serie'];
         $result['nr'] = $row['nr'];
-        $result['client_id'] = $invoice->client_id;
+        $result['client_id'] = $invoice->getClientId();
 
         $nr = is_numeric($row['nr']) ? intval($row['nr']) : $result['id'];
-        $result['serie_nr'] = $result['serie'] . sprintf('%0' . $this->getInvoiceNumberPadding() . 's', $nr);
+        $result['serie_nr'] = $this->formatSerieNr($invoice->getSerie(), $nr);
 
         $result['hash'] = $row['hash'];
         $result['hash_expires_at'] = $row['hash_expires_at'] ?? null;
@@ -357,6 +410,12 @@ class Service implements InjectionAwareInterface
         $result['subtotal'] = $total;
         $result['total'] = $total + $tax;
         $result['status'] = $row['status'];
+        $unpaid = $row['status'] === Invoice::STATUS_UNPAID;
+        $result['amount_paid'] = $unpaid ? min($this->getAmountPaid($invoice), round($result['total'], 2)) : (in_array($row['status'], [Invoice::STATUS_PAID, Invoice::STATUS_REFUNDED], true) ? $result['total'] : 0.0);
+        $result['balance_due'] = $unpaid ? max(0.0, round($result['total'] - $result['amount_paid'], 2)) : 0.0;
+        $result['credit_applied'] = $unpaid ? $this->getInvoiceCreditRepository()->getSumByInvoiceId((int) $row['id']) : 0.0;
+        // A bank debit still clearing shows the invoice as "Payment pending".
+        $result['pending_payment'] = $unpaid ? PendingPayments::forInvoice($this->di['em']->getConnection(), (int) $invoice->getId()) : null;
         $result['notes'] = $row['notes'];
         $result['text_1'] = $row['text_1'] ?? null;
         $result['text_2'] = $row['text_2'] ?? null;
@@ -377,51 +436,105 @@ class Service implements InjectionAwareInterface
             'state' => $row['buyer_state'],
             'country' => $row['buyer_country'],
             'phone' => $row['buyer_phone'],
-            'phone_cc' => $row['buyer_phone_cc'] ?? '',
             'email' => $row['buyer_email'],
             'zip' => $row['buyer_zip'],
         ];
 
         $systemService = $this->di['mod_service']('system');
         $c = $systemService->getCompany();
+        $isDraft = !$invoice->isIssued();
+        $liveAddress = trim(($c['address_1'] ?? '') . ' ' . ($c['address_2'] ?? '') . ' ' . ($c['address_3'] ?? ''));
+        // The snapshot keeps one combined address line, so it fills address_1 with
+        // address_2/3 left empty. Rows predating snapshots fall back to live settings.
+        $frozenAddress = !$isDraft ? ($row['seller_address'] ?? null) : null;
         $result['seller'] = [
             'company' => !empty($row['seller_company']) ? $row['seller_company'] : ($c['name'] ?? ''),
-            'company_vat' => $row['seller_company_vat'] ?? '',
-            'company_number' => $row['seller_company_number'] ?? '',
-            'address' => !empty($row['seller_address']) ? $row['seller_address'] : trim(($c['address_1'] ?? '') . ' ' . ($c['address_2'] ?? '') . ' ' . ($c['address_3'] ?? '')),
-            'address_1' => !empty($row['seller_address_1']) ? $row['seller_address_1'] : ($c['address_1'] ?? ''),
-            'address_2' => !empty($row['seller_address_2']) ? $row['seller_address_2'] : ($c['address_2'] ?? ''),
-            'address_3' => !empty($row['seller_address_3']) ? $row['seller_address_3'] : ($c['address_3'] ?? ''),
-            'phone' => !empty($row['seller_phone']) ? $row['seller_phone'] : ($c['tel'] ?? ''),
-            'email' => !empty($row['seller_email']) ? $row['seller_email'] : ($c['email'] ?? ''),
+            // Drafts have no snapshot yet, so identity comes from live
+            // settings too; issued invoices keep their frozen copy.
+            'company_vat' => $isDraft ? ($c['vat_number'] ?? '') : ($row['seller_company_vat'] ?? ''),
+            'company_number' => $isDraft ? ($c['number'] ?? '') : ($row['seller_company_number'] ?? ''),
+            // Issued invoices show the frozen seller details like any other
+            // legal particular; only drafts follow live company settings.
+            'address' => $frozenAddress ?: $liveAddress,
+            'address_1' => $frozenAddress ?: ($c['address_1'] ?? ''),
+            'address_2' => $frozenAddress !== null ? '' : ($c['address_2'] ?? ''),
+            'address_3' => $frozenAddress !== null ? '' : ($c['address_3'] ?? ''),
+            'phone' => !$isDraft ? ($row['seller_phone'] ?? ($c['tel'] ?? '')) : ($c['tel'] ?? ''),
+            'email' => !$isDraft ? ($row['seller_email'] ?? ($c['email'] ?? '')) : ($c['email'] ?? ''),
             'account_number' => $c['account_number'] ?? null,
             'bank_name' => $c['bank_name'] ?? null,
             'bic' => $c['bic'] ?? null,
         ];
 
         /**
-         * Removed if($identity instanceof \Model_Admin) {}
          * Generates error when this function is called by cron.
          */
-        $client = isset($row['client_id']) ? $this->di['db']->load('Client', $row['client_id']) : null;
+        $client = isset($row['client_id']) ? $this->di['em']->getRepository(Client::class)->find($row['client_id']) : null;
         $clientService = $this->di['mod_service']('client');
-        if ($client instanceof \Model_Client) {
+        if ($client instanceof Client) {
             $result['client'] = $clientService->toApiArray($client);
             if ($includeClientBillingEmail) {
-                $result['client']['billing_email'] = $client->billing_email;
+                $result['client']['billing_email'] = $client->getBillingEmail();
+            }
+            // Drafts carry no buyer snapshot (it is taken at issuance), so
+            // display the live client record until the invoice is issued.
+            if ($isDraft && empty($row['buyer_first_name']) && empty($row['buyer_last_name']) && empty($row['buyer_company'])) {
+                $result['buyer'] = [
+                    'first_name' => $client->getFirstName(),
+                    'last_name' => $client->getLastName(),
+                    'company' => $client->getCompany(),
+                    'company_vat' => $client->getCompanyVat(),
+                    'company_number' => $client->getCompanyNumber(),
+                    'address' => trim(($client->getAddress1() ?? '') . ' ' . ($client->getAddress2() ?? '')),
+                    'city' => $client->getCity(),
+                    'state' => $client->getState(),
+                    'country' => $client->getCountry(),
+                    'phone' => trim(($client->getPhoneCc() ?? '') . ' ' . ($client->getPhone() ?? '')),
+                    'phone_cc' => $client->getPhoneCc() ?? '',
+                    'email' => $client->getEmail(),
+                    'zip' => $client->getPostcode(),
+                ];
             }
         } else {
             $result['client'] = null;
         }
         $result['reminded_at'] = $row['reminded_at'] ?? null;
-        $result['approved'] = (bool) ($row['approved'] ?? false);
+        $result['issued'] = (bool) $row['issued'];
+        $result['editable'] = $this->isInvoiceEditable($invoice);
+        $result['cancellable'] = $this->isInvoiceCancellable($invoice);
+        $result['deletable'] = $this->isDeletableByAdmin($invoice);
+        $result['credit_note_for_invoice_id'] = $row['credit_note_for_invoice_id'] ?? null;
+        $result['debit_note_for_invoice_id'] = $row['debit_note_for_invoice_id'] ?? null;
+        $result['replaces_invoice_id'] = $row['replaces_invoice_id'] ?? null;
+        $result['replaced_by_invoice_id'] = $row['replaced_by_invoice_id'] ?? null;
+        $result['refunded_by_invoice_ids'] = [];
+        $result['refunded_total'] = round((float) ($row['refund'] ?? 0), 2);
+        $result['remaining_refundable'] = round(max(0, $result['total'] - $result['refunded_total']), 2);
+        if ($invoice->getStatus() === Invoice::STATUS_REFUNDED || $result['refunded_total'] > 0) {
+            $result['refunded_by_invoice_ids'] = array_map(
+                fn (Invoice $creditNote): ?int => $creditNote->getId(),
+                $this->findRefundingInvoices($invoice)
+            );
+        }
         $result['income'] = ($row['base_income'] ?? 0) - ($row['base_refund'] ?? 0);
+        // A refund whose tax was never classified leaves the net basis unknown: report
+        // null rather than netting an income from a gross base_refund. No in-repo
+        // consumer reads this key (dashboards use the Stats endpoints), so no
+        // separate gross-subtraction field is needed.
+        if (($row['refund'] ?? null) !== null && ($row['base_refund_tax'] ?? null) === null) {
+            $result['income'] = null;
+        }
         $result['refund'] = $row['refund'] ?? 0;
+        // Tax portion of the refund, in base currency like `income` (unlike
+        // invoice-currency `refund`/`refunded_total`): do not subtract it from
+        // `refund`. Null when the backfill could not classify the refund, as
+        // opposed to a known zero-tax refund.
+        $result['refund_tax'] = $row['base_refund_tax'] ?? null;
         $result['credit'] = $row['credit'] ?? 0;
 
         $subscriptionService = $this->di['mod_service']('Invoice', 'Subscription');
         $subscriptionPeriod = $subscriptionService->getSubscriptionPeriod($invoice);
-        $result['subscribable'] = $subscriptionPeriod !== null;
+        $result['subscribable'] = $subscriptionPeriod !== null && (!$unpaid || $result['amount_paid'] <= 0.0);
         if ($deep && $result['subscribable']) {
             $period = $this->di['period']($subscriptionPeriod);
             $result['subscription'] = [
@@ -442,17 +555,10 @@ class Service implements InjectionAwareInterface
 
         if (!empty($orderIds)) {
             // Batch load orders
-            $orderIdPlaceholders = [];
-            $orderIdParams = [];
-            foreach ($orderIds as $idx => $id) {
-                $placeholder = ':order_id_' . $idx;
-                $orderIdPlaceholders[] = $placeholder;
-                $orderIdParams['order_id_' . $idx] = $id;
-            }
-            $orders = $this->di['db']->find('ClientOrder', 'id IN (' . implode(',', $orderIdPlaceholders) . ')', $orderIdParams);
+            $orders = $this->di['em']->getRepository(Order::class)->findBy(['id' => $orderIds]);
 
             // Batch load related products
-            $rawProductIds = array_map(static fn ($order): int => isset($order->product_id) ? (int) $order->product_id : 0, $orders);
+            $rawProductIds = array_map(static fn (Order $order): int => $order->getProductId() ?? 0, $orders);
             $nonEmptyProductIds = array_filter($rawProductIds);
             $productIds = array_unique($nonEmptyProductIds);
 
@@ -463,12 +569,13 @@ class Service implements InjectionAwareInterface
             $productsById = !empty($productIds) ? $productService->getProductSnapshotMap($productIds) : [];
 
             foreach ($orders as $order) {
-                $productId = isset($order->product_id) ? (int) $order->product_id : 0;
+                $productId = $order->getProductId() !== null ? (int) $order->getProductId() : 0;
                 $product = $productsById[$productId] ?? null;
+                $expiresAt = $order->getExpiresAt();
                 $orderData = [
-                    'id' => $order->id,
-                    'title' => $order->title,
-                    'expires_at' => $order->expires_at,
+                    'id' => $order->getId(),
+                    'title' => $order->getTitle(),
+                    'expires_at' => $expiresAt?->format('Y-m-d H:i:s'),
                 ];
 
                 if ($product) {
@@ -483,79 +590,177 @@ class Service implements InjectionAwareInterface
         return $result;
     }
 
-    public static function onAfterAdminInvoicePaymentReceived(\Box_Event $event): bool
+    /**
+     * Promotions recorded against this invoice at checkout, grouped by promo
+     * and order. Used by the admin UI to show and remove applied promos.
+     *
+     * @return list<array{
+     *     promo_id: int,
+     *     code: ?string,
+     *     title: string,
+     *     order_id: ?int,
+     *     discount_amount: float,
+     *     status: string,
+     *     removable: bool
+     * }>
+     */
+    public function getInvoicePromoApplications(Invoice $invoice): array
     {
-        $params = $event->getParameters();
-        $di = $event->getDi();
-        $service = $di['mod_service']('invoice');
+        $productService = $this->di['mod_service']('Product');
+        $redemptions = $productService->getPromoRedemptionRepository()->findBy(
+            [
+                'invoiceId' => (int) $invoice->getId(),
+                'phase' => \Box\Mod\Product\Entity\PromoRedemption::PHASE_CHECKOUT,
+            ],
+            ['id' => 'ASC']
+        );
 
+        if ($redemptions === []) {
+            return [];
+        }
+
+        $grouped = [];
+        foreach ($redemptions as $redemption) {
+            $promo = $redemption->getPromo();
+            if (!$promo instanceof \Box\Mod\Product\Entity\Promo) {
+                continue;
+            }
+
+            $key = $promo->getId() . ':' . ($redemption->getClientOrderId() ?? 0);
+            $grouped[$key] ??= [
+                'promo_id' => (int) $promo->getId(),
+                'code' => $promo->getCode(),
+                'title' => '',
+                'order_id' => $redemption->getClientOrderId() !== null ? (int) $redemption->getClientOrderId() : null,
+                'discount_amount' => 0.0,
+                'status' => $redemption->getStatus(),
+                'removable' => false,
+            ];
+            $grouped[$key]['discount_amount'] += (float) ($redemption->getDiscountAmount() ?? 0);
+            if ($redemption->getStatus() === \Box\Mod\Product\Entity\PromoRedemption::STATUS_RESERVED) {
+                $grouped[$key]['removable'] = true;
+            }
+        }
+
+        $applications = [];
+        foreach ($grouped as $entry) {
+            try {
+                $promo = $productService->findPromoById($entry['promo_id']);
+                $entry['title'] = $productService->getPromoDiscountTitle($promo, $invoice->getCurrency() ?? '');
+            } catch (\Exception) {
+                $entry['title'] = $entry['code'] ?? '';
+            }
+
+            $entry['removable'] = $entry['removable'] && $invoice->getStatus() === Invoice::STATUS_UNPAID;
+            $entry['discount_amount'] = round($entry['discount_amount'], 2);
+            $applications[] = $entry;
+        }
+
+        return $applications;
+    }
+
+    #[AsEventListener]
+    public function sendPaidInvoiceEmail(AfterAdminInvoicePaymentReceivedEvent $event): void
+    {
         try {
-            $invoiceModel = $di['db']->load('Invoice', $params['id'] ?? 0);
-            $invoice = $service->toApiArray($invoiceModel, true, null, true);
+            $invoiceModel = $this->di['em']->getRepository(Invoice::class)->find($event->invoiceId);
+            if (!$invoiceModel instanceof Invoice) {
+                return;
+            }
+
+            $invoice = $this->toApiArray($invoiceModel, true, null, true);
             if (($invoice['total'] ?? 0) > 0) {
-                $service->sendInvoiceEmail($invoiceModel, $invoice, 'mod_invoice_paid');
+                $this->sendInvoiceEmail($invoiceModel, $invoice, 'mod_invoice_paid');
             }
         } catch (\Exception $exc) {
-            $di['logger']->setChannel('email')->error('Failed to send email for invoice payment', ['exception' => $exc->getMessage()]);
+            $this->di['logger']->withChannel('email')->error('Failed to send email for invoice payment', ['exception' => $exc]);
         }
-
-        return true;
     }
 
-    public static function onAfterInvoiceCreate(\Box_Event $event): bool
+    #[AsEventListener]
+    public function sendIssuedInvoiceEmail(AfterAdminInvoiceIssueEvent $event): void
     {
-        $params = $event->getParameters();
-        $di = $event->getDi();
-        $service = $di['mod_service']('invoice');
-
         try {
-            $invoiceModel = $di['db']->load('Invoice', $params['id']);
-            $invoice = $service->toApiArray($invoiceModel, true, null, true);
-            $service->sendInvoiceEmail($invoiceModel, $invoice, 'mod_invoice_created');
-        } catch (\Exception $exc) {
-            $di['logger']->setChannel('email')->error('Failed to send email for invoice creation', ['exception' => $exc->getMessage()]);
-        }
+            $invoiceModel = $this->di['em']->getRepository(Invoice::class)->find($event->invoiceId);
+            if (!$invoiceModel instanceof Invoice) {
+                return;
+            }
 
-        return true;
-    }
-
-    public static function onAfterAdminInvoiceApprove(\Box_Event $event): bool
-    {
-        $params = $event->getParameters();
-        $di = $event->getDi();
-        $service = $di['mod_service']('invoice');
-
-        try {
-            $invoiceModel = $di['db']->load('Invoice', $params['id'] ?? 0);
-
-            if (($params['total'] ?? 0) > 0
-                && ($params['status'] ?? null) !== \Model_Invoice::STATUS_PAID
-                && isset($params['client']['id'])
-            ) {
-                if ($invoiceModel instanceof \Model_Invoice) {
-                    $service->sendInvoiceEmail($invoiceModel, $params, 'mod_invoice_created', (int) $params['client']['id']);
+            // Deferred delivery records its email checkpoint in the same
+            // transaction as the queued message. A later listener failure can
+            // then retry the event without queuing a second email.
+            $deliver = function () use ($invoiceModel, $event): void {
+                if ($event->retryOnFailure && ($invoiceModel->getIssueNotificationState() & 4) !== 0) {
+                    return;
                 }
-            }
+                $invoice = $this->toApiArray($invoiceModel, true, null, true);
+                if (($invoice['total'] ?? 0) > 0
+                    && ($invoice['status'] ?? null) === Invoice::STATUS_UNPAID
+                    && isset($invoice['client']['id'])
+                ) {
+                    $this->sendInvoiceEmail($invoiceModel, $invoice, 'mod_invoice_created', (int) $invoice['client']['id']);
+                }
+                $this->extendInvoiceHashLifetime($invoiceModel);
+                if ($event->retryOnFailure) {
+                    $invoiceModel->setIssueNotificationState($invoiceModel->getIssueNotificationState() | 4);
+                    $this->di['em']->flush();
+                }
+            };
+            if ($event->retryOnFailure) {
+                $em = $this->di['em'];
+                $connection = $em->getConnection();
+                $known = new \SplObjectStorage();
+                foreach ($em->getUnitOfWork()->getIdentityMap() as $entities) {
+                    foreach ($entities as $entity) {
+                        $known[$entity] = true;
+                    }
+                }
+                $connection->beginTransaction();
 
-            // Sending the created-email extends the hash lifetime so the
-            // recipient has a fresh window to act on the link.
-            if ($invoiceModel instanceof \Model_Invoice) {
-                $service->extendInvoiceHashLifetime($invoiceModel);
+                try {
+                    $this->lockAndRefreshInvoice($invoiceModel);
+                    $deliver();
+                    $connection->commit();
+                } catch (\Throwable $e) {
+                    $connection->rollBack();
+                    if ($em->isOpen()) {
+                        // Flushed queue/template objects no longer have rows.
+                        // Detach them so reused IDs cannot collide on retry.
+                        foreach ($em->getUnitOfWork()->getIdentityMap() as $entities) {
+                            foreach ($entities as $entity) {
+                                if (!isset($known[$entity])) {
+                                    $em->detach($entity);
+                                }
+                            }
+                        }
+                        foreach ($em->getUnitOfWork()->getScheduledEntityInsertions() as $entity) {
+                            if (!isset($known[$entity])) {
+                                $em->detach($entity);
+                            }
+                        }
+                        $em->refresh($invoiceModel);
+                    }
+
+                    throw $e;
+                }
+            } else {
+                $deliver();
             }
         } catch (\Exception $exc) {
-            $di['logger']->setChannel('email')->error('Failed to send email for invoice approval', ['exception' => $exc->getMessage()]);
+            $this->di['logger']->withChannel('email')->error('Failed to send email for an issued invoice', ['exception' => $exc]);
+            if ($event->retryOnFailure) {
+                throw $exc;
+            }
         }
-
-        return true;
     }
 
-    private function sendInvoiceEmail(\Model_Invoice $invoice, array $invoiceData, string $templateCode, ?int $clientId = null): void
+    private function sendInvoiceEmail(Invoice $invoice, array $invoiceData, string $templateCode, ?int $clientId = null, array $extraVars = []): void
     {
         $email = [
-            'to_client' => $clientId ?? $invoice->client_id,
+            'to_client' => $clientId ?? $invoice->getClientId(),
             'code' => $templateCode,
             'invoice' => $invoiceData,
-        ];
+        ] + $extraVars;
         $email = $this->withBillingRecipient($email, $invoiceData);
 
         $attachment = $this->getInvoicePdfAttachment($invoice);
@@ -566,25 +771,170 @@ class Service implements InjectionAwareInterface
         $this->di['mod_service']('email')->sendTemplate($email);
     }
 
-    public static function onAfterAdminInvoiceReminderSent(\Box_Event $event): void
+    /**
+     * Notify the client that their paid invoice was refunded as a credit note.
+     */
+    private function sendRefundEmail(Invoice $original, Invoice $creditNote, bool $toCredit = false): void
     {
-        $params = $event->getParameters();
-        $di = $event->getDi();
-        $service = $di['mod_service']('invoice');
+        $creditNoteData = $this->toApiArray($creditNote);
+        if (($creditNoteData['total'] ?? 0) >= 0 || $original->getClientId() === null) {
+            return;
+        }
+
+        $this->sendInvoiceEmail(
+            $creditNote,
+            $creditNoteData,
+            'mod_invoice_refunded',
+            null,
+            ['original_invoice' => $this->toApiArray($original), 'to_credit' => $toCredit]
+        );
+        $this->extendInvoiceHashLifetime($creditNote);
+    }
+
+    /**
+     * Notify the client that their unpaid invoice was voided, when the
+     * invoice_send_cancel_email setting opts in. Guest (client-less)
+     * invoices have no recipient, so they stay silent.
+     */
+    private function sendCancelEmail(Invoice $original, string $reason = '', ?Invoice $replacement = null): void
+    {
+        if ($original->getClientId() === null) {
+            return;
+        }
+
+        $systemService = $this->di['mod_service']('system');
+        if ($systemService->getParamValue('invoice_send_cancel_email', '0') !== '1') {
+            return;
+        }
+
+        $extraVars = ['reason' => $reason];
+        if ($replacement instanceof Invoice) {
+            $extraVars['replacement_invoice'] = $this->toApiArray($replacement);
+        }
+
+        $this->sendInvoiceEmail(
+            $original,
+            $this->toApiArray($original),
+            'mod_invoice_canceled',
+            null,
+            $extraVars
+        );
+    }
+
+    /**
+     * Append an entry to the invoice journal: a trimmed snapshot of the
+     * invoice taken after the transition, so the full history (including
+     * past buyer/seller details) stays queryable after the fact. Journal
+     * writes normally log and swallow failures, mirroring the mail sends.
+     * Required financial receipts instead propagate failures so their
+     * surrounding bookkeeping transaction cannot commit without the receipt.
+     *
+     * The row is written with a raw DBAL insert rather than through the
+     * EntityManager, nested in the caller's transaction via a savepoint when
+     * one is active (the mutation paths call this inside their
+     * `wrapInTransaction` closures, so the row commits atomically with the
+     * transition) and in its own implicit transaction otherwise. Bypassing
+     * the UnitOfWork matters: a failed insert rolls back only its savepoint
+     * instead of leaving a poisoned pending insertion that a later flush
+     * would retry — which would fail the surrounding mutation and close the
+     * EntityManager.
+     */
+    public function recordJournalEvent(Invoice $invoice, string $type, ?array $extra = null, bool $required = false): void
+    {
+        try {
+            $data = $this->toApiArray($invoice);
+            $gateway = $invoice->getGateway();
+            $snapshot = [
+                'serie_nr' => $data['serie_nr'] ?? null,
+                'status' => $data['status'] ?? null,
+                'issued' => $data['issued'] ?? null,
+                'subtotal' => $data['subtotal'] ?? null,
+                'tax' => $data['tax'] ?? null,
+                'total' => $data['total'] ?? null,
+                'buyer' => $data['buyer'] ?? null,
+                'seller' => $data['seller'] ?? null,
+                'paid_at' => $data['paid_at'] ?? null,
+                'due_at' => $data['due_at'] ?? null,
+                'created_at' => $data['created_at'] ?? null,
+                'gateway_id' => $gateway?->getId(),
+                // Frozen display title: gateway settings may change or the
+                // gateway may be removed later, while the journal is an
+                // immutable audit record.
+                'gateway' => $gateway?->getName() ?: $gateway?->getGateway(),
+            ];
+            if ($extra !== null) {
+                $snapshot += $extra;
+            }
+
+            $adminId = null;
+            if (isset($this->di['auth']) && $this->di['auth']->isAdminLoggedIn() && isset($this->di['loggedin_admin'])) {
+                $adminId = (int) $this->di['loggedin_admin']->getId();
+            }
+
+            $snapshotJson = json_encode($snapshot, JSON_INVALID_UTF8_SUBSTITUTE);
+            if ($snapshotJson === false) {
+                throw new \FOSSBilling\Core\Exception\BaseException('Unable to encode the invoice journal snapshot.');
+            }
+
+            $connection = $this->di['em']->getConnection();
+            $connection->transactional(function () use ($connection, $invoice, $type, $adminId, $snapshotJson): void {
+                $connection->executeStatement(
+                    'INSERT INTO invoice_event (invoice_id, type, admin_id, client_id, snapshot, created_at) VALUES (:invoice_id, :type, :admin_id, :client_id, :snapshot, :created_at)',
+                    [
+                        'invoice_id' => $invoice->getId(),
+                        'type' => $type,
+                        'admin_id' => $adminId,
+                        'client_id' => $invoice->getClientId(),
+                        'snapshot' => $snapshotJson,
+                        'created_at' => date('Y-m-d H:i:s'),
+                    ]
+                );
+            });
+        } catch (\Throwable $exception) {
+            if ($required) {
+                throw $exception;
+            }
+            $this->di['logger']->error('Failed to record invoice journal event', [
+                'invoice_id' => $invoice->getId(),
+                'exception' => $exception,
+            ]);
+        }
+    }
+
+    /**
+     * @return list<array>
+     */
+    public function getJournalForInvoice(int $invoiceId): array
+    {
+        $events = $this->di['em']->getRepository(InvoiceEvent::class)->findByInvoiceId($invoiceId);
+
+        return array_map(fn (InvoiceEvent $event): array => [
+            'id' => $event->getId(),
+            'type' => $event->getType(),
+            'admin_id' => $event->getAdminId(),
+            'client_id' => $event->getClientId(),
+            'snapshot' => $event->getSnapshot(),
+            'created_at' => $event->getCreatedAt()?->format('Y-m-d H:i:s'),
+        ], $events);
+    }
+
+    public function sendInvoiceReminderEmail(AfterAdminInvoiceReminderRecordedEvent $event): void
+    {
+        $di = $this->di ?? throw new \LogicException('The Invoice service dependency injection container has not been set.');
 
         try {
-            $invoiceModel = $di['db']->load('Invoice', $params['id'] ?? 0);
-            if (!$invoiceModel instanceof \Model_Invoice) {
+            $invoiceModel = $di['em']->getRepository(Invoice::class)->find($event->invoiceId);
+            if (!$invoiceModel instanceof Invoice) {
                 return;
             }
 
-            $invoice = $service->toApiArray($invoiceModel, true, null, true);
+            $invoice = $this->toApiArray($invoiceModel, true, null, true);
             $email = [];
-            $email['to_client'] = $invoiceModel->client_id;
+            $email['to_client'] = $invoiceModel->getClientId();
             $email['code'] = 'mod_invoice_payment_reminder';
             $email['invoice'] = $invoice;
-            $email = $service->withBillingRecipient($email, $invoice);
-            $attachment = $service->getInvoicePdfAttachment($invoiceModel);
+            $email = $this->withBillingRecipient($email, $invoice);
+            $attachment = $this->getInvoicePdfAttachment($invoiceModel);
             if ($attachment !== null) {
                 $email['attachment'] = $attachment;
             }
@@ -593,21 +943,31 @@ class Service implements InjectionAwareInterface
 
             // Sending a payment reminder also re-extends the hash lifetime
             // since the recipient is being re-engaged via the same link.
-            $service->extendInvoiceHashLifetime($invoiceModel);
-        } catch (\Exception $exc) {
-            $di['logger']->setChannel('email')->error('Failed to send invoice reminder email', ['exception' => $exc->getMessage()]);
+            $this->extendInvoiceHashLifetime($invoiceModel);
+        } catch (\Throwable $exc) {
+            $di['logger']->withChannel('email')->error('Failed to send invoice reminder email', ['exception' => $exc]);
         }
     }
 
-    public static function onEventBeforeInvoiceIsDue(\Box_Event $event): void
+    #[AsEventListener]
+    public function onEventBeforeInvoiceIsDue(BeforeInvoiceIsDueEvent $event): void
     {
-        $params = $event->getParameters();
-        $di = $event->getDi();
-        $service = $di['mod_service']('invoice');
+        $di = $this->di ?? throw new \LogicException('The Invoice service dependency injection container has not been set.');
         $claimed = false;
 
         try {
-            if (!$service->isInvoiceReminderIntervalEnabled('invoice_reminder_before_due_days', (int) ($params['days_left'] ?? 0), '', $params['reminder_intervals'] ?? null)) {
+            // Defer until the configured send time; returning before the claim
+            // leaves reminded_at untouched so a later cron retries.
+            if (!$this->isReminderSendTimeReached()) {
+                return;
+            }
+
+            if (!$this->isInvoiceReminderIntervalEnabled('invoice_reminder_before_due_days', $event->daysLeft, '', $event->reminderIntervals)) {
+                return;
+            }
+
+            // No reminder before the due date while a bank debit of the invoice is clearing.
+            if (PendingPayments::forInvoice($di['em']->getConnection(), $event->invoiceId) !== null) {
                 return;
             }
 
@@ -615,52 +975,140 @@ class Service implements InjectionAwareInterface
             // reminder being sent twice when this event is dispatched more than once for the
             // same invoice (overlapping cron runs, the once-daily batch and the pending-reminder
             // fallback both firing it, etc).
-            $claimed = (bool) $di['db']->exec(
-                "UPDATE invoice SET reminded_at = NOW(), updated_at = NOW() WHERE id = :id AND status = 'unpaid' AND approved = 1 AND due_at > NOW() AND (reminded_at IS NULL OR DATE(reminded_at) < CURDATE())",
-                [':id' => $params['id'] ?? 0]
+            $now = new \DateTimeImmutable();
+            $claimed = (bool) $di['em']->getConnection()->executeStatement(
+                "UPDATE invoice SET reminded_at = :now, updated_at = :now WHERE id = :id AND status = 'unpaid' AND issued = true AND due_at > :now AND (reminded_at IS NULL OR reminded_at < :today_start)",
+                [
+                    'id' => $event->invoiceId,
+                    'now' => $now->format('Y-m-d H:i:s'),
+                    'today_start' => $now->modify('today')->format('Y-m-d H:i:s'),
+                ]
             );
             if (!$claimed) {
                 return;
             }
 
-            $invoiceModel = $di['db']->load('Invoice', $params['id'] ?? 0);
-            if ($invoiceModel instanceof \Model_Invoice) {
-                $service->sendInvoiceReminder($invoiceModel);
+            $invoiceModel = $di['em']->getRepository(Invoice::class)->find($event->invoiceId);
+            if ($invoiceModel instanceof Invoice) {
+                $this->sendInvoiceReminder($invoiceModel);
             }
         } catch (\Exception $exc) {
             if ($claimed) {
-                // sendInvoiceReminder()'s downstream send handler (onAfterAdminInvoiceReminderSent)
-                // catches its own failures internally, so any exception reaching here means the
-                // email was never queued. Release the claim so a later cron run retries it instead
-                // of the reminder being silently lost for the day.
-                $di['db']->exec('UPDATE invoice SET reminded_at = NULL WHERE id = :id', [':id' => $params['id'] ?? 0]);
+                // sendInvoiceReminder() handles errors after recording separately. An exception
+                // reaching here occurred before the reminder was recorded, so release the claim.
+                $di['em']->getConnection()->executeStatement('UPDATE invoice SET reminded_at = NULL WHERE id = :id', ['id' => $event->invoiceId]);
             }
-            $di['logger']->setChannel('email')->error('Failed to send invoice reminder email', ['id' => $params['id'] ?? null, 'exception' => $exc->getMessage()]);
+            $di['logger']->withChannel('email')->error('Failed to send invoice reminder email', ['id' => $event->invoiceId, 'exception' => $exc]);
         }
     }
 
-    public static function onAfterAdminCronRun(\Box_Event $event): void
+    #[AsEventListener]
+    public function healMissingJournalEntries(AfterAdminCronRunEvent $event): void
     {
-        $di = $event->getDi();
+        $di = $this->di ?? throw new \LogicException('The Invoice service dependency injection container has not been set.');
+
+        // Bounded to one page per run: invoices that never got any journal row (a lost
+        // write, or a table created after its invoices by drift healing) converge over
+        // runs instead of stalling this one. Failures stay local to the cron log.
+        // Legacy tax-inclusive refunds converge the same way, independently of the
+        // schema-hash gate: a finalization whose sync failed leaves these rows for
+        // drift healing, which only runs one bounded page per request.
+        $patcher = new \FOSSBilling\Core\Update\Patcher();
+        $patcher->setDi($di);
+
+        try {
+            $patcher->healInvoiceJournal();
+        } catch (\Throwable $e) {
+            $di['logger']->warning('Invoice journal healing failed: {message}', ['message' => $e->getMessage()]);
+        }
+
+        try {
+            $patcher->backfillRefundIncomeBasis(1);
+        } catch (\Throwable $e) {
+            $di['logger']->warning('Refund income basis healing failed: {message}', ['message' => $e->getMessage()]);
+        }
+    }
+
+    #[AsEventListener]
+    public function removeExpiredUnpaidInvoices(AfterAdminCronRunEvent $event): void
+    {
+        $di = $this->di ?? throw new \LogicException('The Invoice service dependency injection container has not been set.');
         $systemService = $di['mod_service']('System');
         $remove_after_days = $systemService->getParamValue('remove_after_days');
         if (isset($remove_after_days) && $remove_after_days) {
-            // removing old invoices
+            // Expire stale unpaid invoices. Drafts (never issued) are hard-deleted
+            // through rmInvoice(); issued invoices are voided instead so their
+            // numbers stay in the audit trail.
             $days = (int) $remove_after_days;
-            $sql = 'DELETE FROM invoice WHERE status = :status AND DATEDIFF(NOW(), due_at) > :days';
-            $di['db']->exec($sql, [':days' => $days, ':status' => \Model_Invoice::STATUS_UNPAID]);
+            $service = $di['mod_service']('invoice');
+            $invoices = $service->getInvoiceRepository()->findUnpaidOlderThan($days);
+            foreach ($invoices as $invoiceModel) {
+                $id = $invoiceModel->getId();
+
+                try {
+                    // Keep invoices still tied to a live order (first or
+                    // renewal invoice of an active/suspended order): removing
+                    // them here would delete and re-create them on every cron
+                    // run, with an email each time.
+                    $liveOrder = $di['em']->getConnection()->fetchOne(
+                        "SELECT id FROM client_order WHERE unpaid_invoice_id = :id AND status IN ('active', 'suspended') LIMIT 1",
+                        ['id' => $id]
+                    );
+                    if ($liveOrder !== false && $liveOrder !== null) {
+                        $di['logger']->info('Skipped expired unpaid invoice #{id}: linked to a live order', ['id' => $id]);
+
+                        continue;
+                    }
+
+                    if ($service->isInvoiceCancellable($invoiceModel)) {
+                        $service->cancelInvoice($invoiceModel, ['reason' => "Expired unpaid — automatically voided after {$days} days."]);
+                        $di['logger']->info('Voided expired unpaid invoice #{id}', ['id' => $id]);
+                    } elseif (!$invoiceModel->isIssued()
+                        && $invoiceModel->getStatus() === Invoice::STATUS_UNPAID
+                        && $invoiceModel->getCreditNoteForInvoiceId() === null
+                        && $invoiceModel->getDebitNoteForInvoiceId() === null
+                        && $invoiceModel->getReplacesInvoiceId() === null
+                        && $invoiceModel->getReplacedByInvoiceId() === null
+                    ) {
+                        // Rechecked under the row lock inside rmInvoice(): a
+                        // draft that was issued, paid, or linked after the
+                        // listing read above is refused instead of deleted.
+                        $service->rmInvoice($invoiceModel, true);
+                        $di['logger']->info('Removed expired unpaid invoice #{id}', ['id' => $id]);
+                    } else {
+                        // Issued notes (e.g. unpaid debit notes) are legal
+                        // documents with links from their originals: neither
+                        // voiding nor deleting applies, leave them for manual
+                        // handling (refund/reissue of the original).
+                        $di['logger']->info('Skipped expired unpaid invoice #{id}: issued notes are never removed automatically', ['id' => $id]);
+                    }
+                } catch (\Throwable $e) {
+                    // One expired invoice (e.g. one changed concurrently) must
+                    // not abort cleanup of the rest.
+                    $di['logger']->warning('Could not expire unpaid invoice #{id}: {message}', ['id' => $id, 'message' => $e->getMessage()]);
+                }
+            }
         }
     }
 
-    public static function onEventAfterInvoiceIsDue(\Box_Event $event): void
+    #[AsEventListener]
+    public function onEventAfterInvoiceIsDue(AfterInvoiceIsDueEvent $event): void
     {
-        $params = $event->getParameters();
-        $di = $event->getDi();
-        $service = $di['mod_service']('invoice');
+        $di = $this->di ?? throw new \LogicException('The Invoice service dependency injection container has not been set.');
         $claimed = false;
 
         try {
-            if (!$service->isInvoiceReminderIntervalEnabled('invoice_reminder_after_due_days', (int) ($params['days_passed'] ?? 0), '5', $params['reminder_intervals'] ?? null)) {
+            // Same deferral as the before-due handler; no claim is made yet.
+            if (!$this->isReminderSendTimeReached()) {
+                return;
+            }
+
+            if (!$this->isInvoiceReminderIntervalEnabled('invoice_reminder_after_due_days', $event->daysPassed, '5', $event->reminderIntervals)) {
+                return;
+            }
+
+            // No overdue reminder while a bank debit of the invoice is clearing.
+            if (PendingPayments::forInvoice($di['em']->getConnection(), $event->invoiceId) !== null) {
                 return;
             }
 
@@ -669,31 +1117,41 @@ class Service implements InjectionAwareInterface
             // same invoice (overlapping cron runs, the once-daily batch and the pending-reminder
             // fallback both firing it, etc). The claim UPDATE already persists reminded_at and
             // updated_at, so there's no need to store the loaded model again once sent below.
-            $claimed = (bool) $di['db']->exec(
-                "UPDATE invoice SET reminded_at = NOW(), updated_at = NOW() WHERE id = :id AND status = 'unpaid' AND approved = 1 AND ((due_at < NOW()) OR (ABS(DATEDIFF(due_at, NOW())) = 0)) AND (reminded_at IS NULL OR DATE(reminded_at) < CURDATE())",
-                [':id' => $params['id'] ?? 0]
+            // due_at < :tomorrow_start is a portable stand-in for MySQL's
+            // (due_at < NOW()) OR (ABS(DATEDIFF(due_at, NOW())) = 0): "already overdue, or due
+            // sometime today" is exactly "due before the start of tomorrow".
+            $now = new \DateTimeImmutable();
+            $todayStart = $now->modify('today');
+            $claimed = (bool) $di['em']->getConnection()->executeStatement(
+                "UPDATE invoice SET reminded_at = :now, updated_at = :now WHERE id = :id AND status = 'unpaid' AND issued = true AND due_at < :tomorrow_start AND (reminded_at IS NULL OR reminded_at < :today_start)",
+                [
+                    'id' => $event->invoiceId,
+                    'now' => $now->format('Y-m-d H:i:s'),
+                    'today_start' => $todayStart->format('Y-m-d H:i:s'),
+                    'tomorrow_start' => $todayStart->modify('+1 day')->format('Y-m-d H:i:s'),
+                ]
             );
             if (!$claimed) {
                 return;
             }
 
-            $invoiceModel = $di['db']->load('Invoice', $params['id']);
-            if (!$invoiceModel instanceof \Model_Invoice) {
+            $invoiceModel = $di['em']->getRepository(Invoice::class)->find($event->invoiceId);
+            if (!$invoiceModel instanceof Invoice) {
                 return;
             }
 
-            $invoice = $service->toApiArray($invoiceModel, true, null, true);
+            $invoice = $this->toApiArray($invoiceModel, true, null, true);
             if (!isset($invoice['client']) || !is_array($invoice['client']) || !isset($invoice['client']['id'])) {
-                throw new \FOSSBilling\Exception('Invoice client data is unavailable.');
+                throw new \FOSSBilling\Core\Exception\BaseException('Invoice client data is unavailable.');
             }
 
             $email = [];
             $email['to_client'] = $invoice['client']['id'];
             $email['code'] = 'mod_invoice_due_after';
-            $email['days_passed'] = $params['days_passed'];
+            $email['days_passed'] = $event->daysPassed;
             $email['invoice'] = $invoice;
-            $email = $service->withBillingRecipient($email, $invoice);
-            $attachment = $service->getInvoicePdfAttachment($invoiceModel);
+            $email = $this->withBillingRecipient($email, $invoice);
+            $attachment = $this->getInvoicePdfAttachment($invoiceModel);
             if ($attachment !== null) {
                 $email['attachment'] = $attachment;
             }
@@ -705,138 +1163,335 @@ class Service implements InjectionAwareInterface
                 // Nothing past sendTemplate() can throw, so reaching here with a claim already
                 // made means the email was never confirmed queued. Release the claim so a later
                 // cron run retries this invoice instead of losing the reminder.
-                $di['db']->exec('UPDATE invoice SET reminded_at = NULL WHERE id = :id', [':id' => $params['id'] ?? 0]);
+                $di['em']->getConnection()->executeStatement('UPDATE invoice SET reminded_at = NULL WHERE id = :id', ['id' => $event->invoiceId]);
             }
-            $di['logger']->setChannel('email')->error('Failed to send overdue invoice email', ['id' => $params['id'] ?? null, 'exception' => $exc->getMessage()]);
+            $di['logger']->withChannel('email')->error('Failed to send overdue invoice email', ['id' => $event->invoiceId, 'exception' => $exc]);
         }
     }
 
     /**
      * Route invoice notifications to the client's optional billing address while retaining
      * to_client so templates, timezone handling, and client email history keep working.
+     * Uses the internal `client_billing_email` override validated by the email service.
      */
     public function withBillingRecipient(array $email, array $invoice): array
     {
         $billingEmail = trim((string) ($invoice['client']['billing_email'] ?? ''));
-        if ($billingEmail !== '') {
-            $email['to'] = $billingEmail;
+        if ($billingEmail !== '' && filter_var($billingEmail, FILTER_VALIDATE_EMAIL) !== false) {
+            $email['client_billing_email'] = $billingEmail;
         }
 
         return $email;
     }
 
-    public function markAsPaid(\Model_Invoice $invoice, $charge = true, $execute = false): bool
+    public function markAsPaid(Invoice $invoice, $charge = true, $execute = false, bool $deferEvents = false, ?\DateTimeImmutable $paidAtOverride = null, ?bool &$actuallyPaid = null): bool
     {
-        if ($invoice->status == \Model_Invoice::STATUS_PAID) {
+        /** @var InvoiceItem[] $invoiceItems */
+        $invoiceItems = [];
+        $paid = $this->di['em']->wrapInTransaction(function () use (&$invoiceItems, $invoice, $charge, $paidAtOverride): bool {
+            return $this->markAsPaidInTransaction($invoice, $charge, $invoiceItems, $paidAtOverride);
+        });
+        $actuallyPaid = $paid;
+
+        // Replays and deletion holds do not settle another payment. Accept the
+        // receipt without sending payment events or executing service tasks.
+        if (!$paid) {
             return true;
         }
 
-        $invoiceItems = $this->getInvoiceItemRepository()->findByInvoiceId((int) $invoice->id);
+        // Listeners render PDFs and send email, so a caller holding row locks defers this until
+        // after it has committed rather than holding them for the duration of an SMTP send.
+        if (!$deferEvents) {
+            $this->firePaymentReceivedEvent($invoice);
+        }
+
+        if ($execute) {
+            $this->executeInvoiceItemTasks($invoiceItems, $this->di['mod_service']('Invoice', 'InvoiceItem'));
+        }
+
+        $this->di['logger']->info('Marked invoice #{invoice_id} as paid', ['invoice_id' => $invoice->getId()]);
+
+        return true;
+    }
+
+    /**
+     * Mark an invoice as paid while the caller owns its invoice-row lock.
+     *
+     * The paid journal row is persisted in the same transaction: it commits
+     * atomically with the payment, so a crash can no longer leave a paid
+     * invoice without its journal entry.
+     *
+     * @param InvoiceItem[] $invoiceItems
+     */
+    private function markAsPaidInTransaction(Invoice $invoice, bool $charge, array &$invoiceItems, ?\DateTimeImmutable $paidAtOverride = null): bool
+    {
+        $state = $this->lockAndRefreshInvoice($invoice);
+        if ($state['status'] === Invoice::STATUS_PAID) {
+            return false;
+        }
+        if ($state['status'] === Invoice::STATUS_CANCELED || $invoice->getReplacedByInvoiceId() !== null) {
+            throw new InformationException('This invoice was canceled and cannot be marked as paid');
+        }
+
+        if ($state['status'] !== Invoice::STATUS_UNPAID) {
+            throw new InformationException('Only an unpaid invoice can be marked as paid.');
+        }
+
+        // A gateway may already have credited incoming funds. Keep those funds
+        // available for staff reconciliation without settling a held invoice.
+        if ($this->invoiceHasDeletionHold($invoice)) {
+            return false;
+        }
+
+        $invoiceItems = $this->getInvoiceItemRepository()->findByInvoiceId((int) $invoice->getId());
         $invoiceItemService = $this->di['mod_service']('Invoice', 'InvoiceItem');
+
         foreach ($invoiceItems as $item) {
             $invoiceItemService->markAsPaid($item, $charge);
         }
-
-        $systemService = $this->di['mod_service']('system');
 
         $currencyService = $this->di['mod_service']('currency');
         /** @var \Box\Mod\Currency\Repository\CurrencyRepository $currencyRepository */
         $currencyRepository = $currencyService->getCurrencyRepository();
 
-        $invoice->serie = $systemService->getParamValue('invoice_series_paid');
-        $invoice->approved = true;
+        // The invoice number is fixed once issued: paying must not rewrite the
+        // series, so paid invoices keep the number they were issued with.
+        $invoice->setIssued(true);
 
-        $currencyRate = $currencyRepository->getRateByCode((string) $invoice->currency);
+        $currencyRate = $currencyRepository->getRateByCode((string) $invoice->getCurrency());
         if ($currencyRate === null) {
-            throw new \FOSSBilling\Exception("Currency rate for code '{$invoice->currency}' is not configured.");
+            throw new \FOSSBilling\Core\Exception\BaseException("Currency rate for code '{$invoice->getCurrency()}' is not configured.");
         }
-        $invoice->currency_rate = $currencyRate;
+        $invoice->setCurrencyRate($currencyRate);
 
-        $invoice->status = \Model_Invoice::STATUS_PAID;
-        $invoice->paid_at = date('Y-m-d H:i:s');
-        $invoice->updated_at = date('Y-m-d H:i:s');
-        $this->di['db']->store($invoice);
+        $invoice->setStatus(Invoice::STATUS_PAID);
+        $invoice->setPaidAt($paidAtOverride ?? new \DateTimeImmutable());
+        $this->di['em']->persist($invoice);
+        $this->di['em']->flush();
 
         $this->countIncome($invoice);
         $productService = $this->di['mod_service']('Product');
         $productService->commitReservedPromoRedemptionsForInvoice($invoice);
 
-        $this->di['events_manager']->fire(['event' => 'onAfterAdminInvoicePaymentReceived', 'params' => ['id' => $invoice->id]]);
-
-        if ($execute) {
-            foreach ($invoiceItems as $item) {
-                try {
-                    $invoiceItemService->executeTask($item);
-                } catch (\Exception $e) {
-                    $this->di['logger']->warning($e->getMessage());
-                }
-            }
-        }
-
-        $this->di['logger']->info("Marked invoice {$invoice->id} as paid.");
+        $this->recordJournalEvent($invoice, InvoiceEvent::TYPE_PAID);
 
         return true;
     }
 
-    public function markAsPaidByAdmin(\Model_Invoice $invoice, array $data = []): bool
+    public function markAsPaidByAdmin(Invoice $invoice, array $data = []): bool
     {
-        if ($invoice->status === \Model_Invoice::STATUS_PAID) {
+        if ($invoice->getStatus() === Invoice::STATUS_PAID) {
             return true;
         }
+        if ($invoice->getStatus() === Invoice::STATUS_CANCELED || $invoice->getReplacedByInvoiceId() !== null) {
+            throw new InformationException('This invoice was canceled and cannot be marked as paid');
+        }
 
-        $execute = Tools::normalizeBoolean($data['execute'] ?? false);
+        $execute = \FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($data['execute'] ?? false);
         $payGateway = $this->validateAdminMarkAsPaidRequest($data, $invoice);
         $transactionId = isset($data['transactionId']) ? trim((string) $data['transactionId']) : null;
 
-        if ((int) $payGateway->getId() !== (int) $invoice->gateway_id) {
-            $invoice->gateway_id = (int) $payGateway->getId();
-            $invoice->updated_at = date('Y-m-d H:i:s');
-            $this->di['db']->store($invoice);
+        // Parse before any write so a bad date fails fast without side effects.
+        $paidAt = null;
+        if (isset($data['paid_at']) && trim((string) $data['paid_at']) !== '') {
+            $paidAtTimestamp = strtotime((string) $data['paid_at']);
+            if ($paidAtTimestamp === false) {
+                throw new InformationException('Invalid date format for paid_at: :value', [':value' => (string) $data['paid_at']]);
+            }
+            $paidAt = new \DateTimeImmutable(date('Y-m-d H:i:s', $paidAtTimestamp));
         }
 
-        if ($payGateway->getGateway() === 'Custom' && $payGateway->isEnabled()) {
-            $transactionService = $this->di['mod_service']('Invoice', 'Transaction');
-            $invoiceTotal = $this->getTotalWithTax($invoice);
-            $newtx = $transactionService->create([
-                'invoice_id' => $invoice->id,
-                'gateway_id' => $invoice->gateway_id,
-                'currency' => $invoice->currency,
-                'status' => 'received',
-                'source' => 'admin',
-                'post' => [
-                    'invoice_id' => $invoice->id,
-                    'txn_id' => $transactionId,
-                ],
-                'txn_id' => $transactionId,
-            ]);
-            $transaction = $this->di['em']->getRepository(Transaction::class)->find((int) $newtx);
-            if ($transaction === null) {
-                throw new InformationException('Transaction not found');
-            }
-            if ((int) $transaction->getInvoiceId() !== (int) $invoice->id) {
-                throw new InformationException('Transaction ID is already associated with another invoice.');
-            }
-
-            $result = $this->markAsPaid($invoice, false, $execute);
-            if ($result) {
-                $transaction->setAmount((string) $invoiceTotal);
-                $transaction->setCurrency($invoice->currency);
-                $transaction->setStatus(Transaction::STATUS_PROCESSED);
-                $gatewayTitle = $payGateway->getName() ?: $payGateway->getGateway();
-                $transaction->setNote(sprintf('%s transaction No: %s', $gatewayTitle, $transactionId));
-                $transaction->setUpdatedAt(new \DateTime());
-                $this->di['em']->flush();
-            }
-
-            return $result;
+        if ($this->invoiceHasDeletionHold($invoice)) {
+            throw new InformationException('Order deletion is awaiting recovery. Retry deletion before recording a manual payment.');
         }
 
-        return $this->markAsPaid($invoice, false, $execute);
+        if ($payGateway->getGateway() === 'Custom') {
+            $actuallyPaid = null;
+            $paid = $this->withCreditLock((int) $invoice->getClientId(), function () use ($invoice, $payGateway, $transactionId, $paidAt, &$actuallyPaid): bool {
+                return $this->di['em']->wrapInTransaction(function () use ($invoice, $payGateway, $transactionId, $paidAt, &$actuallyPaid): bool {
+                    // Re-validate under the invoice lock: the invoice may have
+                    // been canceled or replaced after the preflight check above.
+                    // Creating the transaction record in this transaction means a
+                    // rejection rolls it back instead of stranding a received
+                    // record on a canceled invoice.
+                    $state = $this->lockAndRefreshInvoice($invoice);
+                    if ($state['status'] === Invoice::STATUS_PAID) {
+                        return false;
+                    }
+                    // Re-read through the repository: the entity getter was
+                    // already narrowed by the preflight check above, while the
+                    // row may have changed under us.
+                    $locked = $this->di['em']->getRepository(Invoice::class)->find($invoice->getId());
+                    if ($state['status'] === Invoice::STATUS_CANCELED || ($locked instanceof Invoice && $locked->getReplacedByInvoiceId() !== null)) {
+                        throw new InformationException('This invoice was canceled and cannot be marked as paid');
+                    }
+
+                    if ($this->invoiceHasDeletionHold($invoice)) {
+                        throw new InformationException('Order deletion is awaiting recovery. Retry deletion before recording a manual payment.');
+                    }
+                    if ((int) $invoice->getGateway()?->getId() !== (int) $payGateway->getId()) {
+                        $invoice->setGateway($payGateway);
+                        $this->di['em']->flush();
+                    }
+
+                    $transactionService = $this->di['mod_service']('Invoice', 'Transaction');
+                    $invoiceTotal = $this->getTotalWithTax($invoice);
+                    $isDeposit = $this->isInvoiceTypeDeposit($invoice);
+                    // Record only the remainder received from staff, including for deposits.
+                    $invoiceTotal = max(0.0, round($invoiceTotal - min($this->getAmountPaid($invoice), round($invoiceTotal, 2)), 2));
+                    $transaction = null;
+                    if ($isDeposit || $invoiceTotal > 0) {
+                        $newtx = $transactionService->create([
+                            'invoice_id' => $invoice->getId(),
+                            'gateway_id' => $invoice->getGateway()?->getId(),
+                            'currency' => $invoice->getCurrency(),
+                            'status' => 'received',
+                            'source' => 'admin',
+                            'post' => [
+                                'invoice_id' => $invoice->getId(),
+                                'txn_id' => $transactionId,
+                            ],
+                            'txn_id' => $transactionId,
+                        ]);
+                        $transaction = $this->di['em']->getRepository(Transaction::class)->find((int) $newtx);
+                        if ($transaction === null) {
+                            throw new InformationException('Transaction not found');
+                        }
+                        if ((int) $transaction->getInvoice()?->getId() !== (int) $invoice->getId()) {
+                            throw new InformationException('Transaction ID is already associated with another invoice.');
+                        }
+                        if ($transaction->getStatus() === Transaction::STATUS_PROCESSED) {
+                            throw new InformationException('Transaction ID has already been processed. Use a distinct reference for an additional payment.');
+                        }
+                    }
+
+                    $result = $this->markAsPaid($invoice, false, false, true, $paidAt, $actuallyPaid);
+                    if ($actuallyPaid ?? $result) {
+                        $this->creditDepositBalanceIfNeeded($invoice, $payGateway, $transactionId);
+                        $this->consumeInvoiceWalletFunds($invoice);
+                    }
+                    if ($result && $transaction instanceof Transaction) {
+                        $transaction->setAmount((string) $invoiceTotal);
+                        $transaction->setCurrency($invoice->getCurrency());
+                        $transaction->setStatus(Transaction::STATUS_PROCESSED);
+                        $gatewayTitle = $payGateway->getName() ?: $payGateway->getGateway();
+                        $transaction->setNote(sprintf('%s transaction No: %s', $gatewayTitle, $transactionId));
+                        $transaction->setUpdatedAt(new \DateTimeImmutable());
+                        $this->di['em']->flush();
+                    }
+
+                    return $result;
+                });
+            });
+
+            // Events and tasks run after the commit above, so neither
+            // notifications nor provisioning precede the recorded payment. The
+            // paid journal row (including the paid_at override, threaded into
+            // the payment transaction above) already committed atomically.
+            // Gated on the payment having happened in this call: a concurrent
+            // caller that won the race already emitted all of these (an
+            // unknown signal defaults to emitting, preserving the old behavior
+            // for callers that predate it).
+            if ($paid && ($actuallyPaid ?? true)) {
+                $this->firePaymentReceivedEvent($invoice);
+                if ($execute) {
+                    $this->executeInvoiceItemTasks(
+                        $this->getInvoiceItemRepository()->findByInvoiceId((int) $invoice->getId()),
+                        $this->di['mod_service']('Invoice', 'InvoiceItem')
+                    );
+                }
+            }
+
+            return $paid;
+        }
+
+        // Payment runs first so the paid journal row commits atomically with
+        // it (carrying the admin-supplied paid_at date via the override
+        // below); a deposit credit commits in the same transaction so a
+        // crash cannot leave a paid Add Funds invoice without its balance.
+        // Notifications follow. Gated on the payment having happened
+        // in this call, as above.
+        $actuallyPaid = null;
+        $paid = $this->withCreditLock((int) $invoice->getClientId(), function () use ($invoice, $payGateway, $transactionId, $paidAt, &$actuallyPaid): bool {
+            return $this->di['em']->wrapInTransaction(function () use ($invoice, $payGateway, $transactionId, $paidAt, &$actuallyPaid): bool {
+                $state = $this->lockAndRefreshInvoice($invoice);
+                if ($state['status'] === Invoice::STATUS_PAID) {
+                    return false;
+                }
+                if ($this->invoiceHasDeletionHold($invoice)) {
+                    throw new InformationException('Order deletion is awaiting recovery. Retry deletion before recording a manual payment.');
+                }
+                if ((int) $invoice->getGateway()?->getId() !== (int) $payGateway->getId()) {
+                    $invoice->setGateway($payGateway);
+                    $this->di['em']->flush();
+                }
+                $result = $this->markAsPaid($invoice, false, false, true, $paidAt, $actuallyPaid);
+                if ($actuallyPaid ?? $result) {
+                    $this->creditDepositBalanceIfNeeded($invoice, $payGateway, $transactionId);
+                    $this->consumeInvoiceWalletFunds($invoice);
+                }
+
+                return $result;
+            });
+        });
+        if ($paid && ($actuallyPaid ?? true)) {
+            $this->firePaymentReceivedEvent($invoice);
+            if ($execute) {
+                $this->executeInvoiceItemTasks(
+                    $this->getInvoiceItemRepository()->findByInvoiceId((int) $invoice->getId()),
+                    $this->di['mod_service']('Invoice', 'InvoiceItem')
+                );
+            }
+        }
+
+        return $paid;
     }
 
-    public function validateAdminMarkAsPaidRequest(array $data, ?\Model_Invoice $invoice = null): PayGateway
+    /** Settle an existing manually approved transaction without crediting its
+     * payment to the wallet. Applied account credit is consumed once. */
+    public function approveOfflineTransaction(Transaction $transaction): bool
     {
-        $gatewayId = isset($data['gateway_id']) && !empty($data['gateway_id']) ? (int) $data['gateway_id'] : (int) ($invoice->gateway_id ?? 0);
+        $invoice = $transaction->getInvoice() ?? throw new InformationException('Invoice not found');
+        $gateway = $transaction->getGateway() ?? throw new InformationException('Payment gateway not found');
+        if (!ServicePayGateway::isManualApprovalGateway($gateway->getGateway())) {
+            throw new InformationException('Offline settlement requires a manual payment gateway.');
+        }
+        $paid = $this->withPaymentCompletionLock((int) $transaction->getId(), fn (): bool => $this->withCreditLock((int) $invoice->getClientId(), fn (): bool => $this->di['em']->wrapInTransaction(function () use ($invoice, $gateway, $transaction): bool {
+            $state = $this->lockAndRefreshInvoice($invoice);
+            if ($state['status'] !== Invoice::STATUS_UNPAID || $invoice->getReplacedByInvoiceId() !== null) {
+                throw new InformationException('Only an unpaid invoice can be approved for payment.');
+            }
+            $received = $this->getBalanceDue($invoice);
+            $actuallyPaid = null;
+            $this->markAsPaid($invoice, false, false, true, null, $actuallyPaid);
+            if (!$actuallyPaid) {
+                throw new InformationException('The invoice was already paid.');
+            }
+            $this->creditDepositBalanceIfNeeded($invoice, $gateway, $transaction->getTxnId());
+            $this->consumeInvoiceWalletFunds($invoice);
+            $gatewayName = $gateway->getName() ?: $gateway->getGateway();
+            $transaction->setStatus(Transaction::STATUS_PROCESSED);
+            $transaction->setGatewayCompletionState(Transaction::GATEWAY_COMPLETION_RUNNING);
+            $transaction->setError(null);
+            $transaction->setErrorCode(null);
+            $transaction->setAmount((string) $received);
+            $transaction->setNote($gatewayName . ' transaction No: ' . $transaction->getTxnId());
+            $transaction->setCurrency($invoice->getCurrency());
+            $transaction->setUpdatedAt(new \DateTimeImmutable());
+            $this->di['em']->flush();
+
+            return true;
+        })));
+        if ($paid) {
+            $this->completeOfflinePayment($transaction);
+        }
+
+        return $paid;
+    }
+
+    public function validateAdminMarkAsPaidRequest(array $data, ?Invoice $invoice = null): PayGateway
+    {
+        $gatewayId = isset($data['gateway_id']) && !empty($data['gateway_id']) ? (int) $data['gateway_id'] : $invoice?->getGateway()?->getId() ?? 0;
         if ($gatewayId <= 0) {
             throw new InformationException('Payment gateway is required when marking an invoice as paid.');
         }
@@ -845,7 +1500,10 @@ class Service implements InjectionAwareInterface
         if ($payGateway === null) {
             throw new InformationException('Payment gateway not found');
         }
-        if ($payGateway->getGateway() === 'Custom' && $payGateway->isEnabled()) {
+        if (!$payGateway->isEnabled()) {
+            throw new InformationException('Payment gateway is not enabled');
+        }
+        if ($payGateway->getGateway() === 'Custom') {
             $transactionId = trim((string) ($data['transactionId'] ?? ''));
             if ($transactionId === '') {
                 throw new InformationException('Transaction ID is required when using the Custom payment gateway.');
@@ -856,89 +1514,284 @@ class Service implements InjectionAwareInterface
     }
 
     /**
+     * Credit the client balance for an Add Funds (deposit) invoice paid by an admin.
+     *
+     * No-op for ordinary invoices. Must only be called when the payment
+     * happened in this call (gated on $actuallyPaid by the caller) and
+     * inside the payment transaction so the credit commits atomically
+     * with the paid-marking. Only deposit lines are credited: a draft
+     * deposit invoice can gain non-deposit lines before issuance, and
+     * those charges must not become spendable balance.
+     */
+    private function creditDepositBalanceIfNeeded(Invoice $invoice, PayGateway $payGateway, ?string $transactionId, ?float $invoiceTotal = null): void
+    {
+        if (!$this->isInvoiceTypeDeposit($invoice)) {
+            return;
+        }
+
+        $items = $this->getInvoiceItemRepository()->findByInvoiceId((int) $invoice->getId());
+        $hasOtherItems = false;
+        foreach ($items as $item) {
+            if ($item->getType() != InvoiceItem::TYPE_DEPOSIT) {
+                $hasOtherItems = true;
+
+                break;
+            }
+        }
+
+        if ($hasOtherItems) {
+            // Derive the deposit portion from the invoice total so per-item
+            // rounding cannot drift it a cent from what the client was shown.
+            $amount = ($invoiceTotal ?? $this->getTotalWithTax($invoice)) - $this->getNonDepositTotalWithTax($invoice, $items);
+        } else {
+            $amount = $invoiceTotal ?? $this->getTotalWithTax($invoice);
+        }
+
+        $client = $this->di['em']->getRepository(Client::class)->find($invoice->getClientId());
+        if (!$client instanceof Client) {
+            throw new InformationException('Client not found');
+        }
+
+        $gatewayTitle = $payGateway->getName() ?: $payGateway->getGateway();
+        $reference = trim((string) $transactionId);
+        $description = $reference !== ''
+            ? sprintf('%s transaction No: %s', $gatewayTitle, $reference)
+            : sprintf('%s manual payment', $gatewayTitle);
+
+        $this->di['mod_service']('client')->addFunds($client, $amount, $description, [
+            'type' => 'invoice',
+            'rel_id' => (string) $invoice->getId(),
+        ]);
+    }
+
+    /** Allocate tax on the aggregate non-deposit subtotal, matching invoice tax rounding.
+     * Any rounding remainder belongs to the deposit portion.
+     *
+     * @param InvoiceItem[] $items
+     */
+    private function getNonDepositTotalWithTax(Invoice $invoice, array $items): float
+    {
+        $subtotal = 0.0;
+        $taxable = 0.0;
+        foreach ($items as $item) {
+            if ($item->getType() === InvoiceItem::TYPE_DEPOSIT) {
+                continue;
+            }
+            $line = (float) ($item->getPrice() ?? 0) * (float) ($item->getQuantity() ?? 1);
+            $subtotal += $line;
+            if ($item->getTaxed()) {
+                $taxable += $line;
+            }
+        }
+
+        return round($subtotal + round($taxable * (float) $invoice->getTaxrate() / 100, 2), 2);
+    }
+
+    /**
      * Finds all paid invoices associated with a given client order.
      *
-     * @param \Model_ClientOrder $order the client order for which to find paid invoices
+     * @param Order $order the client order for which to find paid invoices
      *
      * @return array An array of paid invoices. Each element in the array represents an invoice record
      *               as returned by the database, typically as an associative array or an object.
      */
-    public function findPaidInvoicesForOrder(\Model_ClientOrder $order): array
+    public function findPaidInvoicesForOrder(Order $order): array
     {
-        $bindings = [
-            ':rel_id' => $order->id,
-            ':status' => \Model_Invoice::STATUS_PAID,
-        ];
-
-        return $this->di['db']->find('Invoice', 'id IN (SELECT invoice_id FROM invoice_item WHERE rel_id = :rel_id) AND status = :status', $bindings);
+        return $this->getInvoiceRepository()->findPaidByRelId($order->getId());
     }
 
     public function getNextInvoiceNumber()
     {
         $systemService = $this->di['mod_service']('system');
-        $next_nr = $systemService->getParamValue('invoice_starting_number');
 
-        if (empty($next_nr)) {
+        // Claimed and advanced in one locked step, otherwise two concurrent issuances take the
+        // same number and issue two invoices sharing an invoice number.
+        $next_nr = $systemService->reserveNextNumericParamValue('invoice_starting_number');
+
+        if ($next_nr === null) {
             // In theory this code should never need to be called, but is provided as a fallback
-            $r = $this->di['db']->findOne('Invoice', 'nr is not null order by id desc');
-            if ($r instanceof \Model_Invoice && is_numeric($r->nr)) {
-                $next_nr = intval($r->nr) + 1;
-            } else {
-                throw new \FOSSBilling\Exception('Unable to determine the next invoice number');
+            $r = $this->getInvoiceRepository()->findLatestWithNr();
+            if (!$r instanceof Invoice || !is_numeric($r->getNr())) {
+                throw new \FOSSBilling\Core\Exception\BaseException('Unable to determine the next invoice number');
+            }
+
+            // Seeding the counter and reserving from it has to be one locked step too, otherwise
+            // two callers deriving the same seed both write it and both reserve the same number.
+            $next_nr = $systemService->reserveNextNumericParamValue('invoice_starting_number', intval($r->getNr()) + 1);
+            if ($next_nr === null) {
+                throw new \FOSSBilling\Core\Exception\BaseException('Unable to determine the next invoice number');
             }
         }
-
-        $systemService->setParamValue('invoice_starting_number', intval($next_nr) + 1);
 
         return $next_nr;
     }
 
-    public function countIncome(\Model_Invoice $invoice): void
+    public function countIncome(Invoice $invoice): void
     {
         $table = $this->di['mod_service']('currency');
 
-        $invoice->base_income = $table->toBaseCurrency($invoice->currency, $this->getTotal($invoice));
-        if ($invoice->refund !== null) {
-            $invoice->base_refund = $table->toBaseCurrency($invoice->currency, $invoice->refund);
+        $oldIncome = $invoice->getBaseIncome();
+        $oldRefund = $invoice->getBaseRefund();
+        $oldRefundTax = $invoice->getBaseRefundTax();
+
+        $invoice->setBaseIncome($table->toBaseCurrency($invoice->getCurrency(), $this->getTotal($invoice)));
+        if ($invoice->getRefund() !== null) {
+            // base_income excludes tax, so the refund it is netted against must exclude it too.
+            // base_refund_tax preserves the cash tax portion so gross cash remains derivable.
+            // Round the converted legs first so the stored pair always sums to the converted gross.
+            // A NULL tax portion means the cumulative basis is unresolved: keep base_refund on
+            // the gross amount without classifying unknown tax as known.
+            [$netRefund, $taxPortion] = $this->getRefundBreakdown($invoice);
+            $currencyCode = $invoice->getCurrency();
+            $netBase = round($table->toBaseCurrency($currencyCode, $netRefund), 2);
+            $invoice->setBaseRefund($netBase);
+            if ($taxPortion === null) {
+                $invoice->setBaseRefundTax(null);
+            } else {
+                $grossBase = round($table->toBaseCurrency($currencyCode, $netRefund + $taxPortion), 2);
+                $invoice->setBaseRefundTax(round($grossBase - $netBase, 2));
+            }
         } else {
-            $invoice->base_refund = null;
+            $invoice->setBaseRefund(null);
+            $invoice->setBaseRefundTax(null);
         }
 
-        $this->di['db']->store($invoice);
+        // Base-currency rewrites on issued invoices (e.g. after an FX rate move) touch locked
+        // rows: log them so a changed paid total is always explainable. Compared as floats: the
+        // columns are DECIMAL, so identical amounts can stringify differently ('100' vs '100.00').
+        $incomeChanged = $oldIncome === null
+            ? $invoice->getBaseIncome() !== null
+            : (float) $invoice->getBaseIncome() !== (float) $oldIncome;
+        $refundChanged = $oldRefund === null
+            ? $invoice->getBaseRefund() !== null
+            : (float) $invoice->getBaseRefund() !== (float) $oldRefund;
+        $refundTaxChanged = $oldRefundTax === null
+            ? $invoice->getBaseRefundTax() !== null
+            : (float) $invoice->getBaseRefundTax() !== (float) $oldRefundTax;
+        if ($invoice->isIssued() && isset($this->di['logger']) && ($incomeChanged || $refundChanged || $refundTaxChanged)) {
+            $this->di['logger']->info(
+                'Recalculated base-currency income for issued invoice #{invoice_id} ({old_income} -> {new_income}, refund tax {old_tax} -> {new_tax})',
+                ['invoice_id' => $invoice->getId(), 'old_income' => $oldIncome, 'new_income' => $invoice->getBaseIncome(), 'old_tax' => $oldRefundTax, 'new_tax' => $invoice->getBaseRefundTax()]
+            );
+        }
+
+        $this->di['em']->persist($invoice);
+        $this->di['em']->flush();
     }
 
-    public function prepareInvoice(\Model_Client $client, array $data)
+    /**
+     * Split the refunded amount into its net (without tax) and tax portions, in invoice currency.
+     *
+     * `refund` holds what was paid back (tax included); the tax part is read from the credit notes
+     * issued against the invoice. Returns [net, tax] with gross === net + tax when every
+     * refunded amount is backed by a linked note. Otherwise the tax is NULL: without a link
+     * the split is unknowable, so the whole refund stays net rather than guessing.
+     *
+     * @return array{0: float, 1: float|null}
+     */
+    private function getRefundBreakdown(Invoice $invoice): array
     {
-        if (!$client->currency) {
+        $refund = (float) $invoice->getRefund();
+        if ($refund <= 0) {
+            return [$refund, 0.0];
+        }
+
+        $creditNotes = $this->findRefundingInvoices($invoice);
+        if ($creditNotes === []) {
+            // Older refunds recorded before `credit_note_for_invoice_id` existed, or notes
+            // deleted since: no linked note establishes the tax, so keep the pre-#4661
+            // gross base_refund and leave the tax unknown rather than recording zero.
+            if (isset($this->di['logger'])) {
+                $this->di['logger']->debug(
+                    'Refund without linked credit note for invoice #{invoice_id}: keeping tax-inclusive base_refund with unknown tax',
+                    ['invoice_id' => $invoice->getId()]
+                );
+            }
+
+            return [$refund, null];
+        }
+
+        // Credit note amounts are negated, so their tax is too. Keep the sign:
+        // a refunded negative taxable subtotal (a taxed discount) gives back
+        // negative tax, which adds to the refund without tax.
+        $refundedTax = 0.0;
+        $linkedGross = 0.0;
+        foreach ($creditNotes as $creditNote) {
+            $refundedTax -= $this->getTax($creditNote);
+            $linkedGross += abs($this->getTotalWithTax($creditNote));
+        }
+
+        // `refund` accumulates each note's rounded gross, so allow a couple of cents of
+        // rounding dust. Anything beyond that is a refunded amount with no linked
+        // document: the cumulative tax basis is unresolved, so keep the gross base
+        // and leave the tax unknown rather than splitting on partial evidence.
+        if ($refund - $linkedGross > 0.02) {
+            if (isset($this->di['logger'])) {
+                $this->di['logger']->warning(
+                    'Refund for invoice #{invoice_id} exceeds its linked credit notes ({refund} vs {linked}): keeping tax-inclusive base_refund with unknown tax',
+                    ['invoice_id' => $invoice->getId(), 'refund' => $refund, 'linked' => round($linkedGross, 2)]
+                );
+            }
+
+            return [$refund, null];
+        }
+
+        $unclamped = $refund - $refundedTax;
+        if ($unclamped < 0) {
+            if (isset($this->di['logger'])) {
+                $this->di['logger']->warning(
+                    'Refund tax {tax} exceeds refund {refund} for invoice #{invoice_id}: clamping base_refund to 0',
+                    ['invoice_id' => $invoice->getId(), 'tax' => $refundedTax, 'refund' => $refund]
+                );
+            }
+
+            return [0.0, round($refund, 2)];
+        }
+
+        $net = round($unclamped, 2);
+
+        return [$net, round($refund - $net, 2)];
+    }
+
+    public function prepareInvoice(Client $client, array $data): Invoice
+    {
+        if (!$client->getCurrency()) {
             $currencyService = $this->di['mod_service']('currency');
             /** @var \Box\Mod\Currency\Repository\CurrencyRepository $currencyRepository */
             $currencyRepository = $currencyService->getCurrencyRepository();
             $currency = $currencyRepository->findDefault();
 
             if (!$currency instanceof Currency) {
-                throw new \FOSSBilling\Exception('Default currency not found');
+                throw new \FOSSBilling\Core\Exception\BaseException('Default currency not found');
             }
 
             $currencyCode = $currency->getCode();
-            $client->currency = $currencyCode;
-            $this->di['db']->store($client);
+            $client->setCurrency($currencyCode);
+            $this->di['em']->persist($client);
+            $this->di['em']->flush();
             if (isset($this->di['logger'])) {
-                $this->di['logger']->info('Client #%s currency was not defined. Set default currency %s.', $client->id, $currencyCode);
+                $this->di['logger']->info('Client #{client_id} currency was not defined. Set default currency {currency_code}.', ['client_id' => $client->getId(), 'currency_code' => $currencyCode]);
             }
         }
 
-        $model = $this->di['db']->dispense('Invoice');
-        $model->client_id = $client->id;
-        $model->status = \Model_Invoice::STATUS_UNPAID;
-        $model->currency = $client->currency;
-        $model->approved = 0;
+        $model = new Invoice();
+        $model->setClientId($client->getId() ?? null);
+        $model->setStatus(Invoice::STATUS_UNPAID);
+        $model->setCurrency($client->getCurrency());
+        $model->setIssued(false);
 
-        $model->gateway_id = $data['gateway_id'] ?? $model->gateway_id;
-        $model->text_1 = $data['text_1'] ?? $model->text_1;
-        $model->text_2 = $data['text_2'] ?? $model->text_2;
-        $model->created_at = date('Y-m-d H:i:s');
-        $model->updated_at = date('Y-m-d H:i:s');
-        $invoiceId = $this->di['db']->store($model);
+        if (!empty($data['gateway_id'])) {
+            $gateway = $this->di['em']->getRepository(PayGateway::class)->find((int) $data['gateway_id']);
+            if (!$gateway instanceof PayGateway) {
+                throw new InformationException('Payment gateway not found');
+            }
+            $model->setGateway($gateway);
+        }
+        $model->setText1($data['text_1'] ?? $model->getText1());
+        $model->setText2($data['text_2'] ?? $model->getText2());
+        $this->di['em']->persist($model);
+        $this->di['em']->flush();
+        $invoiceId = $model->getId();
 
         $this->setInvoiceDefaults($model);
 
@@ -949,87 +1802,385 @@ class Service implements InjectionAwareInterface
             }
         }
 
-        $this->di['logger']->info("Prepared new invoice {$invoiceId}.");
+        $this->di['logger']->info('Prepared new invoice #{invoice_id}', ['invoice_id' => $invoiceId]);
 
-        if (isset($data['approve']) && $data['approve']) {
+        $this->recordJournalEvent($model, InvoiceEvent::TYPE_CREATED);
+
+        if (isset($data['issue']) && $data['issue']) {
             try {
-                $this->approveInvoice($model, ['id' => $invoiceId]);
-                $this->di['logger']->info("Approved invoice {$invoiceId} instantly.");
+                if (!$this->issueInvoice($model, ['id' => $invoiceId])) {
+                    throw new InformationException('Invoice issuance was deferred because an order is awaiting recovery.');
+                }
+                $this->di['logger']->info('Issued invoice #{invoice_id} instantly', ['invoice_id' => $invoiceId]);
             } catch (\Exception $e) {
-                $this->di['logger']->warning($e->getMessage());
+                $this->di['logger']->warning('Instant issue of prepared invoice #{invoice_id} failed: {message}', ['invoice_id' => $invoiceId, 'message' => $e->getMessage()]);
+
+                // The prepared draft persists, but the caller asked for an issued invoice:
+                // report the failure instead of returning a draft as success.
+                throw new InformationException('The invoice was prepared as a draft but could not be issued: :message', [':message' => $e->getMessage()]);
             }
         }
 
         return $model;
     }
 
-    public function setInvoiceDefaults(\Model_Invoice $model): void
+    public function setInvoiceDefaults(Invoice $model): void
     {
-        $clientService = $this->di['mod_service']('Client');
         $systemService = $this->di['mod_service']('system');
-        $client = $this->di['db']->load('Client', $model->client_id);
-        $seller = $systemService->getCompany();
-
-        $buyer = $clientService->toApiArray($client);
-
-        $model->seller_company = $seller['name'];
-        $model->seller_company_vat = $seller['vat_number'];
-        $model->seller_company_number = $seller['number'];
-        $model->seller_address = trim("{$seller['address_1']} {$seller['address_2']} {$seller['address_3']}");
-        $model->seller_phone = $seller['tel'];
-        $model->seller_email = $seller['email'];
-
-        $model->buyer_first_name = $buyer['first_name'];
-        $model->buyer_last_name = $buyer['last_name'];
-        $model->buyer_company = $buyer['company'];
-        $model->buyer_company_vat = $buyer['company_vat'];
-        $model->buyer_company_number = $buyer['company_number'];
-        $model->buyer_address = "{$buyer['address_1']} {$buyer['address_2']}";
-        $model->buyer_city = $buyer['city'];
-        $model->buyer_state = $buyer['state'];
-        $model->buyer_country = $buyer['country'];
-        $model->buyer_phone = "{$buyer['phone_cc']} {$buyer['phone']}";
-        $model->buyer_email = $buyer['email'];
-        $model->buyer_zip = $buyer['postcode'];
+        $client = $this->di['em']->getRepository(Client::class)->find($model->getClientId());
 
         $invoice_due_days = $systemService->getParamValue('invoice_due_days');
         if (!is_numeric($invoice_due_days)) {
             $invoice_due_days = 1;
         }
         $due_time = strtotime("+{$invoice_due_days} day");
-        $model->due_at = date('Y-m-d H:i:s', $due_time);
+        $model->setDueAt(new \DateTimeImmutable(date('Y-m-d H:i:s', $due_time)));
 
-        $model->serie = $systemService->getParamValue('invoice_series');
-        $model->nr = $this->getNextInvoiceNumber();
-        $model->hash = bin2hex(random_bytes(random_int(15, 30)));
-        $model->hash_expires_at = $this->computeHashExpiration();
+        $serie = $systemService->getParamValue('invoice_series');
+        $model->setSerie($serie !== null ? (string) $serie : null);
+        $model->setHash(bin2hex(random_bytes(random_int(15, 30))));
+        $model->setHashExpiresAt($this->computeHashExpiration());
 
         $taxtitle = '';
         $taxService = $this->di['mod_service']('Invoice', 'Tax');
         $tax = $taxService->getTaxRateForClient($client, $taxtitle);
-        $model->taxname = $taxtitle;
-        $model->taxrate = $tax;
+        $model->setTaxname($taxtitle);
+        $model->setTaxrate($tax);
 
-        $model->notes = $this->di['mod_service']('system')->getParamValue('invoice_default_note');
+        $notes = $this->di['mod_service']('system')->getParamValue('invoice_default_note');
+        $model->setNotes($notes !== null ? (string) $notes : null);
 
-        $this->di['db']->store($model);
+        $this->di['em']->persist($model);
+        $this->di['em']->flush();
     }
 
-    public function approveInvoice(\Model_Invoice $invoice, array $data): bool
+    /**
+     * Freeze the buyer/seller details from the live client and company
+     * records onto the invoice. Runs once, at issuance: drafts carry no party
+     * snapshot, so the frozen copy always reflects reality at the moment the
+     * document becomes legally meaningful. Already-issued invoices are left
+     * untouched, and a deleted client leaves any existing snapshot in place
+     * rather than wiping it to nulls.
+     */
+    private function snapshotPartiesFromLiveRecords(Invoice $model): void
     {
-        $this->di['events_manager']->fire(['event' => 'onBeforeAdminInvoiceApprove', 'params' => $this->toApiArray($invoice)]);
-
-        $invoice->approved = 1;
-        $invoice->updated_at = date('Y-m-d H:i:s');
-        $this->di['db']->store($invoice);
-
-        if (isset($data['use_credits']) && $data['use_credits']) {
-            $this->tryPayWithCredits($invoice);
+        if ($model->isIssued()) {
+            return;
         }
 
-        $this->di['events_manager']->fire(['event' => 'onAfterAdminInvoiceApprove', 'params' => $this->toApiArray($invoice, true, null, true)]);
+        $systemService = $this->di['mod_service']('system');
+        $seller = $systemService->getCompany();
+        $model->setSellerCompany($seller['name'] ?? null);
+        $model->setSellerCompanyVat($seller['vat_number'] ?? null);
+        $model->setSellerCompanyNumber($seller['number'] ?? null);
+        $model->setSellerAddress(trim(($seller['address_1'] ?? '') . ' ' . ($seller['address_2'] ?? '') . ' ' . ($seller['address_3'] ?? '')));
+        $model->setSellerPhone($seller['tel'] ?? null);
+        $model->setSellerEmail($seller['email'] ?? null);
 
-        $this->di['logger']->info("Approved invoice {$invoice->id}.");
+        $client = $model->getClientId() !== null
+            ? $this->di['em']->getRepository(Client::class)->find($model->getClientId())
+            : null;
+        if (!$client instanceof Client) {
+            return;
+        }
+
+        $clientService = $this->di['mod_service']('Client');
+        $buyer = $clientService->toApiArray($client);
+        $model->setBuyerFirstName($buyer['first_name'] ?? null);
+        $model->setBuyerLastName($buyer['last_name'] ?? null);
+        $model->setBuyerCompany($buyer['company'] ?? null);
+        $model->setBuyerCompanyVat($buyer['company_vat'] ?? null);
+        $model->setBuyerCompanyNumber($buyer['company_number'] ?? null);
+        $model->setBuyerAddress(trim(($buyer['address_1'] ?? '') . ' ' . ($buyer['address_2'] ?? '')));
+        $model->setBuyerCity($buyer['city'] ?? null);
+        $model->setBuyerState($buyer['state'] ?? null);
+        $model->setBuyerCountry($buyer['country'] ?? null);
+        $model->setBuyerPhone(trim(($buyer['phone_cc'] ?? '') . ' ' . ($buyer['phone'] ?? '')));
+        $model->setBuyerEmail($buyer['email'] ?? null);
+        $model->setBuyerZip($buyer['postcode'] ?? null);
+    }
+
+    public function issueInvoice(Invoice $invoice, array $data): bool
+    {
+        $orderIds = $this->renewalOrderIds($invoice);
+
+        return $this->withRenewalQuoteLocks($orderIds, fn (): bool => $this->issueInvoiceWithRenewalLock($invoice, $data, $orderIds));
+    }
+
+    /** @return list<int> */
+    private function renewalOrderIds(Invoice $invoice): array
+    {
+        $links = $this->di['em']->getConnection()->fetchAllAssociative(
+            "SELECT DISTINCT order_id, rel_id FROM invoice_item WHERE invoice_id = ? AND type = 'order' AND task = 'renew'",
+            [$invoice->getId()]
+        );
+        $ids = [];
+        foreach ($links as $link) {
+            $id = isset($link['order_id']) ? (int) $link['order_id']
+                : ServiceInvoiceItem::resolveOrderReference(InvoiceItem::TYPE_ORDER, null, $link['rel_id']);
+            if ($id !== null) {
+                $ids[$id] = $id;
+            }
+        }
+        sort($ids);
+
+        return $ids;
+    }
+
+    private function issueInvoiceWithRenewalLock(Invoice $invoice, array $data, array $renewalOrderIds, ?int $subscriptionOrderId = null): bool
+    {
+        $this->di['event_dispatcher']->dispatch(new BeforeAdminInvoiceIssueEvent((int) $invoice->getId()));
+
+        $renewalBlocked = false;
+        $subscriptionHold = null;
+        $quoteChanged = false;
+        $issued = $this->di['em']->wrapInTransaction(function () use ($invoice, $data, $renewalOrderIds, $subscriptionOrderId, &$renewalBlocked, &$quoteChanged, &$subscriptionHold): bool {
+            $this->lockAndRefreshInvoice($invoice);
+            if ($subscriptionOrderId !== null && !$this->isSingleOrderRenewal($invoice, $subscriptionOrderId)) {
+                $subscriptionHold = 'The linked invoice is not a single-order subscription renewal.';
+
+                return false;
+            }
+            // First issuance is only valid from the unpaid state. Re-issuing
+            // an already-issued invoice stays idempotent (paid, refunded, or
+            // canceled rows keep their state); this guard is about drafts.
+            if (!$invoice->isIssued() && $invoice->getStatus() !== Invoice::STATUS_UNPAID) {
+                throw new InformationException('Only unpaid draft invoices can be issued.');
+            }
+            if ($this->invoiceHasDeletionHold($invoice)) {
+                return false;
+            }
+            if (!$invoice->isIssued()) {
+                if ($this->renewalOrderIds($invoice) !== $renewalOrderIds) {
+                    $quoteChanged = true;
+
+                    return false;
+                }
+                $held = array_values(array_filter($renewalOrderIds, $this->hasRenewalHold(...)));
+                if ($held !== [] && !$this->removeRenewalsFromDraft($invoice, $held, 'renewal_cancellation_hold')) {
+                    $renewalBlocked = true;
+
+                    return false;
+                }
+                if ($invoice->getCronRenewalExpiries() !== null) {
+                    $stale = $this->staleCronRenewalOrders($invoice, array_diff($renewalOrderIds, $held), $subscriptionOrderId !== null);
+                    if ($subscriptionOrderId !== null && $stale !== []) {
+                        $subscriptionHold = 'The subscription renewal quote changed before issuance.';
+
+                        return false;
+                    }
+                    if ($stale === null || ($stale !== [] && !$this->removeRenewalsFromDraft($invoice, $stale, 'renewal_quote_changed'))) {
+                        $quoteChanged = true;
+
+                        return false;
+                    }
+                }
+            }
+
+            // Freeze the parties from the live records and claim the number
+            // inside the issuance lock. Already-issued invoices skip both;
+            // legacy drafts keep their number when present.
+            $this->snapshotPartiesFromLiveRecords($invoice);
+            $this->assignInvoiceNumberIfMissing($invoice);
+
+            if (!$invoice->isIssued()) {
+                $invoice->setIssueNotificationState(!empty($data['deferred_issue_use_credits']) && !$invoice->isSubscriptionPaymentDraft() ? 1 : 2);
+            }
+            $invoice->setIssued(true);
+            $this->di['em']->persist($invoice);
+            $this->di['em']->flush();
+
+            // Commits atomically with the issuance above: a crash can no
+            // longer leave an issued invoice without its journal entry.
+            $this->recordJournalEvent($invoice, InvoiceEvent::TYPE_ISSUED);
+
+            return true;
+        });
+        if (!$issued) {
+            if ($subscriptionHold !== null) {
+                throw new Exception\RenewalHoldException($subscriptionHold);
+            }
+            if ($quoteChanged) {
+                throw new InformationException('The renewal invoice changed. Reload it and retry issuance.');
+            }
+            if ($renewalBlocked) {
+                throw new Exception\RenewalHoldException('Cancellation prevents issuing this renewal invoice. Withdraw the request or have staff review the order and any received payment.');
+            }
+
+            return false;
+        }
+
+        if (!empty($data['use_credits']) && !$invoice->isSubscriptionPaymentDraft()) {
+            try {
+                $this->tryPayWithCredits($invoice);
+            } catch (\Throwable $e) {
+                $this->di['logger']->warning('Could not apply credit to issued invoice #{id}: {error}', ['id' => $invoice->getId(), 'error' => $e->getMessage()]);
+                if (!$this->di['em']->isOpen()) {
+                    $id = (int) $invoice->getId();
+                    $this->resetEntityManager();
+                    $invoice = $this->getInvoiceRepository()->find($id) ?? throw new InformationException('Invoice not found');
+                }
+            }
+        }
+
+        if (empty($data['defer_issue_event'])) {
+            $this->notifyDeferredInvoiceIssued($invoice);
+        }
+
+        $this->di['logger']->info('Issued invoice #{invoice_id}', ['invoice_id' => $invoice->getId()]);
+
+        return true;
+    }
+
+    /** @return list<int>|null Null when a renewal line has no verifiable order link. */
+    private function staleCronRenewalOrders(Invoice $invoice, array $orderIds, bool $subscriptionPayment): ?array
+    {
+        $em = $this->di['em'];
+        $quotedExpiries = $invoice->getCronRenewalExpiries() ?? [];
+        $periods = [];
+        foreach ($orderIds as $orderId) {
+            $order = $em->getRepository(Order::class)->find($orderId);
+            if (!$order instanceof Order) {
+                continue;
+            }
+            $this->lockAndRefreshOrder($order);
+            $eligible = $subscriptionPayment ? $this->isSubscriptionRenewalOrder($order) && $order->getInvoiceOption() === 'issue-invoice'
+                : $this->isCronRenewalOrder($order);
+            if ($eligible && $order->getUnpaidInvoiceId() === $invoice->getId()
+                && isset($quotedExpiries[$orderId])
+                && $order->getExpiresAt()?->format('Y-m-d H:i:s') === $quotedExpiries[$orderId] && $order->getPeriod() !== null) {
+                $periods[$orderId] = $this->di['period']($order->getPeriod())->getCode();
+            }
+        }
+
+        $lines = $em->getConnection()->fetchAllAssociative(
+            'SELECT order_id, rel_id, period FROM invoice_item WHERE invoice_id = ? AND type = ? AND task = ?',
+            [$invoice->getId(), InvoiceItem::TYPE_ORDER, InvoiceItem::TASK_RENEW],
+        );
+        foreach ($lines as $line) {
+            $orderId = isset($line['order_id']) ? (int) $line['order_id']
+                : ServiceInvoiceItem::resolveOrderReference(InvoiceItem::TYPE_ORDER, null, $line['rel_id']);
+            if (!in_array($orderId, $orderIds, true) || !array_key_exists($orderId, $quotedExpiries)) {
+                return null;
+            }
+            if (isset($periods[$orderId]) && $periods[$orderId] !== $line['period']) {
+                unset($periods[$orderId]);
+            }
+        }
+
+        return array_values(array_diff($orderIds, array_keys($periods)));
+    }
+
+    /** Caller holds the invoice row and every renewal order's request mutex. */
+    private function removeRenewalsFromDraft(Invoice $invoice, array $orderIds, string $reason): bool
+    {
+        // Never rewrite a quote after incoming money has been linked to it.
+        if ($this->getAmountPaid($invoice) > 0 || $this->getTransactionRepository()->findOneBy(['invoice' => $invoice]) !== null) {
+            return false;
+        }
+        $em = $this->di['em'];
+        $orders = $this->di['mod_service']('Order');
+        $feeRemoved = false;
+        $remaining = 0;
+        foreach ($this->getInvoiceItemRepository()->findByInvoiceId((int) $invoice->getId()) as $item) {
+            $em->refresh($item);
+            $orderId = $item->getOrderId() ?? ServiceInvoiceItem::resolveOrderReference($item->getType(), $item->getUnit(), $item->getRelId());
+            $removed = in_array($orderId, $orderIds, true)
+                && (($item->getType() === InvoiceItem::TYPE_ORDER && $item->getTask() === InvoiceItem::TASK_RENEW)
+                    || ($item->getType() === InvoiceItem::TYPE_CUSTOM && $item->getUnit() === 'discount'));
+            if ($removed || $item->getTask() === ServiceGatewayFees::TASK) {
+                $feeRemoved = $feeRemoved || $item->getTask() === ServiceGatewayFees::TASK;
+                $em->remove($item);
+            } else {
+                ++$remaining;
+            }
+        }
+        foreach ($orderIds as $id) {
+            $order = $em->getRepository(Order::class)->find($id);
+            if (!$order instanceof Order) {
+                continue;
+            }
+            $em->refresh($order);
+            if ($order->getUnpaidInvoiceId() === $invoice->getId()) {
+                $orders->unsetUnpaidInvoice($order);
+            }
+            $this->di['mod_service']('Product')->releaseReservedPromoRedemptionsForOrder($order, $reason, (int) $invoice->getId());
+            foreach (['free_domain_renewal_invoice_', 'domain_renewal_zero_price_invoice_'] as $prefix) {
+                $em->getConnection()->delete('client_order_meta', ['client_order_id' => $id, 'name' => $prefix . $invoice->getId()]);
+            }
+        }
+        if ($remaining === 0) {
+            $invoice->setStatus(Invoice::STATUS_CANCELED);
+        }
+        $em->flush();
+        if ($remaining > 0 && $feeRemoved) {
+            $this->di['mod_service']('Invoice', 'GatewayFees')->apply($invoice, $invoice->getGateway());
+        }
+
+        return $remaining > 0;
+    }
+
+    private function assignInvoiceNumberIfMissing(Invoice $invoice): void
+    {
+        if (!is_numeric($invoice->getNr() ?? null)) {
+            $serie = $this->di['mod_service']('system')->getParamValue('invoice_series');
+            $invoice->setSerie($serie !== null ? (string) $serie : null);
+            $invoice->setNr($this->getNextInvoiceNumber());
+        }
+    }
+
+    public function notifyInvoiceIssued(Invoice $invoice, bool $retryOnFailure = false): void
+    {
+        $this->di['event_dispatcher']->dispatch(new AfterAdminInvoiceIssueEvent((int) $invoice->getId(), $retryOnFailure));
+    }
+
+    /** Deliver deferred checkout events at least once, serialized per invoice. */
+    public function notifyDeferredInvoiceIssued(Invoice $invoice, bool $retryCredit = false): void
+    {
+        $connection = $this->di['em']->getConnection();
+        $name = 'fb:invoice-issued:' . $invoice->getId();
+        if (!NamedLock::acquire($connection, $name, 30)) {
+            throw new InformationException('Invoice issuance notification is already being processed.');
+        }
+
+        try {
+            $this->di['em']->refresh($invoice);
+            if ($invoice->getIssueNotificationState() === 0) {
+                return;
+            }
+            if ($retryCredit && !$invoice->isSubscriptionPaymentDraft() && ($invoice->getIssueNotificationState() & 3) === 1 && $invoice->getStatus() === Invoice::STATUS_UNPAID) {
+                $this->tryPayWithCredits($invoice);
+            }
+            // A deferred event is acknowledged only after its built-in
+            // notification listener has successfully queued the email.
+            $this->notifyInvoiceIssued($invoice, true);
+            $invoice->setIssueNotificationState(0);
+            $this->di['em']->flush();
+        } finally {
+            NamedLock::release($connection, $name);
+        }
+    }
+
+    /** Retry checkout issue events left pending by interruption or listener failure. */
+    public function doBatchDeliverIssuedNotifications(): bool
+    {
+        $invoices = $this->getInvoiceRepository()->findBy(['issueNotificationState' => [1, 2, 5, 6]]);
+        $invoiceIds = array_map(static fn (Invoice $invoice): int => (int) $invoice->getId(), $invoices);
+        foreach ($invoiceIds as $invoiceId) {
+            try {
+                // A prior failure may have replaced the manager and detached the selection.
+                $invoice = $this->getInvoiceRepository()->find($invoiceId);
+                if (!$invoice instanceof Invoice) {
+                    continue;
+                }
+                $this->notifyDeferredInvoiceIssued($invoice, true);
+            } catch (\Throwable $e) {
+                $this->di['logger']->warning('Could not deliver deferred invoice issuance #{id}: {error}', ['id' => $invoiceId, 'error' => $e->getMessage()]);
+                if (!$this->di['em']->isOpen()) {
+                    $this->resetEntityManager();
+                }
+            }
+        }
 
         return true;
     }
@@ -1038,7 +2189,7 @@ class Service implements InjectionAwareInterface
     {
         $epsilon = 0.01;
         if ($received < $expected - $epsilon) {
-            throw new \FOSSBilling\Exception('Payment amount does not match the expected invoice total. Expected :expected, received :received.', [':expected' => number_format($expected, 2, '.', ''), ':received' => number_format($received, 2, '.', '')]);
+            throw new \FOSSBilling\Core\Exception\BaseException('Payment amount does not match the expected invoice total. Expected :expected, received :received.', [':expected' => number_format($expected, 2, '.', ''), ':received' => number_format($received, 2, '.', '')]);
         }
 
         // Warn on significant overpayments — this can indicate a misdirected
@@ -1046,104 +2197,633 @@ class Service implements InjectionAwareInterface
         $overpaymentTolerance = 1.00;
         if ($received > $expected + $overpaymentTolerance) {
             $this->di['logger']->warning(
-                'Payment amount significantly exceeds the expected invoice total. Expected :expected, received :received.',
-                [':expected' => number_format($expected, 2, '.', ''), ':received' => number_format($received, 2, '.', '')]
+                'Payment amount significantly exceeds the expected invoice total. Expected {expected}, received {received}.',
+                ['expected' => number_format($expected, 2, '.', ''), 'received' => number_format($received, 2, '.', '')]
             );
         }
     }
 
-    public function tryPayWithCredits(\Model_Invoice $invoice): bool
+    private function withCreditLock(int $clientId, callable $callback): mixed
     {
-        if (!$invoice->approved) {
-            return false;
+        $connection = $this->di['em']->getConnection();
+        if ($connection->isTransactionActive()) {
+            throw new InformationException('Credit operations must start outside an existing transaction.');
         }
-        if ($invoice->status == \Model_Invoice::STATUS_PAID) {
-            if (DEBUG) {
-                $this->di['logger']->setChannel('billing')->info("Skipping credit payment for already paid invoice {$invoice->id}.");
+        $name = 'fb:credit_payment:client:' . $clientId;
+        if (!NamedLock::acquire($connection, $name, 30)) {
+            throw new InformationException('Another credit operation for this client is already in progress. Please retry.');
+        }
+
+        try {
+            return $callback();
+        } finally {
+            NamedLock::release($connection, $name);
+        }
+    }
+
+    public function tryPayWithCredits(Invoice $invoice, bool $gatewayPayment = false, bool $deferEvents = false): bool
+    {
+        $paid = $this->withCreditLock((int) $invoice->getClientId(), fn (): bool => $this->di['em']->wrapInTransaction(fn (): bool => $this->payWithCreditsInTransaction($invoice, $gatewayPayment)));
+
+        if ($paid && !$deferEvents) {
+            $this->finishGatewayPayment($invoice, true);
+        } elseif (!$paid && !$gatewayPayment && $invoice->getStatus() === Invoice::STATUS_UNPAID && $invoice->getGateway() instanceof PayGateway) {
+            // Credit did not cover the invoice: what it leaves due gets the
+            // gateway fee again.
+            $this->di['mod_service']('Invoice', 'GatewayFees')->apply($invoice, $invoice->getGateway());
+        }
+
+        return $paid;
+    }
+
+    /** Apply a cleared gateway payment and its pending marker in one database transaction. */
+    public function settleClearingPayment(Invoice $invoice, Transaction $clearing, Transaction $payment, string $gatewayName = 'Stripe'): void
+    {
+        $client = $this->di['em']->getRepository(Client::class)->find((int) $invoice->getClientId());
+        if (!$client instanceof Client) {
+            throw new InformationException('Client not found');
+        }
+        $this->recordGatewayPayment(
+            $payment, $client, (string) $payment->getTxnId(),
+            $gatewayName . ' transaction ' . $payment->getTxnId(),
+            $gatewayName === 'PayPal' ? 'PayPal' : 'transaction',
+            $gatewayName === 'PayPal' ? $payment->getTxnId() : (string) $payment->getId(),
+            function () use ($invoice, $clearing, $payment, $gatewayName): void {
+                $state = $this->lockAndRefreshInvoice($invoice);
+                if ($clearing !== $payment) {
+                    $this->di['em']->refresh($clearing, \Doctrine\DBAL\LockMode::PESSIMISTIC_WRITE);
+                }
+                if ($clearing->getInvoice()?->getId() !== $invoice->getId()
+                    || !in_array($clearing->getStatus(), $clearing === $payment ? [Transaction::STATUS_PROCESSING, Transaction::STATUS_RECEIVED, Transaction::STATUS_ERROR] : [Transaction::STATUS_RECEIVED, Transaction::STATUS_ERROR], true)
+                    || $clearing->getTxnStatus() !== 'processing') {
+                    throw new InformationException('The pending payment no longer matches this invoice.');
+                }
+                if (!in_array($state['status'], [Invoice::STATUS_UNPAID, Invoice::STATUS_PAID], true)) {
+                    throw new InformationException('The invoice cannot accept this payment.');
+                }
+                if ($state['status'] === Invoice::STATUS_UNPAID) {
+                    $this->validatePaymentAmount((float) $payment->getAmount(), $this->getBalanceDue($invoice));
+                }
+                if ($gatewayName === 'PayPal' && $state['status'] === Invoice::STATUS_UNPAID && !$invoice->isIssued() && !$this->isInvoiceTypeDeposit($invoice)) {
+                    $this->issueInvoice($invoice, ['use_credits' => false, 'defer_events' => true]);
+                }
+                $clearing->setTxnStatus($gatewayName === 'PayPal' ? 'Completed' : 'succeeded');
+                $clearing->setUpdatedAt(new \DateTimeImmutable());
             }
+        );
+    }
 
+    private function finishGatewayPayment(Invoice $invoice, bool $executeTasks): void
+    {
+        $this->firePaymentReceivedEvent($invoice);
+        if ($executeTasks) {
+            $this->executeInvoiceItemTasks(
+                $this->getInvoiceItemRepository()->findByInvoiceId((int) $invoice->getId()),
+                $this->di['mod_service']('Invoice', 'InvoiceItem')
+            );
+        } elseif ($invoice->getStatus() === Invoice::STATUS_UNPAID && $invoice->getGateway() instanceof PayGateway) {
+            // Credit did not cover the invoice: what it leaves due gets the
+            // gateway fee again.
+            $this->di['mod_service']('Invoice', 'GatewayFees')->apply($invoice, $invoice->getGateway());
+        }
+    }
+
+    /** Caller holds the client credit lock and an open transaction. */
+    private function payWithCreditsInTransaction(Invoice $invoice, bool $gatewayPayment): bool
+    {
+        // Refresh after locking so a stale entity cannot authorize a credit deduction.
+        $state = $this->lockAndRefreshInvoice($invoice);
+        if (!$state['issued'] || (!$gatewayPayment && $invoice->isSubscriptionPaymentDraft())) {
+            return false;
+        }
+        if ($state['status'] !== Invoice::STATUS_UNPAID) {
             return false;
         }
 
-        $client = $this->di['db']->load('Client', $invoice->client_id);
+        if ($this->invoiceHasDeletionHold($invoice)) {
+            return false;
+        }
+
+        // Account credit never pays an Add funds invoice: the deposit
+        // would be deducted without ever topping the wallet up.
+        if ($this->isInvoiceTypeDeposit($invoice)) {
+            return false;
+        }
+
+        if (PendingPayments::forInvoice($this->di['em']->getConnection(), (int) $invoice->getId()) !== null) {
+            return false;
+        }
+
+        $clientId = (int) $invoice->getClientId();
+        $client = $this->di['em']->getRepository(Client::class)->find($clientId);
+        if (!$client instanceof Client) {
+            throw new InformationException('Client not found');
+        }
+        $this->di['em']->refresh($client, \Doctrine\DBAL\LockMode::PESSIMISTIC_WRITE);
+        if (strcasecmp((string) $client->getCurrency(), (string) $invoice->getCurrency()) !== 0) {
+            throw new InformationException('The credit is in :currency and cannot pay an invoice in another currency.', [':currency' => (string) $client->getCurrency()]);
+        }
+
+        // Credit pays without the gateway fee. Remove it before measuring
+        // what the credit must cover.
+        $invoiceId = (int) $invoice->getId();
+        $received = $gatewayPayment ? [] : $this->getTransactionRepository()->getProcessedSumsByInvoiceIds([$invoiceId]);
+        if (!$gatewayPayment && ($received[$invoiceId] ?? 0.0) <= 0.0) {
+            $this->di['mod_service']('Invoice', 'GatewayFees')->remove($invoice);
+        }
+
         $cbrepo = $this->di['mod_service']('Client', 'Balance');
-        $balance = $cbrepo->getClientBalance($client);
+
+        // Locks the balance for the rest of this transaction, so a concurrent request cannot
+        // spend the same credit.
+        $balance = $cbrepo->getClientBalanceForUpdate($clientId);
+
+        // What other unpaid invoices have received waits for them.
+        $balance -= $this->getReservedCredit($clientId, (int) $invoice->getId());
+
         $required = $this->getTotalWithTax($invoice);
-        $epsilon = 0.01;
-        $difference = $balance - $required;
+        // A staff-recorded payment has no matching wallet receipt. Only the
+        // remainder (including receipt-backed gateway payments) consumes credit.
+        $processed = $this->getTransactionRepository()->getProcessedSumsByInvoiceIds([$invoiceId]);
 
-        if ($difference >= -$epsilon) {
-            // @phpstan-ignore if.alwaysFalse
+        try {
+            $receipts = $this->di['em']->getRepository(ClientBalance::class);
+            $receipts->reconcileHistoricalGatewayReceiptsForInvoice($invoiceId);
+            $receiptBacked = $receipts->getGatewayReceiptSumForInvoice($invoiceId);
+        } catch (InformationException $e) {
+            // An unresolved historical receipt must be reviewed before the
+            // invoice can be settled. It may account for the apparent credit.
+            if (!$gatewayPayment) {
+                throw $e;
+            }
+
+            return false;
+        }
+        $required = max(0.0, round($required - max(0.0, ($processed[$invoiceId] ?? 0.0) - $receiptBacked), 2));
+        // Compare at two-decimal monetary scale: balances are DECIMAL(18,2) sums while the
+        // total is float arithmetic, so e.g. 0.30 and 0.1 * 3 differ as raw floats.
+        if (round($balance, 2) < round($required, 2)) {
+            // @phpstan-ignore if.alwaysFalse (DEBUG is a runtime constant that may be true during debugging)
             if (DEBUG) {
-                $this->di['logger']->setChannel('billing')->info("Setting invoice {$invoice->id} as paid with credits for the amount of {$required}.");
+                $this->di['logger']->withChannel('billing')->info('Invoice #{id} could not be paid with credits. Money in balance {balance}. Required: {required}.', ['id' => $invoice->getId(), 'balance' => $balance, 'required' => $required]);
             }
 
-            if ($required <= $epsilon) {
-                // Nothing was actually charged against the client's balance, so don't record a $0 credit transaction.
-                $this->markAsPaid($invoice, false, true);
+            return false;
+        }
 
-                return true;
-            }
+        // @phpstan-ignore if.alwaysFalse
+        if (DEBUG) {
+            $this->di['logger']->withChannel('billing')->info('Setting invoice #{id} as paid with credits for the amount of {amount}.', ['id' => $invoice->getId(), 'amount' => $required]);
+        }
 
+        if ($required > 0.0) {
+            // Nothing is charged against the client's balance for a zero or negative invoice,
+            // so don't record a $0 credit transaction.
             $balanceTransaction = new ClientBalance();
-            $balanceTransaction->setClientId((int) $client->id);
+            $balanceTransaction->setClient($this->di['em']->getReference(Client::class, $clientId));
             $balanceTransaction->setType('invoice');
-            $balanceTransaction->setRelId((string) $invoice->id);
+            $balanceTransaction->setRelId((string) $invoice->getId());
 
-            $invoice_identifier = $invoice->nr ?: $invoice->id;
+            $invoice_identifier = $invoice->getNr() ?: $invoice->getId();
             $balanceTransaction->setDescription("Payment for invoice #{$invoice_identifier} using account credit.");
 
             $balanceTransaction->setAmount((string) (-$required));
             $this->di['em']->persist($balanceTransaction);
             $this->di['em']->flush();
+        }
 
-            $this->markAsPaid($invoice, false, true);
+        // Events and tasks run after the commit below, so neither
+        // notifications nor provisioning are held under the balance lock.
+        // The paid journal row is written by markAsPaid() inside this same
+        // transaction, so it commits atomically with the payment; a
+        // journal failure still cannot fail the payment itself.
+        $this->markAsPaid($invoice, false, false, true);
+
+        return true;
+    }
+
+    /** Must be called under the provider-object lock when selecting a renewal invoice. */
+    public function gatewayReceiptExists(int $gatewayId, string $providerObjectId, Client $client, float $amount, string $description, string $legacyType): bool
+    {
+        if ($gatewayId <= 0 || $providerObjectId === '') {
+            throw new InformationException('Gateway receipt details are invalid.');
+        }
+        $repository = $this->di['em']->getRepository(ClientBalance::class);
+        $existing = $repository->findOneBy(['gatewayReceiptKey' => hash('sha256', $gatewayId . ':' . $providerObjectId)]);
+        if ($existing instanceof ClientBalance) {
+            if ((int) $existing->getClient()?->getId() !== (int) $client->getId() || round((float) $existing->getAmount(), 2) !== round($amount, 2)) {
+                throw new InformationException('A gateway receipt conflicts with the client or amount.');
+            }
 
             return true;
         }
-        // @phpstan-ignore if.alwaysFalse (DEBUG is a runtime constant that may be true during debugging)
-        if (DEBUG) {
-            $this->di['logger']->setChannel('billing')->info("Invoice {$invoice->id} could not be paid with credits. Money in balance {$balance} Required: {$required}.");
+        $descriptions = [$description];
+        if ($legacyType === 'transaction' && str_starts_with($description, 'Stripe subscription ')) {
+            $descriptions[] = 'Stripe subscription initial payment ' . $providerObjectId;
+            $descriptions[] = 'Stripe subscription recurring payment ' . $providerObjectId;
+        }
+        if ($repository->findOneBy(['client' => $client, 'type' => $legacyType, 'description' => array_unique($descriptions)]) instanceof ClientBalance) {
+            throw new InformationException('A previous gateway credit needs staff reconciliation before this payment can be retried.');
         }
 
         return false;
     }
 
-    public function getTotalWithTax(\Model_Invoice $invoice): float
+    /**
+     * Record a verified provider payment and settle its invoice atomically.
+     * Returns false only for a separate duplicate transaction. The canonical
+     * receipt owner is retained and resumes post-commit completion on retry.
+     */
+    public function recordGatewayPayment(Transaction $transaction, Client $client, string $providerObjectId, string $description, string $legacyType, ?string $legacyRelId = null, ?callable $prepareSettlement = null): bool
+    {
+        $gatewayId = $transaction->getGateway()?->getId();
+        $amount = (float) $transaction->getAmount();
+        if (!$gatewayId || $providerObjectId === '' || !$client->getId() || !is_finite($amount) || $amount <= 0.0) {
+            throw new InformationException('Gateway receipt details are invalid.');
+        }
+        $invoice = $transaction->getInvoice();
+        if ($invoice instanceof Invoice && (int) $invoice->getClientId() !== (int) $client->getId()) {
+            throw new InformationException('Gateway receipt does not belong to the invoice client.');
+        }
+        $currency = (string) $transaction->getCurrency();
+        if ($currency === '' || strcasecmp($currency, (string) $client->getCurrency()) !== 0
+            || ($invoice instanceof Invoice && strcasecmp($currency, (string) $invoice->getCurrency()) !== 0)) {
+            throw new InformationException('Gateway receipt currency does not match the client and invoice.');
+        }
+        $db = $this->di['em']->getConnection();
+        $attempt = $invoice instanceof Invoice ? $db->fetchAssociative("SELECT id, owner_token, invoice_id FROM invoice_gateway_charge_attempt WHERE invoice_id = ? AND gateway_id = ? AND payment_id = ? AND state = 'pending'", [$invoice->getId(), $gatewayId, $providerObjectId]) : false;
+        foreach (ProcessingFence::claims() as $claim) {
+            if ($attempt && $claim['table'] === 'invoice_gateway_charge_attempt' && $claim['id'] === $attempt['id']) {
+                // The enclosing saved-charge/recovery scope resolves its own
+                // attempt after settlement; ending it here would revoke that scope.
+                $attempt = false;
+
+                break;
+            }
+        }
+        // Legacy rel_id is limited to 20 characters. The complete provider
+        // identifier remains in the description and receipt fingerprint.
+        if ($legacyRelId !== null && strlen($legacyRelId) > 20) {
+            $legacyRelId = null;
+        }
+        $key = hash('sha256', $gatewayId . ':' . $providerObjectId);
+        $paid = false;
+        $resume = false;
+        $complete = true;
+        // Settlement and acknowledgement share one mutex: an older completion
+        // must not acknowledge work created by a concurrent receipt retry.
+        $created = $this->withPaymentCompletionLock((int) $transaction->getId(), function () use ($transaction, $client, &$invoice, $key, $amount, $description, $legacyType, $legacyRelId, $providerObjectId, &$paid, &$resume, &$complete, $prepareSettlement, $db, $attempt): bool {
+            return $this->withCreditLock((int) $client->getId(), function () use ($transaction, $client, &$invoice, $key, $amount, $description, $legacyType, $legacyRelId, $providerObjectId, &$paid, &$resume, &$complete, $prepareSettlement, $db, $attempt): bool {
+                if ($this->gatewayReceiptExists((int) $transaction->getGateway()->getId(), $providerObjectId, $client, $amount, $description, $legacyType)) {
+                    $receipt = $this->di['em']->getRepository(ClientBalance::class)->findOneBy(['gatewayReceiptKey' => $key]);
+                    if (!$receipt instanceof ClientBalance || $receipt->getGatewayTransactionId() !== $transaction->getId()) {
+                        return false;
+                    }
+                    // Restore the original target rather than a retry's tentative binding.
+                    $this->di['em']->refresh($transaction);
+                    $invoice = $transaction->getInvoice();
+                    $complete = $transaction->getGatewayCompletionState() !== Transaction::GATEWAY_COMPLETION_DONE || !empty($transaction->getError());
+                    $resume = true;
+                }
+
+                return $this->di['em']->wrapInTransaction(function () use ($transaction, $client, $invoice, $key, $amount, $description, $legacyType, $legacyRelId, $providerObjectId, &$paid, $resume, &$complete, $prepareSettlement, $db, $attempt): bool {
+                    if (!$resume && $prepareSettlement !== null) {
+                        $prepareSettlement();
+                    }
+                    if (!$resume) {
+                        PaymentCredit::assertNoLegacyCredit($this->di['em'], (int) $client->getId(), [
+                            'payment_reference' => $providerObjectId, 'type' => $legacyType, 'rel_id' => $legacyRelId,
+                        ]);
+                        $receipt = (new ClientBalance())
+                        ->setClient($client)
+                        ->setType($legacyType)
+                        ->setRelId($legacyRelId)
+                        ->setDescription($description)
+                        ->setAmount((string) $amount)
+                        ->setGatewayReceiptKey($key)
+                        ->setGatewayTransactionId($transaction->getId());
+                        $this->di['em']->persist($receipt);
+                    }
+                    $transaction->setStatus(Transaction::STATUS_PROCESSED);
+                    if ($complete) {
+                        $transaction->setGatewayCompletionState(Transaction::GATEWAY_COMPLETION_RUNNING);
+                    }
+                    $transaction->setError(null);
+                    $transaction->setErrorCode(null);
+                    $transaction->setUpdatedAt(new \DateTimeImmutable());
+                    $this->di['em']->persist($transaction);
+                    // The processed transaction reserves the incoming credit for its
+                    // invoice before any other credit operation can spend it.
+                    $this->di['em']->flush();
+
+                    if ($invoice instanceof Invoice && $invoice->getStatus() !== Invoice::STATUS_PAID) {
+                        $this->settleGatewayInvoiceInTransaction($invoice, $client, $paid);
+                        if ($paid && !$complete) {
+                            $complete = true;
+                            $transaction->setGatewayCompletionState(Transaction::GATEWAY_COMPLETION_RUNNING);
+                            $this->di['em']->flush();
+                        }
+                    }
+
+                    if ($attempt && $invoice instanceof Invoice && $invoice->getId() === (int) $attempt['invoice_id']) {
+                        $owner = $attempt['owner_token'] === null ? 'owner_token IS NULL' : 'owner_token = ?';
+                        $parameters = [date('Y-m-d H:i:s'), $attempt['id']];
+                        if ($attempt['owner_token'] !== null) {
+                            $parameters[] = $attempt['owner_token'];
+                        }
+                        if ($db->executeStatement("UPDATE invoice_gateway_charge_attempt SET state = 'settled', resolved_at = ? WHERE id = ? AND state = 'pending' AND {$owner}", $parameters) !== 1) {
+                            throw new \FOSSBilling\Core\Payment\OwnershipLost('The charge attempt changed while settling its payment.');
+                        }
+                    }
+
+                    return true;
+                });
+            });
+        });
+        if ($created && $complete) {
+            $this->completeGatewayPayment($transaction);
+        }
+
+        return $created;
+    }
+
+    /** Resume committed receipt work without repeating any provider operation. */
+    public function completeGatewayPayment(Transaction $transaction): void
+    {
+        $this->completePayment($transaction, false);
+    }
+
+    /** Resume only local work for a payment already confirmed by staff. */
+    public function completeOfflinePayment(Transaction $transaction): void
+    {
+        $this->completePayment($transaction, true);
+    }
+
+    protected function withPaymentCompletionLock(int $transactionId, callable $operation): mixed
+    {
+        $connection = $this->di['em']->getConnection();
+        $name = 'fb:gateway-completion:' . $transactionId;
+        if (!NamedLock::acquire($connection, $name, 30)) {
+            throw new InformationException('Gateway payment completion is already being processed.');
+        }
+
+        try {
+            return $operation();
+        } finally {
+            NamedLock::release($connection, $name);
+        }
+    }
+
+    private function completePayment(Transaction $transaction, bool $offline): void
+    {
+        $this->withPaymentCompletionLock((int) $transaction->getId(), function () use ($transaction, $offline): void {
+            $em = $this->di['em'];
+            $connection = $em->getConnection();
+            $em->refresh($transaction);
+            if ($transaction->getStatus() !== Transaction::STATUS_PROCESSED) {
+                throw new InformationException('Gateway payment has not been committed.');
+            }
+            if ($transaction->getGatewayCompletionState() === Transaction::GATEWAY_COMPLETION_DONE) {
+                return;
+            }
+            $invoice = $transaction->getInvoice();
+            if ($invoice instanceof Invoice) {
+                $em->refresh($invoice);
+            }
+            if ($offline) {
+                $gateway = $transaction->getGateway();
+                if (!$gateway instanceof PayGateway || !ServicePayGateway::isManualApprovalGateway($gateway->getGateway())
+                    || !$invoice instanceof Invoice || strcasecmp((string) $transaction->getCurrency(), (string) $invoice->getCurrency()) !== 0) {
+                    throw new InformationException('Offline payment completion requires a committed staff-approved invoice payment.');
+                }
+            } else {
+                $receipt = $em->getRepository(ClientBalance::class)->findOneBy(['gatewayTransactionId' => $transaction->getId()]);
+                $client = $receipt?->getClient();
+                $amount = (float) $transaction->getAmount();
+                $currency = (string) $transaction->getCurrency();
+                if (!$receipt instanceof ClientBalance || !$client instanceof Client || !$receipt->getGatewayReceiptKey()
+                    || !is_finite($amount) || $amount <= 0.0 || round((float) $receipt->getAmount(), 2) !== round($amount, 2)
+                    || $currency === '' || strcasecmp($currency, (string) $client->getCurrency()) !== 0
+                    || ($invoice instanceof Invoice && ((int) $invoice->getClientId() !== (int) $client->getId()
+                        || strcasecmp($currency, (string) $invoice->getCurrency()) !== 0))) {
+                    throw new InformationException('Gateway payment completion does not match its committed receipt.');
+                }
+            }
+            if ($invoice instanceof Invoice && $invoice->getStatus() === Invoice::STATUS_PAID) {
+                $this->firePaymentReceivedEvent($invoice);
+                $this->executeInvoiceItemTasks($this->getInvoiceItemRepository()->findByInvoiceId((int) $invoice->getId()), $this->di['mod_service']('Invoice', 'InvoiceItem'));
+            }
+            // Native acknowledgement also clears diagnostics written by a
+            // timed-out worker without relying on Doctrine's cached values.
+            $connection->executeStatement('UPDATE ' . $connection->quoteSingleIdentifier('transaction')
+                . ' SET gateway_completion_state = 0, error = NULL, error_code = NULL, updated_at = ? WHERE id = ? AND status = ?',
+                [date('Y-m-d H:i:s'), $transaction->getId(), Transaction::STATUS_PROCESSED]);
+            $em->refresh($transaction);
+        });
+    }
+
+    /** Caller holds the client lock and payment transaction. */
+    private function settleGatewayInvoiceInTransaction(Invoice $invoice, Client $client, bool &$paid): void
+    {
+        // Keep verified incoming money even when its invoice can no longer settle.
+        $state = $this->lockAndRefreshInvoice($invoice);
+        if ($state['status'] !== Invoice::STATUS_UNPAID) {
+            return;
+        }
+
+        if ($this->isInvoiceTypeDeposit($invoice)) {
+            if (round($this->getAmountPaid($invoice), 2) < round($this->getTotalWithTax($invoice), 2)) {
+                return;
+            }
+            $invoiceId = (int) $invoice->getId();
+            $processed = $this->getTransactionRepository()->getProcessedSumsByInvoiceIds([$invoiceId]);
+
+            try {
+                $receipts = $this->di['em']->getRepository(ClientBalance::class);
+                $receipts->reconcileHistoricalGatewayReceiptsForInvoice($invoiceId);
+                $receiptBacked = $receipts->getGatewayReceiptSumForInvoice($invoiceId);
+            } catch (InformationException) {
+                // Keep ambiguous historical funds pending staff reconciliation.
+                return;
+            }
+            $manualPayment = max(0.0, round(($processed[$invoiceId] ?? 0.0) - $receiptBacked, 2));
+            $items = $this->getInvoiceItemRepository()->findByInvoiceId((int) $invoice->getId());
+            $itemService = $this->di['mod_service']('Invoice', 'InvoiceItem');
+            $itemCharges = 0.0;
+            foreach ($items as $item) {
+                if ($item->getType() !== InvoiceItem::TYPE_DEPOSIT) {
+                    $itemCharges += $itemService->getTotalWithTax($item);
+                }
+            }
+            $adjustment = round($itemCharges - $this->getNonDepositTotalWithTax($invoice, $items), 2);
+            $newlyPaid = null;
+            $markedPaid = $this->markAsPaid($invoice, true, false, true, null, $newlyPaid);
+            $paid = $newlyPaid ?? $markedPaid;
+            if ($paid && $manualPayment > 0.0) {
+                // Provider receipts already credited the wallet; staff-recorded
+                // payments did not. Commit their credit with the paid state so
+                // neither an interruption nor a repeated callback can lose or
+                // duplicate this portion of the deposit funding.
+                $entry = (new ClientBalance())->setClient($client)->setType('invoice')
+                    ->setRelId((string) $invoiceId)
+                    ->setDescription('Manual payment funding for deposit invoice #' . $invoiceId)
+                    ->setAmount((string) $manualPayment);
+                $this->di['em']->persist($entry);
+                $this->di['em']->flush();
+            }
+            if ($paid && $adjustment != 0.0) {
+                $entry = (new ClientBalance())->setClient($client)->setType('invoice')
+                    ->setRelId((string) $invoice->getId())
+                    ->setDescription('Invoice tax rounding adjustment')
+                    ->setAmount((string) $adjustment);
+                $this->di['em']->persist($entry);
+                $this->di['em']->flush();
+            }
+
+            return;
+        }
+        if ($invoice->getGateway() instanceof PayGateway && $this->getBalanceDue($invoice) > 0.0) {
+            // The receipt has already been flushed. Reprice the fee on the
+            // remaining balance before attempting settlement, under the same
+            // client and invoice locks. A fully paid external charge keeps
+            // the fee that was included in its checkout amount.
+            $this->di['mod_service']('Invoice', 'GatewayFees')->apply($invoice, $invoice->getGateway());
+        }
+        $paid = $this->payWithCreditsInTransaction($invoice, true);
+    }
+
+    /** Staff may link a verified legacy receipt after checking the provider record. */
+    public function reconcileGatewayReceipt(int $receiptId, int $transactionId, string $providerObjectId): void
+    {
+        $receipt = $this->di['em']->find(ClientBalance::class, $receiptId);
+        $clientId = $receipt?->getClient()?->getId();
+        if (!$receipt instanceof ClientBalance || !$clientId || $providerObjectId === '') {
+            throw new InformationException('Gateway receipt details are invalid.');
+        }
+        $paid = false;
+        $completion = null;
+        $this->withPaymentCompletionLock($transactionId, function () use ($receipt, $transactionId, $providerObjectId, $clientId, &$paid, &$completion): void {
+            $this->withCreditLock((int) $clientId, function () use ($receipt, $transactionId, $providerObjectId, $clientId, &$paid, &$completion): void {
+                $this->di['em']->wrapInTransaction(function () use ($receipt, $transactionId, $providerObjectId, $clientId, &$paid, &$completion): void {
+                    $this->di['em']->refresh($receipt);
+                    $connection = $this->di['em']->getConnection();
+                    $txTable = $connection->quoteIdentifier('transaction');
+                    $connection->fetchOne("SELECT id FROM $txTable WHERE id = ?" . RowLock::suffix($connection), [$transactionId]);
+                    $tx = $this->di['em']->find(Transaction::class, $transactionId);
+                    if ($tx instanceof Transaction) {
+                        $this->di['em']->refresh($tx);
+                    }
+                    $gateway = $tx?->getGateway();
+                    $invoice = $tx?->getInvoice();
+                    $client = $receipt->getClient();
+                    if (!$tx instanceof Transaction || !$gateway || !$client
+                        || ($invoice instanceof Invoice && (int) $invoice->getClientId() !== (int) $clientId)
+                        || !in_array($tx->getStatus(), [Transaction::STATUS_PROCESSED, Transaction::STATUS_ERROR], true)
+                        || (float) $receipt->getAmount() <= 0
+                        || round((float) $tx->getAmount(), 2) !== round((float) $receipt->getAmount(), 2)
+                        || strcasecmp((string) $tx->getCurrency(), (string) $client->getCurrency()) !== 0
+                        || ($invoice instanceof Invoice && strcasecmp((string) $tx->getCurrency(), (string) $invoice->getCurrency()) !== 0)
+                        || ($receipt->getGatewayReceiptKey() !== null
+                            && !hash_equals($receipt->getGatewayReceiptKey(), hash('sha256', $gateway->getId() . ':' . $providerObjectId)))
+                        || ($receipt->getGatewayTransactionId() !== null && $receipt->getGatewayTransactionId() !== $transactionId)) {
+                        throw new InformationException('The receipt and transaction do not match.');
+                    }
+                    $descriptions = match ([$gateway->getGateway(), $receipt->getType()]) {
+                        ['Stripe', 'transaction'] => ['Stripe transaction ' . $providerObjectId, 'Stripe subscription initial payment ' . $providerObjectId, 'Stripe subscription recurring payment ' . $providerObjectId],
+                        ['PayPalEmail', 'PayPal'] => ['PayPal transaction ' . $providerObjectId],
+                        default => [],
+                    };
+                    if (!in_array($receipt->getDescription(), $descriptions, true)) {
+                        throw new InformationException('The receipt and provider payment do not match.');
+                    }
+                    // Stripe's historical rel_id is its local transaction ID;
+                    // subscription txn_id can instead identify a setup intent.
+                    // PayPal's transaction ID is the provider payment ID.
+                    $reference = $receipt->getRelId();
+                    $matchesReference = match ($gateway->getGateway()) {
+                        'Stripe' => $reference !== null && $reference !== ''
+                            ? $reference === (string) $transactionId
+                            : $tx->getTxnId() === $providerObjectId,
+                        'PayPalEmail' => $tx->getTxnId() === $providerObjectId,
+                        default => false,
+                    };
+                    if (!$matchesReference || (!$invoice instanceof Invoice && $gateway->getGateway() !== 'Stripe')) {
+                        throw new InformationException('The receipt and transaction do not match.');
+                    }
+                    $key = hash('sha256', $gateway->getId() . ':' . $providerObjectId);
+                    $existingKey = $this->di['em']->getRepository(ClientBalance::class)->findOneBy(['gatewayReceiptKey' => $key]);
+                    if ($existingKey instanceof ClientBalance && $existingKey->getId() !== $receipt->getId()) {
+                        throw new InformationException('This provider payment already has a gateway receipt.');
+                    }
+                    $existing = $this->di['em']->getRepository(ClientBalance::class)->findOneBy(['gatewayTransactionId' => $transactionId]);
+                    if ($existing instanceof ClientBalance && $existing->getId() !== $receipt->getId()) {
+                        throw new InformationException('This transaction already has a gateway receipt.');
+                    }
+                    $receipt->setGatewayReceiptKey($key)->setGatewayTransactionId($transactionId);
+                    if ($tx->getStatus() === Transaction::STATUS_ERROR) {
+                        $tx->setStatus(Transaction::STATUS_PROCESSED)->setError(null)->setErrorCode(null)->setUpdatedAt(new \DateTimeImmutable());
+                        $tx->setGatewayCompletionState(Transaction::GATEWAY_COMPLETION_PENDING);
+                    }
+                    $this->di['em']->flush();
+                    if ($invoice instanceof Invoice && $invoice->getStatus() === Invoice::STATUS_UNPAID) {
+                        $this->settleGatewayInvoiceInTransaction($invoice, $client, $paid);
+                    }
+                    if ($paid || $tx->getGatewayCompletionState() !== Transaction::GATEWAY_COMPLETION_DONE) {
+                        $tx->setGatewayCompletionState(Transaction::GATEWAY_COMPLETION_PENDING);
+                        $this->di['em']->flush();
+                        $completion = $tx;
+                    }
+                });
+            });
+        });
+        if ($completion instanceof Transaction) {
+            $this->completeGatewayPayment($completion);
+        }
+        $this->di['logger']->withChannel('billing')->info('Staff reconciled gateway receipt #{receipt_id} to transaction #{transaction_id}', ['receipt_id' => $receiptId, 'transaction_id' => $transactionId]);
+    }
+
+    private function firePaymentReceivedEvent(Invoice $invoice): void
+    {
+        $this->di['event_dispatcher']->dispatch(new AfterAdminInvoicePaymentReceivedEvent((int) $invoice->getId()));
+    }
+
+    /**
+     * Execute invoice-item tasks after the payment transaction has committed.
+     *
+     * @param InvoiceItem[]      $invoiceItems
+     * @param ServiceInvoiceItem $invoiceItemService
+     */
+    private function executeInvoiceItemTasks(array $invoiceItems, $invoiceItemService): void
+    {
+        foreach ($invoiceItems as $item) {
+            try {
+                $invoiceItemService->executeTask($item);
+            } catch (\Exception $e) {
+                $this->di['logger']->warning($e->getMessage());
+            }
+        }
+    }
+
+    public function getTotalWithTax(Invoice $invoice): float
     {
         return $this->getTotal($invoice) + $this->getTax($invoice);
     }
 
-    public function getTax(\Model_Invoice $invoice): float
+    public function getTax(Invoice $invoice): float
     {
-        if ($invoice->taxrate <= 0) {
+        if ($invoice->getTaxrate() <= 0) {
             return 0.0;
         }
 
-        $items = $this->getInvoiceItemRepository()->findByInvoiceId((int) $invoice->id);
+        $items = $this->getInvoiceItemRepository()->findByInvoiceId((int) $invoice->getId());
 
-        if (empty($items)) {
-            return 0.0;
-        }
-
-        $taxable_subtotal = 0.0;
-        foreach ($items as $item) {
-            if ($item->getTaxed()) {
-                $taxable_subtotal += (($item->getPrice() ?? 0) * ($item->getQuantity() ?? 1));
-            }
-        }
-
-        if ($taxable_subtotal == 0) {
-            return 0.0;
-        }
-
-        return round($taxable_subtotal * $invoice->taxrate / 100, 2);
+        return (float) ServiceTax::calculateInvoiceTax($invoice, $items);
     }
 
-    public function getTotal(\Model_Invoice $invoice): float
+    public function getTotal(Invoice $invoice): float
     {
         $total = 0;
-        $invoiceItems = $this->getInvoiceItemRepository()->findByInvoiceId((int) $invoice->id);
+        $invoiceItems = $this->getInvoiceItemRepository()->findByInvoiceId((int) $invoice->getId());
         $invoiceItemService = $this->di['mod_service']('Invoice', 'InvoiceItem');
         foreach ($invoiceItems as $item) {
             $total += $invoiceItemService->getTotal($item);
@@ -1152,65 +2832,547 @@ class Service implements InjectionAwareInterface
         return (float) $total;
     }
 
-    public function refundInvoice(\Model_Invoice $invoice, $note = null): ?int
+    /**
+     * What an invoice has received: processed payments plus applied account
+     * credit. Either waits on the invoice until it is paid.
+     */
+    public function getAmountPaid(Invoice $invoice): float
     {
-        $this->di['events_manager']->fire(['event' => 'onBeforeAdminInvoiceRefund', 'params' => $this->toApiArray($invoice)]);
+        $id = (int) $invoice->getId();
+        $transactions = $this->getTransactionRepository()->getProcessedSumsByInvoiceIds([$id]);
+        $credits = $this->getInvoiceCreditRepository()->getSumsByInvoiceIds([$id]);
+
+        return round(($transactions[$id] ?? 0.0) + ($credits[$id] ?? 0.0), 2);
+    }
+
+    public function getBalanceDue(Invoice $invoice): float
+    {
+        return max(0.0, round($this->getTotalWithTax($invoice) - $this->getAmountPaid($invoice), 2));
+    }
+
+    /**
+     * The part of each client's balance set aside for their unpaid invoices:
+     * received payments and applied credit wait on their invoice instead of
+     * staying spendable.
+     *
+     * @param list<int> $clientIds
+     *
+     * @return array<int, float> reserved amounts keyed by client id
+     */
+    public function getReservedCreditForClients(array $clientIds): array
+    {
+        $rows = $this->getInvoiceRepository()->findUnpaidNonDepositRowsByClientIds($clientIds);
+
+        $reserved = $this->sumReservedCredit($rows);
+        $deposits = $this->di['em']->getRepository(ClientBalance::class)->getUnpaidDepositReceiptReservations($clientIds);
+        foreach ($deposits as $clientId => $amount) {
+            $reserved[$clientId] = round(($reserved[$clientId] ?? 0.0) + $amount, 2);
+        }
+
+        return $reserved;
+    }
+
+    /**
+     * The part of a client's balance set aside for their unpaid invoices
+     * (other than $exceptInvoiceId).
+     */
+    public function getReservedCredit(int $clientId, int $exceptInvoiceId = 0): float
+    {
+        $rows = $this->getInvoiceRepository()->findUnpaidNonDepositRowsByClientIds([$clientId], $exceptInvoiceId);
+        $reserved = $this->sumReservedCredit($rows);
+
+        $deposits = $this->di['em']->getRepository(ClientBalance::class)->getUnpaidDepositReceiptReservations([$clientId], $exceptInvoiceId);
+
+        return round(($reserved[$clientId] ?? 0.0) + ($deposits[$clientId] ?? 0.0), 2);
+    }
+
+    /**
+     * @param list<array{id: int, client_id: int, taxrate: float}> $rows
+     *
+     * @return array<int, float> reserved amounts keyed by client id
+     */
+    private function sumReservedCredit(array $rows): array
+    {
+        if ($rows === []) {
+            return [];
+        }
+
+        $invoiceIds = array_column($rows, 'id');
+        $totals = $this->getInvoiceRepository()->getInvoiceTotals($invoiceIds);
+        $transactions = $this->getTransactionRepository()->getProcessedSumsByInvoiceIds($invoiceIds);
+        $credits = $this->getInvoiceCreditRepository()->getSumsByInvoiceIds($invoiceIds);
+        $receiptRepository = $this->di['em']->getRepository(ClientBalance::class);
+
+        $reserved = [];
+        foreach ($rows as $row) {
+            $id = $row['id'];
+            $subtotal = $totals[$id]['subtotal'] ?? 0.0;
+            $taxable = $totals[$id]['taxable_subtotal'] ?? 0.0;
+            $total = $subtotal;
+            if ($row['taxrate'] > 0 && $taxable != 0) {
+                $total += round($taxable * $row['taxrate'] / 100, 2);
+            }
+
+            try {
+                $walletProcessed = min($transactions[$id] ?? 0.0, $receiptRepository->getGatewayReceiptReservationForInvoice((int) $id));
+            } catch (InformationException) {
+                // Preserve the reservation until staff identifies the legacy receipt.
+                $walletProcessed = $transactions[$id] ?? 0.0;
+            }
+            $paid = $walletProcessed + ($credits[$id] ?? 0.0);
+            $reserved[$row['client_id']] = ($reserved[$row['client_id']] ?? 0.0) + max(0.0, min($paid, round($total, 2)));
+        }
+
+        foreach ($reserved as $clientId => $amount) {
+            $reserved[$clientId] = round($amount, 2);
+        }
+
+        return $reserved;
+    }
+
+    /**
+     * The credit a client can spend: the balance less what is set aside for
+     * unpaid invoices.
+     */
+    public function getFreeCredit(int $clientId): float
+    {
+        $balance = $this->di['mod_service']('Client', 'Balance')->getBalanceSumByClientId($clientId);
+
+        return round($balance - $this->getReservedCredit($clientId), 2);
+    }
+
+    /**
+     * Applies any part of the client's free credit to an unpaid invoice, up
+     * to its balance due. A fully covered invoice is paid from credit.
+     */
+    public function applyCredit(Invoice $invoice, float $amount): bool
+    {
+        $amount = round($amount, 2);
+        if ($amount <= 0) {
+            throw new InformationException('Enter an amount greater than zero.');
+        }
+
+        $clientId = (int) $invoice->getClientId();
+        if ($this->di['em']->getConnection()->isTransactionActive()) {
+            throw new InformationException('Credit operations must start outside an existing transaction.');
+        }
+        $lockName = 'fb:credit_payment:client:' . $clientId;
+        if (!NamedLock::acquire($this->di['em']->getConnection(), $lockName, 30)) {
+            throw new InformationException('Another credit operation for this client is already in progress. Please retry.');
+        }
+
+        try {
+            $covered = $this->di['em']->wrapInTransaction(function () use ($invoice, $clientId, $amount): bool {
+                $state = $this->lockAndRefreshInvoice($invoice);
+                if ($state['status'] !== Invoice::STATUS_UNPAID) {
+                    throw new InformationException('Credit can only be applied to an unpaid invoice.');
+                }
+                if ($this->isInvoiceTypeDeposit($invoice)) {
+                    throw new InformationException('Account credit cannot pay a deposit invoice.');
+                }
+                if ($invoice->isSubscriptionPaymentDraft()) {
+                    throw new InformationException('Account credit cannot pay an invoice awaiting a subscription payment.');
+                }
+                $client = $this->di['em']->getRepository(Client::class)->find($clientId);
+                if (!$client instanceof Client) {
+                    throw new InformationException('Client not found');
+                }
+                if (strtoupper((string) $client->getCurrency()) !== strtoupper((string) $invoice->getCurrency())) {
+                    throw new InformationException('The credit is in :currency and cannot pay an invoice in another currency.', [':currency' => (string) $client->getCurrency()]);
+                }
+                $due = $this->getBalanceDue($invoice);
+                $max = min($due, $this->getFreeCredit($clientId));
+                if ($amount > $max) {
+                    throw new InformationException('You can apply at most :amount.', [':amount' => number_format(max(0.0, $max), 2) . ' ' . $invoice->getCurrency()]);
+                }
+
+                $credit = new InvoiceCredit();
+                $credit->setInvoice($invoice);
+                $credit->setClient($client);
+                $credit->setAmount((string) $amount);
+                $this->di['em']->persist($credit);
+                $this->di['em']->flush();
+
+                // The gateway fee applies only to the remaining amount due.
+                if ($invoice->getGateway() instanceof PayGateway) {
+                    $this->di['mod_service']('Invoice', 'GatewayFees')->apply($invoice, $invoice->getGateway());
+
+                    return $this->getBalanceDue($invoice) <= 0.0;
+                }
+
+                return $amount >= $due;
+            });
+        } finally {
+            NamedLock::release($this->di['em']->getConnection(), $lockName);
+        }
+
+        if ($covered) {
+            $this->tryPayWithCredits($invoice);
+        }
+
+        return true;
+    }
+
+    /**
+     * Takes the credit applied to an unpaid invoice back to the client's
+     * free credit.
+     */
+    public function removeCredit(Invoice $invoice): bool
+    {
+        if ($this->di['em']->getConnection()->isTransactionActive()) {
+            throw new InformationException('Credit operations must start outside an existing transaction.');
+        }
+        $lockName = 'fb:credit_payment:client:' . (int) $invoice->getClientId();
+        if (!NamedLock::acquire($this->di['em']->getConnection(), $lockName, 30)) {
+            throw new InformationException('Another credit operation for this client is already in progress. Please retry.');
+        }
+
+        try {
+            $this->di['em']->wrapInTransaction(function () use ($invoice): void {
+                $state = $this->lockAndRefreshInvoice($invoice);
+                if ($state['status'] !== Invoice::STATUS_UNPAID) {
+                    throw new InformationException('Credit can only be removed from an unpaid invoice.');
+                }
+                $this->getInvoiceCreditRepository()->deleteByInvoiceId((int) $invoice->getId());
+                if ($invoice->getGateway() instanceof PayGateway) {
+                    $this->di['mod_service']('Invoice', 'GatewayFees')->apply($invoice, $invoice->getGateway());
+                }
+            });
+        } finally {
+            NamedLock::release($this->di['em']->getConnection(), $lockName);
+        }
+
+        return true;
+    }
+
+    public function refundInvoice(Invoice $invoice, $note = null, ?array $items = null, array $options = []): int
+    {
+        $external = $this->externalReversal($options);
+        if ($external === null) {
+            $this->di['event_dispatcher']->dispatch(new BeforeAdminInvoiceRefundEvent((int) $invoice->getId()));
+        }
+
+        // The locked read inside the credit-note transaction below stays
+        // authoritative, but don't move money for a clearly unpaid invoice.
+        if ($external === null && $invoice->getStatus() !== Invoice::STATUS_PAID) {
+            throw new InformationException('Only paid invoices can be refunded');
+        }
+
+        $toCredit = !empty($options['to_credit']);
+        if ($toCredit && ((bool) ($options['gateway_refund'] ?? true) || !empty($options['gateway_returned']))) {
+            throw new InformationException('Return the money through the payment gateway or add it as account credit, not both.');
+        }
+
+        $replayed = false;
+        $new = $this->withInvoiceRefundLock($invoice, function () use ($invoice, $note, $items, $options, $external, &$replayed): Invoice {
+            if ($external !== null) {
+                $recorded = $this->recordedReversal($invoice, $external);
+                if ($recorded !== null) {
+                    $replayed = true;
+
+                    return $recorded;
+                }
+                $this->di['event_dispatcher']->dispatch(new BeforeAdminInvoiceRefundEvent((int) $invoice->getId()));
+            }
+
+            return $this->withCreditLock((int) $invoice->getClientId(), fn (): Invoice => $this->createRefundDocument($invoice, $note, $items, $options));
+        });
+        if ($replayed) {
+            return (int) $new->getId();
+        }
+
+        try {
+            $this->sendRefundEmail($invoice, $new, !empty($options['to_credit']));
+        } catch (\Throwable $exception) {
+            $this->di['logger']->withChannel('email')->error('Failed to send refund email', [
+                'invoice_id' => $invoice->getId(),
+                'credit_note_id' => $new->getId(),
+                'exception' => $exception,
+            ]);
+        }
+
+        $this->di['event_dispatcher']->dispatch(new AfterAdminInvoiceRefundEvent((int) $invoice->getId()));
+
+        $this->di['logger']->info('Refunded invoice #{invoice_id}', ['invoice_id' => $invoice->getId()]);
+
+        return (int) $new->getId();
+    }
+
+    /** Validate the internal receipt supplied for a provider-originated reversal. */
+    private function externalReversal(array $options): ?array
+    {
+        $receipt = $options['external_reversal'] ?? null;
+        if ($receipt === null) {
+            return null;
+        }
+        if (!is_array($receipt) || empty($options['gateway_returned']) || ($options['gateway_refund'] ?? true) !== false
+            || !is_int($receipt['gateway_id'] ?? null) || $receipt['gateway_id'] < 1
+            || !is_string($receipt['reversal_id'] ?? null) || trim($receipt['reversal_id']) === '' || strlen($receipt['reversal_id']) > 255
+            || !is_string($receipt['payment_id'] ?? null) || trim($receipt['payment_id']) === '' || strlen($receipt['payment_id']) > 255) {
+            throw new InformationException('Invalid external reversal receipt.');
+        }
+        $receipt['amount'] = PriceValidator::validateAmount($receipt['amount'] ?? null, 'Reversal amount');
+        if ($receipt['amount'] <= 0) {
+            throw new InformationException('Invalid external reversal amount.');
+        }
+
+        return $receipt;
+    }
+
+    /** Called under the invoice refund lock, before allocating another credit note. */
+    private function recordedReversal(Invoice $invoice, array $external): ?Invoice
+    {
+        $rows = $this->di['em']->getConnection()->fetchFirstColumn('SELECT snapshot FROM invoice_event WHERE invoice_id = ? AND type = ?', [(int) $invoice->getId(), InvoiceEvent::TYPE_REFUNDED]);
+        foreach ($rows as $json) {
+            $snapshot = json_decode((string) $json, true, 512, JSON_THROW_ON_ERROR);
+            $receipt = $snapshot['external_reversal'] ?? null;
+            if (!is_array($receipt) || ($receipt['gateway_id'] ?? null) !== $external['gateway_id'] || ($receipt['reversal_id'] ?? null) !== $external['reversal_id']) {
+                continue;
+            }
+            if (($receipt['payment_id'] ?? null) !== $external['payment_id'] || abs((float) ($receipt['amount'] ?? 0) - $external['amount']) > 0.005) {
+                throw new InformationException('This reversal was already recorded with different payment details.');
+            }
+            $note = $this->di['em']->find(Invoice::class, (int) ($snapshot['credit_note_id'] ?? 0));
+            if (!$note instanceof Invoice || $note->getCreditNoteForInvoiceId() !== $invoice->getId()) {
+                throw new InformationException('The recorded reversal credit note is missing. Review the refund before continuing.');
+            }
+
+            return $note;
+        }
+
+        return null;
+    }
+
+    public function pendingGatewayRefund(Invoice $invoice): ?array
+    {
+        $row = GatewayRefundAttempt::pending($this->di['em']->getConnection(), (int) $invoice->getId());
+
+        return $row === null ? null : ['id' => $row['id'], 'created_at' => $row['created_at']];
+    }
+
+    /** Staff confirmed in PayPal that no money was returned. */
+    public function dismissGatewayRefundAttempt(Invoice $invoice, string $attemptId, int $adminId): bool
+    {
+        $this->withInvoiceRefundLock($invoice, fn (): Invoice => $this->di['em']->wrapInTransaction(function () use ($invoice, $attemptId, $adminId): Invoice {
+            $this->lockAndRefreshInvoice($invoice);
+            GatewayRefundAttempt::dismiss($this->di['em']->getConnection(), (int) $invoice->getId(), $attemptId);
+            $this->addNote($invoice, 'Staff #' . $adminId . ' confirmed that PayPal did not issue refund attempt ' . $attemptId . '.');
+
+            return $invoice;
+        }));
+
+        return true;
+    }
+
+    /** Staff confirmed that PayPal returned the money; create its credit note without another gateway call. */
+    public function reconcileGatewayRefund(Invoice $invoice, string $attemptId, string $refundId, ?array $items, int $adminId): int
+    {
+        $refundId = trim($refundId);
+        if (!preg_match('/^[A-Za-z0-9_-]{1,255}$/', $refundId)) {
+            throw new InformationException('Enter the PayPal refund transaction ID.');
+        }
+
+        return $this->refundInvoice($invoice, 'Staff #' . $adminId . ' reconciled PayPal refund ' . $refundId . '.', $items, [
+            'gateway_refund' => false, 'gateway_returned' => true,
+            'reconcile_attempt' => $attemptId, 'reconcile_refund_id' => $refundId,
+        ]);
+    }
+
+    private function paypalRefundFingerprint(Invoice $invoice, PayGateway $gateway, Transaction $payment, float $amount, ?array $items, ?array $customLine): string
+    {
+        return hash('sha256', json_encode([
+            (int) $gateway->getId(), (string) $payment->getTxnId(), $amount,
+            (string) ($invoice->getCurrency() ?? $payment->getCurrency()),
+            $this->refundItemsFingerprint($items, $customLine),
+        ], JSON_THROW_ON_ERROR));
+    }
+
+    /**
+     * Serialize refunds of one invoice across processes. The gateway refund
+     * executes inside the credit-note transaction below, but that transaction
+     * starts with the invoice row lock, so without this outer lock two
+     * concurrent refunds with different line selections could both pass
+     * their read-only preparation before either commits; the loser's
+     * rollback would then orphan its already-issued refund. Holding the lock
+     * makes the second attempt see the first one's committed state before
+     * anything is prepared, so overlapping lines fail fast with nothing
+     * moved. Split out so tests can simulate a busy lock without a real
+     * database lock manager.
+     */
+    protected function withInvoiceRefundLock(Invoice $invoice, callable $callback): Invoice
+    {
+        $lockName = 'fb:invoice-refund:' . (int) $invoice->getId();
+        if (!NamedLock::acquire($this->di['em']->getConnection(), $lockName, 30)) {
+            $this->di['logger']->warning('Timed out waiting for invoice refund lock for invoice #{id}', ['id' => $invoice->getId()]);
+
+            throw new InformationException('Another refund for this invoice is already in progress. Please retry.');
+        }
+
+        try {
+            return $callback();
+        } finally {
+            NamedLock::release($this->di['em']->getConnection(), $lockName);
+        }
+    }
+
+    /**
+     * Build and persist the credit-note (or negative-invoice) document for a
+     * refund, moving the gateway money first. Runs under the per-invoice
+     * named lock held by refundInvoice so concurrent attempts serialize.
+     */
+    private function createRefundDocument(Invoice $invoice, $note, ?array $items, array $options): Invoice
+    {
+        // Arbitrary-amount custom lines are validated before anything moves.
+        $customLine = $this->resolveCustomRefundLine($options['custom_line'] ?? null);
+        $external = $this->externalReversal($options);
+        $gatewayRefundRequested = (bool) ($options['gateway_refund'] ?? true);
+        $gatewayReturned = (bool) ($options['gateway_returned'] ?? false);
+        $attemptId = $options['reconcile_attempt'] ?? null;
+        $refundId = $options['reconcile_refund_id'] ?? null;
+        $pending = GatewayRefundAttempt::pending($this->di['em']->getConnection(), (int) $invoice->getId());
+        if ($attemptId !== null) {
+            $gateway = $invoice->getGateway();
+            $payment = $this->findRefundablePaymentTransaction($invoice);
+            if (!is_string($attemptId) || !is_string($refundId) || !$gatewayReturned || !$gateway instanceof PayGateway
+                || !$payment instanceof Transaction || $pending === null || !hash_equals($pending['id'], $attemptId)) {
+                throw new InformationException('This refund attempt is no longer pending.');
+            }
+            $amount = $this->previewRefundAmount($invoice, $items, $customLine);
+            if (!hash_equals($pending['fingerprint'], $this->paypalRefundFingerprint($invoice, $gateway, $payment, $amount, $items, $customLine))) {
+                throw new InformationException('The selected refund lines do not match the pending PayPal attempt.');
+            }
+            $recorded = $this->di['em']->getRepository(Transaction::class)->findOneBy([
+                'gateway' => $gateway, 'txnId' => $refundId, 'type' => \Payment_Transaction::TXTYPE_REFUND,
+            ]);
+            if ($recorded instanceof Transaction) {
+                throw new InformationException('This gateway refund is already recorded.');
+            }
+        } elseif ($pending !== null && (!$gatewayRefundRequested || !$invoice->getGateway() instanceof PayGateway)) {
+            throw new InformationException('Reconcile the pending PayPal refund before recording another refund.');
+        }
+        $expectedAmount = $external['amount'] ?? (array_key_exists('expected_amount', $options)
+            ? PriceValidator::validateAmount($options['expected_amount'], 'Expected refund amount')
+            : null);
+
+        // A dashboard refund already returned the card payment, so a deposit
+        // invoice's wallet credit must be reversed when recording it.
+        if ($gatewayReturned && $this->isInvoiceTypeDeposit($invoice)) {
+            $this->assertDepositReversalAvailable($invoice, $this->previewRefundAmount($invoice, $items, $customLine));
+        }
+
+        $gatewayPlan = [];
+        if ($gatewayRefundRequested && !$gatewayReturned) {
+            // Read-only preparation: adapter, transaction, amount and any
+            // already-issued but unrecorded refund. The money-moving
+            // refundPayment call itself runs inside the credit-note
+            // transaction below, after the deposit credit is reversed under
+            // lock, so a shortfall aborts before Stripe is touched.
+            $gatewayPlan = $this->planGatewayRefund($invoice, $items, $customLine);
+        }
+
+        // Offline-only refunds of deposits keep the pre-existing paper trail:
+        // no card money moves, so there is no credit to reverse.
+        $reverseDeposit = ($gatewayPlan !== [] || $gatewayReturned) && $this->isInvoiceTypeDeposit($invoice);
+
+        $toCredit = !empty($options['to_credit']);
+        if ($toCredit && $this->isInvoiceTypeDeposit($invoice)) {
+            throw new InformationException('A deposit refund returns wallet credit as card money; it cannot go to account credit.');
+        }
 
         $systemService = $this->di['mod_service']('system');
         $logic = $systemService->getParamValue('invoice_refund_logic', 'manual');
-        $result = null;
 
-        switch ($logic) {
-            case 'credit_note':
-            case 'negative_invoice':
+        // Manual mode records the money movement as an offline refund document: the operator
+        // returns the money outside FOSSBilling, and the credit note below is its paper trail.
+        // Numbering follows the credit-note series, never the invoice series.
+        $offline = $logic === 'manual';
+        $documentLogic = $offline ? 'credit_note' : $logic;
+
+        return match ($documentLogic) {
+            'credit_note', 'negative_invoice' => $this->di['em']->wrapInTransaction(function () use ($invoice, $items, $customLine, $documentLogic, $note, $systemService, $offline, $gatewayPlan, $reverseDeposit, $toCredit, $attemptId, $refundId, $expectedAmount, $external): Invoice {
+                // Reserve the number before any invoice reads. SQLite must acquire its write
+                // lock before the locking read; the outer transaction rolls this back on failure.
+                $nextNumber = $documentLogic === 'negative_invoice'
+                    ? $this->getNextInvoiceNumber()
+                    : $systemService->reserveNextNumericParamValue('invoice_cn_starting_number', 1);
+                if ($nextNumber === null) {
+                    throw new InformationException('Unable to determine the next invoice number');
+                }
+
+                // Use the current locked status rather than the possibly stale entity state.
+                if ($this->getInvoiceRepository()->lockAndGetStatus((int) $invoice->getId()) !== Invoice::STATUS_PAID) {
+                    throw new InformationException('Only paid invoices can be refunded');
+                }
+                $this->di['em']->refresh($invoice);
+
                 $total = $this->getTotalWithTax($invoice);
                 if ($total <= 0) {
                     throw new InformationException('Cannot refund invoice with negative amount');
                 }
 
-                $new = $this->di['db']->dispense('Invoice');
-                $new->client_id = $invoice->client_id;
-                $new->hash = bin2hex(random_bytes(random_int(15, 30)));
-                $new->hash_expires_at = $this->computeHashExpiration();
-                $new->status = \Model_Invoice::STATUS_REFUNDED;
-                $new->currency = $invoice->currency;
-                $new->approved = true;
-                $new->taxname = $invoice->taxname;
-                $new->taxrate = $invoice->taxrate;
+                $creditLines = $this->resolveRefundLines($invoice, $items, $customLine);
 
-                $new->seller_company = $invoice->seller_company;
-                $new->seller_address = $invoice->seller_address;
-                $new->seller_phone = $invoice->seller_phone;
-                $new->seller_email = $invoice->seller_email;
+                $new = new Invoice();
+                $new->setClientId($invoice->getClientId());
+                $new->setCreditNoteForInvoiceId($invoice->getId());
+                $new->setHash(bin2hex(random_bytes(random_int(15, 30))));
+                $new->setHashExpiresAt($this->computeHashExpiration());
+                $new->setStatus(Invoice::STATUS_REFUNDED);
+                $new->setCurrency($invoice->getCurrency());
+                $new->setIssued(true);
+                $new->setTaxname($invoice->getTaxname());
+                $new->setTaxrate($invoice->getTaxrate());
 
-                $new->buyer_first_name = $invoice->buyer_first_name;
-                $new->buyer_last_name = $invoice->buyer_last_name;
-                $new->buyer_company = $invoice->buyer_company;
-                $new->buyer_address = $invoice->buyer_address;
-                $new->buyer_city = $invoice->buyer_city;
-                $new->buyer_state = $invoice->buyer_state;
-                $new->buyer_country = $invoice->buyer_country;
-                $new->buyer_phone = $invoice->buyer_phone;
-                $new->buyer_email = $invoice->buyer_email;
-                $new->buyer_zip = $invoice->buyer_zip;
+                $new->setSellerCompany($invoice->getSellerCompany());
+                $new->setSellerCompanyVat($invoice->getSellerCompanyVat());
+                $new->setSellerCompanyNumber($invoice->getSellerCompanyNumber());
+                $new->setSellerAddress($invoice->getSellerAddress());
+                $new->setSellerPhone($invoice->getSellerPhone());
+                $new->setSellerEmail($invoice->getSellerEmail());
 
-                $new->paid_at = date('Y-m-d H:i:s');
-                $new->created_at = date('Y-m-d H:i:s');
-                $new->updated_at = date('Y-m-d H:i:s');
-                $this->di['db']->store($new);
+                $new->setBuyerFirstName($invoice->getBuyerFirstName());
+                $new->setBuyerLastName($invoice->getBuyerLastName());
+                $new->setBuyerCompany($invoice->getBuyerCompany());
+                $new->setBuyerCompanyVat($invoice->getBuyerCompanyVat());
+                $new->setBuyerCompanyNumber($invoice->getBuyerCompanyNumber());
+                $new->setBuyerAddress($invoice->getBuyerAddress());
+                $new->setBuyerCity($invoice->getBuyerCity());
+                $new->setBuyerState($invoice->getBuyerState());
+                $new->setBuyerCountry($invoice->getBuyerCountry());
+                $new->setBuyerPhone($invoice->getBuyerPhone());
+                $new->setBuyerEmail($invoice->getBuyerEmail());
+                $new->setBuyerZip($invoice->getBuyerZip());
+                $new->setText1($invoice->getText1());
+                $new->setText2($invoice->getText2());
+                // Each serie draws from exactly one counter: negative invoices continue
+                // the invoice numbering, credit notes (and offline refunds) use the
+                // credit-note counter. Sharing a prefix across counters would mint
+                // duplicate numbers within one serie.
+                $new->setSerie($documentLogic === 'negative_invoice'
+                    ? $systemService->getParamValue('invoice_series')
+                    : $systemService->getParamValue('invoice_cn_series', 'CN-'));
+                $new->setNr($nextNumber);
 
-                $invoiceItems = $this->getInvoiceItemRepository()->findByInvoiceId((int) $invoice->id);
+                $new->setPaidAt(new \DateTimeImmutable());
+                $this->di['em']->persist($new);
+                $this->di['em']->flush();
+
                 $entityManager = $this->di['em'];
-                foreach ($invoiceItems as $item) {
+                foreach ($creditLines as [$item, $qty]) {
                     $pi = new InvoiceItem();
-                    $pi->setInvoiceId($new->id);
+                    $pi->setInvoice($new);
                     $pi->setType($item->getType());
                     $pi->setRelId($item->getRelId());
+                    // Preserve the typed linkage, deriving it when the source predates
+                    // the order_id backfill (a copy flushed before the backfill scans
+                    // past the source would otherwise keep a NULL linkage for good).
+                    $pi->setOrderId($item->getOrderId() ?? ServiceInvoiceItem::resolveOrderReference($item->getType(), $item->getUnit(), $item->getRelId()));
+                    $pi->setRefundedItemId($item->getId());
                     $pi->setTask($item->getTask());
                     $pi->setStatus(InvoiceItem::STATUS_EXECUTED); // Mark refund invoice as executed
                     $pi->setTitle($item->getTitle());
                     $pi->setPeriod($item->getPeriod());
-                    $pi->setQuantity($item->getQuantity());
+                    $pi->setQuantity($qty);
                     $pi->setUnit($item->getUnit());
                     $pi->setCharged(1);
                     $pi->setPrice(-($item->getPrice() ?? 0));
@@ -1219,275 +3381,2235 @@ class Service implements InjectionAwareInterface
                 }
                 $entityManager->flush();
 
-                $this->countIncome($new);
+                // Credit notes carry no income themselves; the offset is
+                // tracked on the original below so reporting nets out.
+                $creditAmount = round(abs($this->getTotalWithTax($new)), 2);
+                if ($expectedAmount !== null && abs($creditAmount - $expectedAmount) > 0.005) {
+                    throw new InformationException('Refund amount changed during reconciliation. Review the invoice before retrying.');
+                }
+                $remaining = round($total - (float) ($invoice->getRefund() ?? 0), 2);
+                if ($creditAmount - $remaining > 0.005) {
+                    throw new InformationException('Refund amount exceeds the remaining refundable amount of :amount', [':amount' => $remaining]);
+                }
 
-                $this->addNote($invoice, "Refund invoice #{$new->id} generated.");
-                $this->addNote($new, "Refund for #{$invoice->id} invoice.");
+                if ($reverseDeposit) {
+                    $this->reverseDepositCredit($invoice, $creditAmount);
+                }
+
+                if ($toCredit) {
+                    $this->addRefundToCredit($invoice, $new, $creditAmount);
+                }
+
+                // The deposit credit above is locked and debited before the
+                // gateway moves money: a concurrent spend either committed
+                // first (and this locked recheck already threw) or waits on
+                // the balance lock, so a shortfall can never orphan an
+                // already-issued Stripe refund.
+                $gatewayRefundId = $gatewayPlan['refund_id'] ?? $refundId;
+                $gatewayName = $gatewayPlan['gateway'] ?? ($attemptId !== null ? ($invoice->getGateway()?->getName() ?: $invoice->getGateway()?->getGateway()) : null);
+                if (isset($gatewayPlan['pending'])) {
+                    $executed = $this->executeGatewayRefund($gatewayPlan['pending']);
+                    $gatewayRefundId = $executed['refund_id'];
+                    $gatewayName = $executed['gateway'];
+                    if ($gatewayPlan['pending']['attempt_id'] !== null) {
+                        GatewayRefundAttempt::complete($this->di['em']->getConnection(), $gatewayPlan['pending']['attempt_id']);
+                    }
+                    // Stripe replays the cached refund when a request repeats
+                    // an idempotency key. Refusing an already-recorded ID
+                    // keeps one Stripe refund from backing two credit notes.
+                    if (in_array($gatewayRefundId, $gatewayPlan['pending']['recorded'], true)) {
+                        throw new InformationException('Stripe refund :refund is already recorded for this invoice; the duplicate was not recorded again.', [':refund' => $gatewayRefundId]);
+                    }
+                }
+
+                if ($attemptId !== null) {
+                    GatewayRefundAttempt::complete($this->di['em']->getConnection(), $attemptId);
+                }
+
+                $invoice->setRefund(round((float) ($invoice->getRefund() ?? 0) + $creditAmount, 2));
+                if (round($total - (float) $invoice->getRefund(), 2) <= 0.005) {
+                    $invoice->setStatus(Invoice::STATUS_REFUNDED);
+                }
+                $this->countIncome($invoice);
+
+                $this->addNote($invoice, "Refund invoice #{$new->getId()} generated.");
+                $this->addNote($new, "Refund for #{$invoice->getId()} invoice.");
                 if (!empty($note)) {
                     $this->addNote($new, $note);
                 }
-
-                if ($logic == 'negative_invoice') {
-                    $new->serie = $systemService->getParamValue('invoice_series_paid');
-                    $this->di['db']->store($new);
+                if ($gatewayRefundId !== null) {
+                    $gatewayLabel = $gatewayName ?? 'Stripe';
+                    $this->addNote($new, "Gateway refund {$gatewayRefundId} issued via {$gatewayLabel} for {$creditAmount} {$invoice->getCurrency()}.");
+                    $this->addNote($invoice, "Gateway refund {$gatewayRefundId} issued via {$gatewayLabel}.");
+                    $this->recordGatewayRefundTransaction($invoice, $gatewayRefundId, $creditAmount);
+                } elseif ($toCredit) {
+                    $this->addNote($new, "Refund of {$creditAmount} {$invoice->getCurrency()} added to account credit.");
+                    $this->addNote($invoice, "Refund of {$creditAmount} {$invoice->getCurrency()} added to account credit, credit note #{$new->getId()}.");
+                } elseif ($offline) {
+                    $this->addNote($new, 'Offline refund: the amount was returned outside FOSSBilling; this credit note records it.');
                 }
 
-                if ($logic == 'credit_note') {
-                    $next_nr = $systemService->getParamValue('invoice_cn_starting_number', 1);
-                    $new->serie = $systemService->getParamValue('invoice_cn_series', 'CN-');
-                    $new->nr = $next_nr;
-                    $this->di['db']->store($new);
-
-                    // update next credit note starting number
-                    $systemService->setParamValue('invoice_cn_starting_number', ++$next_nr, true);
-                }
-                $result = (int) $new->id;
-
-                break;
-
-            case 'manual':
-                // @phpstan-ignore if.alwaysFalse
-                if (DEBUG) {
-                    $this->di['logger']->warning('Refunds are managed manually. No actions performed.');
+                // Commits atomically with the credit note above.
+                $journal = array_filter([
+                    'offline' => $offline && $gatewayRefundId === null && !$toCredit ? true : null,
+                    'to_credit' => $toCredit ? true : null,
+                    'gateway_refund_id' => $gatewayRefundId,
+                    'credit_note_id' => (int) $new->getId(),
+                    'external_reversal' => $external,
+                ]);
+                if ($external !== null) {
+                    // The receipt is load-bearing: failure must roll back the
+                    // credit note, invoice total and any deposit credit debit.
+                    $this->recordJournalEvent($invoice, InvoiceEvent::TYPE_REFUNDED, $journal, true);
+                } else {
+                    $this->recordJournalEvent($invoice, InvoiceEvent::TYPE_REFUNDED, $journal);
                 }
 
-                break;
-            default:
-                break;
+                return $new;
+            }),
+            default => throw new InformationException('Unknown invoice refund logic: :logic', [':logic' => $logic]),
+        };
+    }
+
+    /**
+     * Read-only gateway refund preparation: finds the adapter, the refundable
+     * transaction and the amount, and reuses an already-issued but unrecorded
+     * Stripe refund when one matches. Moves no money; when a new refund is
+     * needed the returned pending plan is executed inside the credit-note
+     * transaction by executeGatewayRefund, after the deposit credit is
+     * reversed under lock. Throws when a gateway refund was requested but the
+     * gateway adapter cannot be loaded or no refundable payment exists,
+     * instead of silently recording an offline refund the admin did not ask
+     * for.
+     *
+     * @return array{refund_id: string, gateway: string}|array{pending: array{attempt_id: ?string, adapter: object, txn_id: string, amount: float, currency: string, metadata: array<string, string>, gateway: string, recorded: list<string>}}|array{}
+     */
+    private function planGatewayRefund(Invoice $invoice, ?array $items, ?array $customLine = null): array
+    {
+        $gateway = $invoice->getGateway();
+        if (!$gateway instanceof PayGateway) {
+            return [];
         }
 
-        $this->di['events_manager']->fire(['event' => 'onAfterAdminInvoiceRefund', 'params' => ['id' => $invoice->id]]);
+        $payGatewayService = $this->di['mod_service']('Invoice', 'PayGateway');
 
-        $this->di['logger']->info("Refunded invoice #{$invoice->id}.");
+        try {
+            $adapter = $payGatewayService->getPaymentAdapter($gateway);
+        } catch (\Throwable $e) {
+            throw new InformationException('Could not load the payment gateway for invoice #:id: :error. Return the payment in the gateway dashboard, or record an offline-only refund.', [':id' => $invoice->getId(), ':error' => $e->getMessage()]);
+        }
+
+        if (GatewayRefundAttempt::pending($this->di['em']->getConnection(), (int) $invoice->getId()) !== null
+            && !$adapter instanceof \Payment_Adapter_PayPalEmail && !$adapter instanceof \Payment_Adapter_PayPalAutoPay) {
+            throw new InformationException('Reconcile the pending PayPal refund before recording another refund.');
+        }
+
+        if (!method_exists($adapter, 'refundPayment') || (method_exists($adapter, 'supportsRefunds') && !$adapter::supportsRefunds())) {
+            return [];
+        }
+
+        $paymentTx = $this->findRefundablePaymentTransaction($invoice);
+        if (!$paymentTx instanceof Transaction) {
+            throw new InformationException('No refundable gateway payment found for invoice #:id. Return the payment in the gateway dashboard, or record an offline-only refund.', ['id' => $invoice->getId()]);
+        }
+
+        $amount = $this->previewRefundAmount($invoice, $items, $customLine);
+        if ($amount <= 0) {
+            return [];
+        }
+
+        // A deposit's wallet credit is reversed under the credit-note lock
+        // below; confirm it exists before preparing the gateway call.
+        if ($this->isInvoiceTypeDeposit($invoice)) {
+            $this->assertDepositReversalAvailable($invoice, $amount);
+        }
+
+        if (method_exists($adapter, 'listRefundsForTransaction')) {
+            $recordedIds = $this->getRecordedGatewayRefundIds($invoice);
+            $reused = $this->reuseUnrecordedStripeRefund($adapter, $paymentTx, $invoice, $amount, $gateway, $recordedIds, $this->refundItemsFingerprint($items, $customLine));
+            if ($reused !== null) {
+                return $reused;
+            }
+        } else {
+            $recordedIds = [];
+        }
+
+        $paypalAttempt = null;
+        if ($adapter instanceof \Payment_Adapter_PayPalEmail || $adapter instanceof \Payment_Adapter_PayPalAutoPay) {
+            $fingerprint = $this->paypalRefundFingerprint($invoice, $gateway, $paymentTx, $amount, $items, $customLine);
+            $paypalAttempt = GatewayRefundAttempt::prepare(
+                $this->di['em']->getConnection(), (int) $invoice->getId(), $fingerprint,
+                $adapter instanceof \Payment_Adapter_PayPalEmail
+            );
+        }
+
+        return ['pending' => [
+            'attempt_id' => $paypalAttempt,
+            'adapter' => $adapter,
+            'txn_id' => (string) $paymentTx->getTxnId(),
+            'amount' => $amount,
+            'currency' => (string) ($invoice->getCurrency() ?? $paymentTx->getCurrency()),
+            // The attempt nonce makes every refund its own idempotency scope:
+            // repeating the same line selection is a new refund (a new Stripe
+            // ID), while a retry of the same attempt reuses the unrecorded
+            // refund above instead of minting another. The line selection
+            // stays in the key so two distinct same-amount partials never
+            // share one either.
+            'metadata' => [
+                'invoice_id' => (string) $invoice->getId(),
+                'gateway_id' => (string) $gateway->getId(),
+                'lines' => $this->refundItemsFingerprint($items, $customLine),
+                'attempt' => $paypalAttempt ?? bin2hex(random_bytes(16)),
+            ],
+            'gateway' => $gateway->getName() ?: $gateway->getGateway(),
+            // Recorded IDs seen during planning, carried for the duplicate
+            // check after execution: under the per-invoice lock no same-
+            // invoice refund can record between planning and execution.
+            'recorded' => $recordedIds,
+        ]];
+    }
+
+    /**
+     * Issue the prepared gateway refund. Runs inside the credit-note
+     * transaction after the deposit credit is reversed under lock, so a
+     * failure rolls the reversal back with it and no credit note is created
+     * for money that never moved.
+     *
+     * @param array{adapter: object, txn_id: string, amount: float, currency: string, metadata: array<string, string>, gateway: string, recorded: list<string>} $pending
+     *
+     * @return array{refund_id: string, gateway: string}
+     */
+    private function executeGatewayRefund(array $pending): array
+    {
+        $adapter = $pending['adapter'];
+        if (!method_exists($adapter, 'refundPayment')) {
+            throw new InformationException('Gateway refund failed: payment adapter cannot issue refunds');
+        }
+        $invoiceId = $pending['metadata']['invoice_id'] ?? '?';
+
+        try {
+            $refundId = $adapter->refundPayment(
+                $pending['txn_id'],
+                $pending['amount'],
+                $pending['currency'],
+                $pending['metadata']
+            );
+        } catch (\Payment_Exception $e) {
+            throw new InformationException('Gateway refund failed: :error', [':error' => $e->getMessage()]);
+        } catch (\Throwable $e) {
+            $this->di['logger']->error('Gateway refund failed for invoice #{id}: {error}', ['id' => $invoiceId, 'error' => $e->getMessage()]);
+
+            throw new InformationException('Gateway refund failed: :error', [':error' => $e->getMessage()]);
+        }
+
+        $this->di['logger']->info('Issued gateway refund {refund} for invoice #{id}', ['refund' => $refundId, 'id' => $invoiceId]);
+
+        return ['refund_id' => $refundId, 'gateway' => $pending['gateway']];
+    }
+
+    /**
+     * Most recent processed payment transaction that can be refunded remotely.
+     * Skips setup-intent rows (seti_...), which authorize but move no money.
+     */
+    private function findRefundablePaymentTransaction(Invoice $invoice): ?Transaction
+    {
+        $rows = $this->di['em']->getRepository(Transaction::class)->findBy(
+            ['invoice' => $this->di['em']->getReference(Invoice::class, $invoice->getId()), 'status' => Transaction::STATUS_PROCESSED],
+            ['id' => 'DESC']
+        );
+        foreach ($rows as $tx) {
+            if (!$tx instanceof Transaction) {
+                continue;
+            }
+            $txnId = $tx->getTxnId() ?? '';
+            if ($txnId === '' || str_starts_with($txnId, 'seti_')) {
+                continue;
+            }
+            $code = $tx->getGateway()?->getGateway();
+            if ($tx->getGateway()?->getId() !== $invoice->getGateway()?->getId()) {
+                continue;
+            }
+            if (in_array($code, ['PayPalEmail', 'PayPalAutoPay'], true)) {
+                if (!in_array($tx->getType(), ['paypal_rest', 'paypal_nvp', 'web_accept', 'subscr_payment', 'recurring_payment'], true)
+                    || strcasecmp((string) $tx->getTxnStatus(), 'completed') !== 0 || (float) $tx->getAmount() <= 0) {
+                    continue;
+                }
+            } elseif (!str_starts_with($txnId, 'pi_') && !str_starts_with($txnId, 'ch_') && !str_starts_with($txnId, 'in_')) {
+                continue;
+            }
+
+            return $tx;
+        }
+
+        return null;
+    }
+
+    /**
+     * Reuse a Stripe refund a previous attempt already moved but failed to
+     * record, so a retry doesn't move the money twice. Only refunds stamped
+     * with this invoice's ID qualify; anything else is someone else's money.
+     * A same-amount orphan for the same line selection is reused, a divergent
+     * one aborts with its IDs so the admin reconciles deliberately instead of
+     * stacking another refund.
+     *
+     * @param list<string> $recordedIds
+     *
+     * @return ?array{refund_id: string, gateway: string}
+     */
+    private function reuseUnrecordedStripeRefund(object $adapter, Transaction $paymentTx, Invoice $invoice, float $amount, PayGateway $gateway, array $recordedIds, string $lines): ?array
+    {
+        try {
+            $stripeRefunds = $adapter->listRefundsForTransaction(
+                (string) $paymentTx->getTxnId(),
+                (string) ($invoice->getCurrency() ?? $paymentTx->getCurrency())
+            );
+        } catch (\Throwable $e) {
+            $this->di['logger']->error('Could not list previous Stripe refunds for invoice #{id}; aborting instead of risking a duplicate refund: {error}', ['id' => $invoice->getId(), 'error' => $e->getMessage()]);
+
+            throw new InformationException('Could not verify previous gateway refunds: :error. Please retry.', [':error' => $e->getMessage()]);
+        }
+
+        $unrecorded = array_values(array_filter(
+            $stripeRefunds,
+            static fn (array $r): bool => ($r['invoice_id'] ?? null) === (string) $invoice->getId() && !in_array($r['id'], $recordedIds, true)
+        ));
+        foreach ($unrecorded as $candidate) {
+            // The selection must match exactly: a refund stamped without a
+            // line selection cannot be attributed to specific lines, so
+            // unknown selections never reuse and fall through to manual
+            // reconciliation below instead of being misattributed.
+            $linesMatch = ($candidate['lines'] ?? null) === $lines;
+            if ($linesMatch && abs((float) $candidate['amount'] - $amount) <= 0.005) {
+                $this->di['logger']->info('Reusing unrecorded Stripe refund {refund} for invoice #{id}', ['refund' => $candidate['id'], 'id' => $invoice->getId()]);
+
+                return ['refund_id' => $candidate['id'], 'gateway' => $gateway->getName() ?: $gateway->getGateway()];
+            }
+        }
+        if ($unrecorded !== []) {
+            $ids = implode(', ', array_column($unrecorded, 'id'));
+
+            throw new InformationException('Stripe already shows refunds (:ids) for this invoice that FOSSBilling has not recorded. Retry with matching lines to reuse them, or record them manually.', [':ids' => $ids]);
+        }
+
+        return null;
+    }
+
+    /**
+     * Stripe refund IDs already recorded against the invoice.
+     *
+     * @return list<string>
+     */
+    private function getRecordedGatewayRefundIds(Invoice $invoice): array
+    {
+        $rows = $this->di['em']->getRepository(Transaction::class)->findBy([
+            'invoice' => $this->di['em']->getReference(Invoice::class, $invoice->getId()),
+            'type' => \Payment_Transaction::TXTYPE_REFUND,
+        ]);
+        $ids = [];
+        foreach ($rows as $row) {
+            if ($row instanceof Transaction && is_string($row->getTxnId()) && $row->getTxnId() !== '') {
+                $ids[] = $row->getTxnId();
+            }
+        }
+
+        return $ids;
+    }
+
+    /**
+     * Fail fast when the wallet credit a deposit refund must reverse exceeds
+     * the client's balance. The locked re-check inside reverseDepositCredit
+     * stays authoritative; this only avoids pointless gateway preparation.
+     */
+    private function assertDepositReversalAvailable(Invoice $invoice, float $amount): void
+    {
+        $client = $this->di['em']->getRepository(Client::class)->find((int) $invoice->getClientId());
+        if (!$client instanceof Client) {
+            throw new InformationException('Client not found');
+        }
+        $available = $this->di['mod_service']('Client', 'Balance')->getClientBalance($client) - $this->getReservedCredit((int) $client->getId());
+        if (round($available, 2) < round($amount, 2)) {
+            throw new InformationException('Client balance of :balance is insufficient to reverse the deposit credit of :amount for this refund.', [':balance' => $available, ':amount' => $amount]);
+        }
+    }
+
+    /**
+     * Debit the wallet credit a deposit invoice created, so returning the
+     * card payment cannot leave spendable credit behind. Runs inside the
+     * refund's database transaction: the balance row is locked until the
+     * credit note commits, and a shortfall rolls everything back.
+     */
+    private function reverseDepositCredit(Invoice $invoice, float $amount): void
+    {
+        if ($amount <= 0) {
+            return;
+        }
+        $clientId = (int) $invoice->getClientId();
+        $available = $this->di['mod_service']('Client', 'Balance')->getClientBalanceForUpdate($clientId) - $this->getReservedCredit($clientId);
+        if (round($available, 2) < round($amount, 2)) {
+            throw new InformationException('Client balance of :balance is insufficient to reverse the deposit credit of :amount for this refund.', [':balance' => $available, ':amount' => $amount]);
+        }
+
+        $debit = new ClientBalance();
+        $debit->setClient($this->di['em']->getReference(Client::class, $clientId));
+        $debit->setType('invoice');
+        $debit->setRelId((string) $invoice->getId());
+        $debit->setDescription('Reversal of deposit credit for refunded invoice #' . ($invoice->getNr() ?: $invoice->getId()) . '.');
+        $debit->setAmount((string) (-$amount));
+        $this->di['em']->persist($debit);
+        $this->di['em']->flush();
+    }
+
+    /**
+     * Spends applied credit and gateway receipts once an invoice is settled
+     * outside the wallet, so the same funds cannot be spent a second time.
+     * Runs inside the payment transaction.
+     */
+    private function consumeInvoiceWalletFunds(Invoice $invoice): void
+    {
+        $applied = $this->getInvoiceCreditRepository()->getSumByInvoiceId((int) $invoice->getId());
+        $receipts = $this->di['em']->getRepository(ClientBalance::class);
+        $receipts->reconcileHistoricalGatewayReceiptsForInvoice((int) $invoice->getId());
+        $receiptBacked = $receipts->getGatewayReceiptSumForInvoice((int) $invoice->getId());
+        $applied += $receiptBacked;
+        if ($applied <= 0.0) {
+            return;
+        }
+        $processed = $this->getTransactionRepository()->getProcessedSumsByInvoiceIds([(int) $invoice->getId()]);
+        $manualPayment = max(0.0, ($processed[$invoice->getId()] ?? 0.0) - $receiptBacked);
+        $required = max(0.0, round($this->getTotalWithTax($invoice) - $manualPayment, 2));
+        $applied = min($applied, $required);
+        if ($applied <= 0) {
+            return;
+        }
+
+        $balance = new ClientBalance();
+        $balance->setClient($this->di['em']->getReference(Client::class, (int) $invoice->getClientId()));
+        $balance->setType('invoice');
+        $balance->setRelId((string) $invoice->getId());
+
+        $invoice_identifier = $invoice->getNr() ?: $invoice->getId();
+        $balance->setDescription("Payment for invoice #{$invoice_identifier} using account credit.");
+
+        $balance->setAmount((string) (-$applied));
+        $this->di['em']->persist($balance);
+        $this->di['em']->flush();
+    }
+
+    /**
+     * Adds a refund to the client's account credit instead of returning it.
+     * Runs inside the credit-note transaction so the credit never exists
+     * without its paper trail.
+     */
+    private function addRefundToCredit(Invoice $invoice, Invoice $creditNote, float $amount): void
+    {
+        $clientId = (int) $invoice->getClientId();
+        $client = $this->di['em']->find(Client::class, $clientId);
+        if (!$client instanceof Client || strcasecmp((string) $client->getCurrency(), (string) $invoice->getCurrency()) !== 0) {
+            throw new InformationException('The invoice currency must match the client currency to refund to account credit.');
+        }
+
+        $credit = new ClientBalance();
+        $credit->setClient($client);
+        $credit->setType('invoice');
+        $credit->setRelId((string) $creditNote->getId());
+        $credit->setDescription('Refund of invoice ' . $invoice->getSerie() . $invoice->getNr() . ' to account credit');
+        $credit->setAmount((string) $amount);
+        $this->di['em']->persist($credit);
+        $this->di['em']->flush();
+    }
+
+    /**
+     * Preview the credit-note total for the requested lines without persisting
+     * anything, mirroring how refundInvoice prices the note it is about to
+     * create (negative line prices plus tax on taxed lines).
+     */
+    private function previewRefundAmount(Invoice $invoice, ?array $items, ?array $customLine = null): float
+    {
+        $creditLines = $this->resolveRefundLines($invoice, $items, $customLine);
+        $subtotal = 0.0;
+        $taxable = 0.0;
+        foreach ($creditLines as [$item, $qty]) {
+            $line = (float) ($item->getPrice() ?? 0) * $qty;
+            $subtotal += $line;
+            if ($item->getTaxed()) {
+                $taxable += $line;
+            }
+        }
+        $tax = 0.0;
+        if ((float) ($invoice->getTaxrate() ?? 0) > 0 && $taxable != 0.0) {
+            $tax = round($taxable * (float) $invoice->getTaxrate() / 100, 2);
+        }
+
+        return round(abs($subtotal + $tax), 2);
+    }
+
+    /**
+     * Canonical fingerprint of the refunded lines for the gateway refund's
+     * idempotency key. Keys are strings here (form posts decode quantities
+     * as strings) while the API also accepts ints, so both normalize to
+     * the same value. A custom line contributes its amount and title, so a
+     * repeated partial for a different amount never shares a key.
+     */
+    private function refundItemsFingerprint(?array $items, ?array $customLine = null): string
+    {
+        $parts = [];
+        if (!empty($items)) {
+            $pairs = [];
+            foreach ($items as $id => $qty) {
+                $pairs[(int) $id] = (int) $qty;
+            }
+            ksort($pairs);
+            foreach ($pairs as $id => $qty) {
+                $parts[] = $id . ':' . $qty;
+            }
+        }
+        if ($customLine !== null) {
+            $parts[] = 'custom:' . number_format($customLine['amount'], 2, '.', '') . ':' . $customLine['title'];
+        }
+        if ($parts === []) {
+            return 'full';
+        }
+
+        return implode(',', $parts);
+    }
+
+    /**
+     * Persist an audit trail for money returned through the gateway. Runs
+     * inside the same database transaction as the credit note above.
+     */
+    private function recordGatewayRefundTransaction(Invoice $invoice, string $refundId, float $amount): void
+    {
+        $tx = new Transaction();
+        $tx->setInvoice($invoice);
+        $tx->setGateway($invoice->getGateway());
+        $tx->setTxnId($refundId);
+        $tx->setTxnStatus('refunded');
+        $tx->setAmount((string) $amount);
+        $tx->setCurrency($invoice->getCurrency());
+        $tx->setType(\Payment_Transaction::TXTYPE_REFUND);
+        $tx->setStatus(Transaction::STATUS_PROCESSED);
+        $tx->setNote('Gateway refund for invoice #' . $invoice->getId());
+        $tx->setUpdatedAt(new \DateTimeImmutable());
+        $this->di['em']->persist($tx);
+        $this->di['em']->flush();
+    }
+
+    /**
+     * Validate the optional arbitrary-amount custom line for a refund. The
+     * amount is tax-exempt: gross reversal amounts carry no new tax.
+     *
+     * @return ?array{title: string, amount: float}
+     */
+    private function resolveCustomRefundLine(mixed $customLine): ?array
+    {
+        if ($customLine === null) {
+            return null;
+        }
+        if (!is_array($customLine)) {
+            throw new InformationException('Custom refund line is invalid.');
+        }
+        $title = trim((string) ($customLine['title'] ?? ''));
+        if ($title === '') {
+            throw new InformationException('Custom refund line needs a title.');
+        }
+        if (mb_strlen($title) > 255) {
+            throw new InformationException('Custom refund line title is too long.');
+        }
+        $amount = PriceValidator::validateAmount($customLine['amount'] ?? 0, 'Amount');
+        $amount = round($amount, 2);
+        if ($amount <= 0) {
+            throw new InformationException('Custom refund line needs an amount greater than zero.');
+        }
+
+        return ['title' => $title, 'amount' => $amount];
+    }
+
+    /**
+     * Resolve which lines a refund credits: every line at its remaining
+     * quantity when no selection is given, otherwise the selected
+     * line/quantity pairs validated against their remainders. A custom line
+     * stands alone: it references no source line, consumes no line quantity,
+     * and counts toward the remaining refundable amount through the
+     * invoice's refund total below.
+     *
+     * @return list<array{InvoiceItem, int}>
+     */
+    private function resolveRefundLines(Invoice $invoice, ?array $items, ?array $customLine = null): array
+    {
+        if ($customLine !== null) {
+            if (!empty($items)) {
+                throw new InformationException('Custom refund line cannot be combined with line selection.');
+            }
+            $remaining = round($this->getTotalWithTax($invoice) - (float) ($invoice->getRefund() ?? 0), 2);
+            if ($remaining <= 0.005) {
+                throw new InformationException('No remaining refundable amount on this invoice');
+            }
+            if ($customLine['amount'] - $remaining > 0.005) {
+                throw new InformationException('Refund amount exceeds the remaining refundable amount of :amount', [':amount' => $remaining]);
+            }
+            $synthetic = (new InvoiceItem())
+                ->setType(InvoiceItem::TYPE_CUSTOM)
+                ->setTask(InvoiceItem::TASK_VOID)
+                ->setStatus(InvoiceItem::STATUS_EXECUTED)
+                ->setTitle($customLine['title'])
+                ->setQuantity(1)
+                ->setPrice($customLine['amount'])
+                ->setTaxed(false);
+
+            return [[$synthetic, 1]];
+        }
+
+        $invoiceItems = $this->getInvoiceItemRepository()->findByInvoiceId((int) $invoice->getId());
+        $credited = $this->getCreditedQuantities($invoice);
+
+        if (empty($items)) {
+            $lines = [];
+            foreach ($invoiceItems as $item) {
+                $remaining = ($item->getQuantity() ?? 1) - ($credited[(int) $item->getId()] ?? 0);
+                if ($remaining > 0) {
+                    $lines[] = [$item, $remaining];
+                }
+            }
+            if ($lines === [] && $invoiceItems !== []) {
+                throw new InformationException('No remaining refundable amount on this invoice');
+            }
+
+            return $lines;
+        }
+
+        $byId = [];
+        foreach ($invoiceItems as $item) {
+            $byId[(int) $item->getId()] = $item;
+        }
+
+        $lines = [];
+        foreach ($items as $id => $qty) {
+            $id = (int) $id;
+            if (!isset($byId[$id])) {
+                throw new InformationException('Invoice line #:id was not found', [':id' => $id]);
+            }
+            if (!is_numeric($qty)) {
+                throw new InformationException('Refund quantity must be a valid number.');
+            }
+            if ((float) $qty <= 0) {
+                continue;
+            }
+            $item = $byId[$id];
+            if (($item->getPrice() ?? 0) <= 0) {
+                throw new InformationException('Only charge lines can be refunded');
+            }
+            $remaining = ($item->getQuantity() ?? 1) - ($credited[$id] ?? 0);
+            $qty = PriceValidator::validateQuantity($qty);
+            if ($qty > $remaining) {
+                throw new InformationException('Refund quantity exceeds the remaining refundable quantity of :max', [':max' => $remaining]);
+            }
+            $lines[] = [$item, $qty];
+        }
+
+        if ($lines === []) {
+            throw new InformationException('No invoice lines selected for refund');
+        }
+
+        return $lines;
+    }
+
+    /**
+     * Credit notes issued against the given invoice, newest last.
+     *
+     * @return list<Invoice>
+     */
+    private function findRefundingInvoices(Invoice $invoice): array
+    {
+        return $this->di['em']->getRepository(Invoice::class)->findBy(['creditNoteForInvoiceId' => $invoice->getId()]);
+    }
+
+    /**
+     * Display references (id => number) for every invoice related to the
+     * given one, loaded in a single query for detail views.
+     *
+     * @return array<int, string>
+     */
+    public function getRelatedInvoiceReferences(Invoice $invoice): array
+    {
+        $ids = array_filter([
+            $invoice->getCreditNoteForInvoiceId(),
+            $invoice->getDebitNoteForInvoiceId(),
+        ]);
+        foreach ($this->findRefundingInvoices($invoice) as $creditNote) {
+            $ids[] = $creditNote->getId();
+        }
+        foreach ($this->getDebitingInvoiceIds($invoice) as $id) {
+            $ids[] = $id;
+        }
+        $ids = array_values(array_unique(array_filter($ids)));
+        if ($ids === []) {
+            return [];
+        }
+
+        $references = [];
+        $related = $this->di['em']->getRepository(Invoice::class)->findBy(['id' => $ids]);
+        foreach ($related as $item) {
+            $nr = is_numeric($item->getNr()) ? (int) $item->getNr() : (int) $item->getId();
+            $references[(int) $item->getId()] = $this->formatSerieNr($item->getSerie(), $nr);
+        }
+
+        return $references;
+    }
+
+    /**
+     * Remaining refundable quantity per invoice line, after earlier partials.
+     *
+     * @return array<int, int> line id => remaining qty
+     */
+    public function getLineRemainingQuantities(Invoice $invoice): array
+    {
+        $remaining = [];
+        $credited = $this->getCreditedQuantities($invoice);
+        $items = $this->getInvoiceItemRepository()->findByInvoiceId((int) $invoice->getId());
+        foreach ($items as $item) {
+            $remaining[(int) $item->getId()] = max(0, ($item->getQuantity() ?? 1) - ($credited[(int) $item->getId()] ?? 0));
+        }
+
+        return $remaining;
+    }
+
+    /**
+     * Quantities already credited per source line across all credit notes
+     * issued against the given invoice. Custom lines reference no source
+     * line and are skipped here; their amounts count toward the invoice's
+     * refund total instead.
+     *
+     * @return array<int, int> source line id => credited quantity
+     */
+    private function getCreditedQuantities(Invoice $invoice): array
+    {
+        $credited = [];
+        foreach ($this->findRefundingInvoices($invoice) as $creditNote) {
+            $items = $this->getInvoiceItemRepository()->findByInvoiceId((int) $creditNote->getId());
+            foreach ($items as $item) {
+                $sourceId = $item->getRefundedItemId();
+                if ($sourceId !== null) {
+                    $credited[$sourceId] = ($credited[$sourceId] ?? 0) + ($item->getQuantity() ?? 0);
+                }
+            }
+        }
+
+        return $credited;
+    }
+
+    /**
+     * Issue a debit note against an issued invoice: a separate payable
+     * document for charges the original missed. The original keeps its status;
+     * only the link and notes tie the two together. Debit lines are inert
+     * custom lines so paying the note never provisions anything.
+     *
+     * @param list<array{title?: string, price?: mixed, quantity?: mixed, taxed?: mixed, unit?: string}> $items
+     */
+    public function debitInvoice(Invoice $invoice, array $items, $note = null): int
+    {
+        $this->di['event_dispatcher']->dispatch(new BeforeAdminInvoiceDebitEvent((int) $invoice->getId()));
+
+        if (!$this->isDebitable($invoice)) {
+            throw new InformationException('Only issued unpaid or paid invoices can be debited');
+        }
+
+        // Validate every line before anything is written.
+        $debitLines = $this->resolveDebitLines($items);
+        $systemService = $this->di['mod_service']('system');
+
+        $new = $this->di['em']->wrapInTransaction(function () use ($invoice, $note, $debitLines, $systemService): Invoice {
+            // Reserve the number before any invoice reads. SQLite must acquire its write
+            // lock before the locking read; the outer transaction rolls this back on failure.
+            $next_nr = $systemService->reserveNextNumericParamValue('invoice_dn_starting_number', 1);
+            if ($next_nr === null) {
+                throw new \FOSSBilling\Core\Exception\BaseException('Unable to determine the next debit note number');
+            }
+
+            // Recheck eligibility against the locked state; the invoice may
+            // have been paid, canceled, or refunded while waiting on the lock.
+            $state = $this->lockAndRefreshInvoice($invoice);
+            if (!$state['issued']
+                || !in_array($state['status'], [Invoice::STATUS_UNPAID, Invoice::STATUS_PAID], true)
+                || $invoice->getCreditNoteForInvoiceId() !== null
+            ) {
+                throw new InformationException('Only issued unpaid or paid invoices can be debited');
+            }
+
+            $new = new Invoice();
+            $new->setClientId($invoice->getClientId());
+            $new->setDebitNoteForInvoiceId($invoice->getId());
+            $new->setHash(bin2hex(random_bytes(random_int(15, 30))));
+            $new->setHashExpiresAt($this->computeHashExpiration());
+            $new->setStatus(Invoice::STATUS_UNPAID);
+            $new->setCurrency($invoice->getCurrency());
+            $new->setIssued(true);
+            $new->setTaxname($invoice->getTaxname());
+            $new->setTaxrate($invoice->getTaxrate());
+
+            $new->setSellerCompany($invoice->getSellerCompany());
+            $new->setSellerCompanyVat($invoice->getSellerCompanyVat());
+            $new->setSellerCompanyNumber($invoice->getSellerCompanyNumber());
+            $new->setSellerAddress($invoice->getSellerAddress());
+            $new->setSellerPhone($invoice->getSellerPhone());
+            $new->setSellerEmail($invoice->getSellerEmail());
+
+            $new->setBuyerFirstName($invoice->getBuyerFirstName());
+            $new->setBuyerLastName($invoice->getBuyerLastName());
+            $new->setBuyerCompany($invoice->getBuyerCompany());
+            $new->setBuyerCompanyVat($invoice->getBuyerCompanyVat());
+            $new->setBuyerCompanyNumber($invoice->getBuyerCompanyNumber());
+            $new->setBuyerAddress($invoice->getBuyerAddress());
+            $new->setBuyerCity($invoice->getBuyerCity());
+            $new->setBuyerState($invoice->getBuyerState());
+            $new->setBuyerCountry($invoice->getBuyerCountry());
+            $new->setBuyerPhone($invoice->getBuyerPhone());
+            $new->setBuyerEmail($invoice->getBuyerEmail());
+            $new->setBuyerZip($invoice->getBuyerZip());
+            $new->setText1($invoice->getText1());
+            $new->setText2($invoice->getText2());
+            $new->setSerie($systemService->getParamValue('invoice_dn_series', 'DN-'));
+            $new->setNr($next_nr);
+
+            $invoice_due_days = $systemService->getParamValue('invoice_due_days');
+            if (!is_numeric($invoice_due_days)) {
+                $invoice_due_days = 1;
+            }
+            $new->setDueAt(new \DateTimeImmutable(date('Y-m-d H:i:s', strtotime("+{$invoice_due_days} day"))));
+            $this->di['em']->persist($new);
+            $this->di['em']->flush();
+
+            $entityManager = $this->di['em'];
+            foreach ($debitLines as [$title, $price, $quantity, $unit, $taxed]) {
+                $pi = new InvoiceItem();
+                $pi->setInvoice($new);
+                $pi->setType(InvoiceItem::TYPE_CUSTOM);
+                $pi->setTask(InvoiceItem::TASK_VOID);
+                $pi->setStatus(InvoiceItem::STATUS_PENDING_PAYMENT);
+                $pi->setTitle($title);
+                $pi->setQuantity($quantity);
+                $pi->setUnit($unit);
+                $pi->setCharged(0);
+                $pi->setPrice($price);
+                $pi->setTaxed($taxed);
+                $entityManager->persist($pi);
+            }
+            $entityManager->flush();
+
+            $this->countIncome($new);
+
+            $this->addNote($invoice, "Debit invoice #{$new->getId()} generated.");
+            $this->addNote($new, "Debit for #{$invoice->getId()} invoice.");
+            if (!empty($note)) {
+                $this->addNote($new, $note);
+            }
+
+            // Commits atomically with the debit note above.
+            $this->recordJournalEvent($invoice, InvoiceEvent::TYPE_DEBITED, ['debit_note_id' => (int) $new->getId()]);
+
+            return $new;
+        });
+        $result = (int) $new->getId();
+
+        try {
+            $this->sendDebitEmail($invoice, $new);
+        } catch (\Throwable $exception) {
+            $this->di['logger']->withChannel('email')->error('Failed to send debit email', [
+                'invoice_id' => $invoice->getId(),
+                'debit_note_id' => $new->getId(),
+                'exception' => $exception,
+            ]);
+        }
+
+        $this->di['event_dispatcher']->dispatch(new AfterAdminInvoiceDebitEvent((int) $invoice->getId(), $result));
+
+        $this->di['logger']->info('Debited invoice #{invoice_id}', ['invoice_id' => $invoice->getId()]);
 
         return $result;
     }
 
-    public function updateInvoice(\Model_Invoice $model, array $data): bool
+    private function isDebitable(Invoice $invoice): bool
     {
-        $invoiceItemService = $this->di['mod_service']('Invoice', 'InvoiceItem');
-        $previousStatus = $model->status;
+        return $invoice->isIssued()
+            && in_array($invoice->getStatus(), [Invoice::STATUS_UNPAID, Invoice::STATUS_PAID], true)
+            && $invoice->getCreditNoteForInvoiceId() === null;
+    }
 
-        $this->di['events_manager']->fire(['event' => 'onBeforeAdminInvoiceUpdate', 'params' => $data]);
-
-        if (!empty($data['gateway_id'])) {
-            $gateway = $this->di['em']->getRepository(PayGateway::class)->find((int) $data['gateway_id']);
-            if (!$gateway instanceof PayGateway) {
-                throw new InformationException('Payment gateway not found');
+    /**
+     * Validate and normalize debit lines before anything is written, so a bad
+     * line can never leave a half-created debit note behind.
+     *
+     * @return list<array{string, float, int, ?string, bool}>
+     */
+    private function resolveDebitLines(array $items): array
+    {
+        $lines = [];
+        foreach ($items as $entry) {
+            if (!is_array($entry)) {
+                throw new InformationException('Debit lines are invalid');
             }
-            if (!$gateway->isEnabled()) {
-                throw new InformationException('Payment gateway is not enabled');
+            $title = trim((string) ($entry['title'] ?? ''));
+            if ($title === '') {
+                continue;
             }
-            $model->gateway_id = intval($data['gateway_id']);
-        } elseif (array_key_exists('gateway_id', $data) && $data['gateway_id'] === null) {
-            $model->gateway_id = null;
-        }
-        $model->text_1 = $data['text_1'] ?? (empty($model->text_1) ? null : $model->text_1);
-        $model->text_2 = $data['text_2'] ?? (empty($model->text_2) ? null : $model->text_2);
-        $model->seller_company = $data['seller_company'] ?? (empty($model->seller_company) ? null : $model->seller_company);
-        $model->seller_company_vat = $data['seller_company_vat'] ?? (empty($model->seller_company_vat) ? null : $model->seller_company_vat);
-        $model->seller_company_number = $data['seller_company_number'] ?? (empty($model->seller_company_number) ? null : $model->seller_company_number);
-        $model->seller_address = $data['seller_address'] ?? (empty($model->seller_address) ? null : $model->seller_address);
-        $model->seller_phone = $data['seller_phone'] ?? (empty($model->seller_phone) ? null : $model->seller_phone);
-        $model->seller_email = $data['seller_email'] ?? (empty($model->seller_email) ? null : $model->seller_email);
-        $model->buyer_first_name = $data['buyer_first_name'] ?? (empty($model->buyer_first_name) ? null : $model->buyer_first_name);
-        $model->buyer_last_name = $data['buyer_last_name'] ?? (empty($model->buyer_last_name) ? null : $model->buyer_last_name);
-        $model->buyer_company = $data['buyer_company'] ?? (empty($model->buyer_company) ? null : $model->buyer_company);
-        $model->buyer_company_vat = $data['buyer_company_vat'] ?? (empty($model->buyer_company_vat) ? null : $model->buyer_company_vat);
-        $model->buyer_company_number = $data['buyer_company_number'] ?? (empty($model->buyer_company_number) ? null : $model->buyer_company_number);
-        $model->buyer_address = $data['buyer_address'] ?? (empty($model->buyer_address) ? null : $model->buyer_address);
-        $model->buyer_city = $data['buyer_city'] ?? (empty($model->buyer_city) ? null : $model->buyer_city);
-        $model->buyer_state = $data['buyer_state'] ?? (empty($model->buyer_state) ? null : $model->buyer_state);
-        $model->buyer_country = $data['buyer_country'] ?? (empty($model->buyer_country) ? null : $model->buyer_country);
-        $model->buyer_zip = $data['buyer_zip'] ?? (empty($model->buyer_zip) ? null : $model->buyer_zip);
-        $model->buyer_phone = $data['buyer_phone'] ?? (empty($model->buyer_phone) ? null : $model->buyer_phone);
-        $model->buyer_email = $data['buyer_email'] ?? (empty($model->buyer_email) ? null : $model->buyer_email);
-
-        $paid_at = $data['paid_at'] ?? $model->paid_at;
-        if (empty($paid_at)) {
-            $model->paid_at = null;
-        } else {
-            $model->paid_at = date('Y-m-d H:i:s', strtotime((string) $paid_at));
-        }
-
-        $due_at = $data['due_at'] ?? $model->due_at;
-        if (empty($due_at)) {
-            $model->due_at = null;
-        } else {
-            $model->due_at = date('Y-m-d H:i:s', strtotime((string) $due_at));
-        }
-
-        $model->serie = $data['serie'] ?? (empty($model->serie) ? null : $model->serie);
-        $model->nr = $data['nr'] ?? (empty($model->nr) ? null : $model->nr);
-        $model->status = $data['status'] ?? (empty($model->status) ? null : $model->status);
-        $model->taxrate = $data['taxrate'] ?? (empty($model->taxrate) ? null : $model->taxrate);
-        $model->taxname = $data['taxname'] ?? (empty($model->taxname) ? null : $model->taxname);
-        $model->approved = (int) ($data['approved'] ?? (empty($model->approved) ? null : $model->approved));
-        $model->notes = $data['notes'] ?? (empty($model->notes) ? null : $model->notes);
-
-        $created_at = $data['created_at'] ?? '';
-        if (!empty($created_at)) {
-            $model->created_at = date('Y-m-d H:i:s', strtotime((string) $created_at));
-        }
-
-        $ni = $data['new_item'] ?? [];
-        if (isset($ni['title']) && !empty($ni['title'])) {
-            $invoiceItemService->addNew($model, $ni);
-        }
-
-        $items = $data['items'] ?? [];
-        foreach ($items as $id => $d) {
-            $item = $this->getInvoiceItemRepository()->find((int) $id);
-            if ($item instanceof InvoiceItem) {
-                $invoiceItemService->update($item, $d);
+            $price = PriceValidator::validateAmount($entry['price'] ?? 0, 'Price');
+            if ($price <= 0) {
+                throw new InformationException('Debit lines must charge a positive amount');
             }
+            $lines[] = [
+                $title,
+                $price,
+                PriceValidator::validateQuantity($entry['quantity'] ?? 1),
+                $entry['unit'] ?? null,
+                (bool) ($entry['taxed'] ?? false),
+            ];
         }
 
-        $model->updated_at = date('Y-m-d H:i:s');
-
-        $this->di['db']->store($model);
-
-        if ($previousStatus === \Model_Invoice::STATUS_UNPAID && $model->status === \Model_Invoice::STATUS_CANCELED) {
-            $productService = $this->di['mod_service']('Product');
-            $productService->releaseReservedPromoRedemptionsForInvoice($model, 'invoice_canceled');
+        if ($lines === []) {
+            throw new InformationException('No debit lines given');
         }
 
-        $this->di['events_manager']->fire(['event' => 'onAfterAdminInvoiceUpdate', 'params' => $this->toApiArray($model)]);
-
-        $this->di['logger']->info("Updated invoice {$model->id}.");
-
-        return true;
+        return $lines;
     }
 
-    public function rmInvoice(\Model_Invoice $model): bool
+    /**
+     * Notify the client that a debit note was issued against their invoice.
+     */
+    private function sendDebitEmail(Invoice $original, Invoice $debitNote): void
     {
-        $productService = $this->di['mod_service']('Product');
-        $productService->releaseReservedPromoRedemptionsForInvoice($model, 'invoice_deleted');
-
-        // remove related invoice from orders
-        $sql = '
-            UPDATE client_order
-            SET unpaid_invoice_id = NULL
-            WHERE unpaid_invoice_id = :id';
-        $this->di['db']->exec($sql, ['id' => $model->id]);
-
-        $invoiceItems = $this->getInvoiceItemRepository()->findByInvoiceId((int) $model->id);
-        $entityManager = $this->di['em'];
-        foreach ($invoiceItems as $item) {
-            $entityManager->remove($item);
+        $debitNoteData = $this->toApiArray($debitNote);
+        if (($debitNoteData['total'] ?? 0) <= 0 || $original->getClientId() === null) {
+            return;
         }
-        $entityManager->flush();
-        $this->di['db']->trash($model);
 
-        return true;
+        $this->sendInvoiceEmail(
+            $debitNote,
+            $debitNoteData,
+            'mod_invoice_debited',
+            null,
+            ['original_invoice' => $this->toApiArray($original)]
+        );
+        $this->extendInvoiceHashLifetime($debitNote);
     }
 
-    public function deleteInvoiceByAdmin(\Model_Invoice $model): bool
+    /**
+     * Attach a product to an editable invoice by creating its order and adding
+     * it as an order line, so paying the invoice provisions the service.
+     *
+     * Accepts either `order_id` (attach an existing pending order) or
+     * `product_id` with `quantity`, `price` (optional override, zero allowed),
+     * `period`, `config` (product custom order form values), `group_id`
+     * (attach as an addon of that order group) and `title`.
+     *
+     * @return int the attached order id
+     */
+    public function attachOrderToInvoice(Invoice $invoice, array $data): int
     {
-        $this->di['events_manager']->fire(['event' => 'onBeforeAdminInvoiceDelete', 'params' => ['id' => $model->id]]);
+        $this->di['event_dispatcher']->dispatch(new BeforeAdminInvoiceAttachOrderEvent((int) $invoice->getId()));
 
-        $id = $model->id;
-        $this->rmInvoice($model);
+        if (!$this->isInvoiceEditable($invoice)) {
+            throw new InformationException('This invoice can no longer be edited. Issued invoices are immutable; correct them with a credit note or a replacement invoice.');
+        }
 
-        $this->di['events_manager']->fire(['event' => 'onAfterAdminInvoiceDelete', 'params' => ['id' => $id]]);
+        $payload = $this->resolveAttachOrderPayload($data);
 
-        $this->di['logger']->info('Removed invoice #%s', $id);
+        $order = $this->di['em']->wrapInTransaction(function () use ($invoice, $payload): Order {
+            $this->lockAndRefreshInvoice($invoice);
+            if (!$this->isInvoiceEditable($invoice)) {
+                throw new InformationException('This invoice can no longer be edited. Issued invoices are immutable; correct them with a credit note or a replacement invoice.');
+            }
 
-        return true;
-    }
+            $created = $this->createAndAttachOrder($invoice, $payload);
 
-    public function renewInvoice(\Model_ClientOrder $model, array $data)
-    {
-        $this->di['events_manager']->fire(['event' => 'onBeforeAdminGenerateRenewalInvoice', 'params' => ['order_id' => $model->id]]);
+            // Commits atomically with the order and line above.
+            $this->recordJournalEvent($invoice, InvoiceEvent::TYPE_ORDER_ATTACHED, ['order_id' => (int) $created->getId()]);
 
-        $due_days = isset($data['due_days']) ? (int) $data['due_days'] : null;
-        $invoice = $this->generateForOrder($model, $due_days);
-        $this->approveInvoice($invoice, ['id' => $invoice->id, 'use_credits' => true]);
+            return $created;
+        });
 
-        $this->di['events_manager']->fire(['event' => 'onAfterAdminGenerateRenewalInvoice', 'params' => ['order_id' => $model->id, 'id' => $invoice->id]]);
-
-        $this->di['logger']->info("Generated renewal invoice #{$invoice->id}.");
-
-        return $invoice->id;
-    }
-
-    public function doBatchPayWithCredits(array $data): bool
-    {
-        $unpaid = $this->findAllUnpaid($data);
-        foreach ($unpaid as $proforma) {
+        // Drafts are sent by the issue path; only re-send issued invoices.
+        // The send is failure-tolerant: the order and line are already
+        // committed, and a retry must not create a second order.
+        if ($invoice->isIssued()) {
             try {
-                $model = $this->di['db']->getExistingModelById('Invoice', $proforma['id'] ?? null);
-                $this->tryPayWithCredits($model);
-            } catch (\Exception $e) {
-                // @phpstan-ignore if.alwaysFalse
-                if (DEBUG) {
-                    $this->di['logger']->warning($e->getMessage());
-                }
+                $this->resendUpdatedInvoice($invoice);
+            } catch (\Throwable $exception) {
+                $this->di['logger']->withChannel('email')->error('Failed to send updated invoice email', [
+                    'invoice_id' => $invoice->getId(),
+                    'order_id' => $order->getId(),
+                    'exception' => $exception,
+                ]);
             }
         }
-        $this->di['logger']->info('Executed action to try cover unpaid invoices with client credits.');
 
-        return true;
+        $this->di['event_dispatcher']->dispatch(new AfterAdminInvoiceAttachOrderEvent((int) $invoice->getId(), (int) $order->getId()));
+
+        $this->di['logger']->info('Attached order #{order_id} to invoice #{invoice_id}', ['order_id' => $order->getId(), 'invoice_id' => $invoice->getId()]);
+
+        return (int) $order->getId();
     }
 
-    public function payInvoiceWithCredits(\Model_Invoice $model): bool
+    /**
+     * Cancel (void) an issued unpaid invoice without issuing a replacement.
+     *
+     * Unlike reissueInvoice(), no replacement is created: the invoice keeps
+     * its number with a canceled status so the audit trail survives, while
+     * linked orders keep pointing at it for history (generateForOrder() heals
+     * such links automatically when the next invoice is needed) and
+     * transactions are detached but kept as payment-attempt records.
+     */
+    public function cancelInvoice(Invoice $original, array $data = []): bool
     {
-        $this->tryPayWithCredits($model);
-        $this->di['logger']->info('Cover invoice with client credits.');
+        $this->di['event_dispatcher']->dispatch(new BeforeAdminInvoiceCancelEvent((int) $original->getId()));
+
+        if (!$this->isInvoiceCancellable($original)) {
+            throw new InformationException('Only issued unpaid invoices can be canceled. Delete drafts, or refund paid invoices instead.');
+        }
+
+        $reason = trim((string) ($data['reason'] ?? ''));
+
+        $this->di['em']->wrapInTransaction(function () use ($original, $reason): void {
+            $this->lockAndRefreshInvoice($original);
+            if (!$this->isInvoiceCancellable($original)) {
+                throw new InformationException('Only issued unpaid invoices can be canceled. Delete drafts, or refund paid invoices instead.');
+            }
+            // Re-check against the locked row, which may have changed while
+            // waiting on the lock.
+            $locked = $this->di['em']->getRepository(Invoice::class)->find($original->getId());
+            if ($locked instanceof Invoice && $locked->getReplacedByInvoiceId() !== null) {
+                throw new InformationException('This invoice has already been reissued as invoice #:id', [':id' => $locked->getReplacedByInvoiceId()]);
+            }
+
+            $original->setStatus(Invoice::STATUS_CANCELED);
+            $this->di['em']->persist($original);
+            $this->di['em']->flush();
+
+            $productService = $this->di['mod_service']('Product');
+            $productService->releaseReservedPromoRedemptionsForInvoice($original, 'invoice_canceled');
+            $productService->releaseReservedStockForInvoice($original, 'invoice_canceled');
+
+            // Detach (not delete) transactions: a transaction is a real record
+            // of a payment attempt/event that must survive the void.
+            $this->di['em']->getRepository(Transaction::class)->detachFromInvoice((int) $original->getId());
+
+            $this->addNote($original, 'Invoice canceled (voided) without replacement.');
+            if ($reason !== '') {
+                $this->addNote($original, $reason);
+            }
+
+            // Commits atomically with the void above.
+            $this->recordJournalEvent($original, InvoiceEvent::TYPE_CANCELED, ['reason' => $reason]);
+        });
+
+        $this->di['event_dispatcher']->dispatch(new AfterAdminInvoiceCancelEvent((int) $original->getId()));
+
+        try {
+            $this->sendCancelEmail($original, $reason);
+        } catch (\Throwable $exception) {
+            $this->di['logger']->withChannel('email')->error('Failed to send cancel email', [
+                'invoice_id' => $original->getId(),
+                'exception' => $exception,
+            ]);
+        }
+
+        $this->di['logger']->info('Canceled invoice #{invoice_id} without replacement', ['invoice_id' => $original->getId()]);
 
         return true;
     }
 
     /**
-     * @param int $due_days
+     * Cancel an issued unpaid invoice and issue a replacement carrying its
+     * lines forward, so the correction keeps a clean audit trail while the
+     * client pays a single invoice. The replacement takes the next invoice
+     * number; the original number stays with the canceled record.
      *
-     * @return \Model_Invoice
+     * Accepts an optional `reason` note plus the same product payload as
+     * attachOrderToInvoice to add one order to the replacement in the same step.
+     *
+     * @return int the replacement invoice id
      */
-    public function generateForOrder(\Model_ClientOrder $order, $due_days = null)
+    public function reissueInvoice(Invoice $original, array $data = []): int
     {
-        // check if we do have invoice prepared already
-        if ($order->unpaid_invoice_id !== null) {
-            $p = $this->di['db']->load('Invoice', $order->unpaid_invoice_id);
-            if ($p instanceof \Model_Invoice && $p->status === \Model_Invoice::STATUS_UNPAID) {
-                return $p;
-            }
+        $this->di['event_dispatcher']->dispatch(new BeforeAdminInvoiceReissueEvent((int) $original->getId()));
 
-            $orderService = $this->di['mod_service']('Order');
-            $orderService->unsetUnpaidInvoice($order);
+        if (!$original->isIssued() || $original->getStatus() !== Invoice::STATUS_UNPAID) {
+            throw new InformationException('Only issued unpaid invoices can be reissued');
+        }
+        if ($original->getCreditNoteForInvoiceId() !== null || $original->getDebitNoteForInvoiceId() !== null) {
+            throw new InformationException('Credit and debit notes cannot be reissued');
+        }
+        if ($original->getReplacedByInvoiceId() !== null) {
+            throw new InformationException('This invoice has already been reissued as invoice #:id', [':id' => $original->getReplacedByInvoiceId()]);
         }
 
-        $price = $order->price;
+        $orderIds = $this->renewalOrderIds($original);
+
+        return $this->withRenewalQuoteLocks($orderIds, function () use ($original, $data, $orderIds): int {
+            foreach ($orderIds as $orderId) {
+                $this->assertNoRenewalHold($orderId);
+            }
+
+            return $this->reissueInvoiceLocked($original, $data, $orderIds);
+        });
+    }
+
+    private function reissueInvoiceLocked(Invoice $original, array $data, array $orderIds): int
+    {
+        $attachPayload = (!empty($data['order_id']) || !empty($data['product_id']))
+            ? $this->resolveAttachOrderPayload($data)
+            : null;
+        $reason = trim((string) ($data['reason'] ?? ''));
+        $systemService = $this->di['mod_service']('system');
+
+        $new = $this->di['em']->wrapInTransaction(function () use ($original, $attachPayload, $reason, $systemService, $orderIds): Invoice {
+            // Reserve the number before any invoice reads. SQLite must acquire its write
+            // lock before the locking read; the outer transaction rolls this back on failure.
+            $next_nr = $this->getNextInvoiceNumber();
+            if ($next_nr === null) {
+                throw new \FOSSBilling\Core\Exception\BaseException('Unable to determine the next invoice number');
+            }
+
+            $state = $this->lockAndRefreshInvoice($original);
+            if (!$state['issued'] || $state['status'] !== Invoice::STATUS_UNPAID) {
+                throw new InformationException('Only issued unpaid invoices can be reissued');
+            }
+            if ($this->renewalOrderIds($original) !== $orderIds) {
+                throw new InformationException('The renewal invoice changed. Reload it and retry reissue.');
+            }
+            foreach ($orderIds as $orderId) {
+                $this->assertNoRenewalHold($orderId);
+            }
+            // Re-check against the locked row, which may have changed while
+            // waiting on the lock.
+            $locked = $this->di['em']->getRepository(Invoice::class)->find($original->getId());
+            if ($locked instanceof Invoice && $locked->getReplacedByInvoiceId() !== null) {
+                throw new InformationException('This invoice has already been reissued as invoice #:id', [':id' => $locked->getReplacedByInvoiceId()]);
+            }
+
+            $original->setStatus(Invoice::STATUS_CANCELED);
+            $this->di['em']->persist($original);
+
+            // No reservation release: every line moves to the replacement
+            // below, so reserved stock (order-level meta) stays valid and
+            // promo redemptions are transferred instead of released.
+            $productService = $this->di['mod_service']('Product');
+
+            $new = new Invoice();
+            $new->setClientId($original->getClientId());
+            $new->setReplacesInvoiceId($original->getId());
+            $new->setHash(bin2hex(random_bytes(random_int(15, 30))));
+            $new->setHashExpiresAt($this->computeHashExpiration());
+            $new->setStatus(Invoice::STATUS_UNPAID);
+            $new->setCurrency($original->getCurrency());
+            $new->setIssued(true);
+            if ($original->isSubscriptionPaymentDraft()) {
+                $new->setSubscriptionPaymentDraft();
+            }
+            $new->setTaxname($original->getTaxname());
+            $new->setTaxrate($original->getTaxrate());
+            $new->setGateway($original->getGateway());
+            $new->setDueAt($original->getDueAt());
+
+            $new->setSellerCompany($original->getSellerCompany());
+            $new->setSellerCompanyVat($original->getSellerCompanyVat());
+            $new->setSellerCompanyNumber($original->getSellerCompanyNumber());
+            $new->setSellerAddress($original->getSellerAddress());
+            $new->setSellerPhone($original->getSellerPhone());
+            $new->setSellerEmail($original->getSellerEmail());
+
+            $new->setBuyerFirstName($original->getBuyerFirstName());
+            $new->setBuyerLastName($original->getBuyerLastName());
+            $new->setBuyerCompany($original->getBuyerCompany());
+            $new->setBuyerCompanyVat($original->getBuyerCompanyVat());
+            $new->setBuyerCompanyNumber($original->getBuyerCompanyNumber());
+            $new->setBuyerAddress($original->getBuyerAddress());
+            $new->setBuyerCity($original->getBuyerCity());
+            $new->setBuyerState($original->getBuyerState());
+            $new->setBuyerCountry($original->getBuyerCountry());
+            $new->setBuyerPhone($original->getBuyerPhone());
+            $new->setBuyerEmail($original->getBuyerEmail());
+            $new->setBuyerZip($original->getBuyerZip());
+            $new->setText1($original->getText1());
+            $new->setText2($original->getText2());
+            $new->setSerie($systemService->getParamValue('invoice_series'));
+            $new->setNr($next_nr);
+            $this->di['em']->persist($new);
+            $this->di['em']->flush();
+
+            $orderService = $this->di['mod_service']('Order');
+            $entityManager = $this->di['em'];
+            $movedOrderIds = [];
+            $discountOrderIds = [];
+            foreach ($this->getInvoiceItemRepository()->findByInvoiceId((int) $original->getId()) as $item) {
+                $orderToLink = null;
+                $referencedOrderId = $item->getOrderId() ?? ServiceInvoiceItem::resolveOrderReference($item->getType(), $item->getUnit(), $item->getRelId());
+                if ($item->getType() === InvoiceItem::TYPE_ORDER) {
+                    $orderToLink = $referencedOrderId === null ? null : $entityManager->getRepository(Order::class)->find($referencedOrderId);
+                    if (!$orderToLink instanceof Order) {
+                        throw new InformationException('Order #:id attached to this invoice could not be found', [':id' => $referencedOrderId ?? $item->getRelId()]);
+                    }
+                    if ((int) $orderToLink->getClientId() !== (int) $new->getClientId()) {
+                        throw new InformationException('Order #:id does not belong to this invoice\'s client', [':id' => $orderToLink->getId()]);
+                    }
+                } elseif ($item->getUnit() === 'discount' && $referencedOrderId !== null) {
+                    $discountOrderIds[$referencedOrderId] = true;
+                }
+
+                $copy = new InvoiceItem();
+                $copy->setInvoice($new);
+                $copy->setType($item->getType());
+                $copy->setRelId($item->getRelId());
+                $copy->setOrderId($referencedOrderId);
+                $copy->setTask($item->getTask());
+                $copy->setStatus(InvoiceItem::STATUS_PENDING_PAYMENT);
+                $copy->setTitle($item->getTitle());
+                $copy->setPeriod($item->getPeriod());
+                $copy->setQuantity($item->getQuantity() ?? 1);
+                $copy->setUnit($item->getUnit());
+                $copy->setCharged(0);
+                $copy->setPrice($item->getPrice() ?? 0);
+                $copy->setTaxed($item->getTaxed());
+                $entityManager->persist($copy);
+
+                if ($orderToLink instanceof Order) {
+                    // Keep the replacement's legacy reference aligned with its validated order.
+                    $copy->setRelId((string) $orderToLink->getId());
+                    $copy->setOrderId((int) $orderToLink->getId());
+                    $orderService->setUnpaidInvoice($orderToLink, $new);
+                    if ($item->getTask() === InvoiceItem::TASK_RENEW) {
+                        $meta = $orderService->getOrderMetaRepository()->getPairsForOrder((int) $orderToLink->getId());
+                        foreach (['free_domain_renewal_invoice_', 'domain_renewal_zero_price_invoice_'] as $prefix) {
+                            if (($meta[$prefix . $original->getId()] ?? null) === '1') {
+                                $orderService->updateOrderMeta($orderToLink, [$prefix . $new->getId() => '1']);
+                            }
+                        }
+                    }
+                    $movedOrderIds[] = (int) $orderToLink->getId();
+                }
+            }
+            $entityManager->flush();
+
+            // Orders still pointing at the original have no moved line (e.g.
+            // their line was deleted earlier) and must not keep pointing at a
+            // canceled invoice; unpointed they invoice normally again. When
+            // such an order's discount line was copied above, its backing
+            // redemption moves with the discount so payment still commits it
+            // and renewals keep it; otherwise the hold is freed, since a
+            // stranded RESERVED redemption would block reusing the code.
+            // Reserved stock stays on the still-pending order either way.
+            foreach ($orderService->getOrderRepository()->findByUnpaidInvoiceId((int) $original->getId()) as $straggler) {
+                if (isset($discountOrderIds[(int) $straggler->getId()])) {
+                    $movedOrderIds[] = (int) $straggler->getId();
+                } else {
+                    $productService->releaseReservedPromoRedemptionsForOrder($straggler, 'invoice_reissued');
+                }
+                $orderService->unsetUnpaidInvoice($straggler);
+            }
+
+            $productService->transferReservedPromoRedemptionsForOrders($movedOrderIds, $new);
+
+            $original->setReplacedByInvoiceId($new->getId());
+            $entityManager->persist($original);
+            $entityManager->flush();
+
+            if ($attachPayload !== null) {
+                $this->createAndAttachOrder($new, $attachPayload);
+            }
+
+            $this->addNote($original, "Reissued as invoice #{$new->getId()}.");
+            $this->addNote($new, "Replacement for invoice #{$original->getId()}.");
+            if ($reason !== '') {
+                $this->addNote($new, $reason);
+            }
+
+            // Commits atomically with the cancel-and-replace above.
+            $this->recordJournalEvent($original, InvoiceEvent::TYPE_REISSUED, ['replacement_id' => (int) $new->getId()]);
+
+            return $new;
+        });
+        $result = (int) $new->getId();
+
+        try {
+            $this->resendUpdatedInvoice($new);
+        } catch (\Throwable $exception) {
+            $this->di['logger']->withChannel('email')->error('Failed to send replacement invoice email', [
+                'invoice_id' => $original->getId(),
+                'replacement_id' => $new->getId(),
+                'exception' => $exception,
+            ]);
+        }
+
+        try {
+            $this->sendCancelEmail($original, $reason, $new);
+        } catch (\Throwable $exception) {
+            $this->di['logger']->withChannel('email')->error('Failed to send cancel email', [
+                'invoice_id' => $original->getId(),
+                'exception' => $exception,
+            ]);
+        }
+
+        $this->di['event_dispatcher']->dispatch(new AfterAdminInvoiceReissueEvent((int) $original->getId(), $result));
+
+        $this->di['logger']->info('Reissued invoice #{invoice_id} as #{replacement_id}', ['invoice_id' => $original->getId(), 'replacement_id' => $result]);
+
+        return $result;
+    }
+
+    /**
+     * Validate the attach payload shape before anything is written, so a bad
+     * product reference can never leave a half-created order behind.
+     *
+     * @return array{order_id: int}|array{product_id: int, quantity: int, price: float|null, period: string|null, config: array, group_id: string|null, title: string|null}
+     */
+    private function resolveAttachOrderPayload(array $data): array
+    {
+        if (!empty($data['order_id'])) {
+            if (!empty($data['product_id'])) {
+                throw new InformationException('Provide either an order or product details, not both');
+            }
+
+            return ['order_id' => (int) $data['order_id']];
+        }
+
+        if (empty($data['product_id'])) {
+            throw new InformationException('Product was not passed');
+        }
+
+        $config = $data['config'] ?? [];
+        if (!is_array($config)) {
+            throw new InformationException('Product configuration is invalid');
+        }
+
+        $period = $data['period'] ?? null;
+        if ($period !== null && trim((string) $period) === '') {
+            $period = null;
+        }
+
+        $groupId = $data['group_id'] ?? null;
+        if ($groupId !== null && trim((string) $groupId) === '') {
+            $groupId = null;
+        }
+
+        $title = $data['title'] ?? null;
+        if ($title !== null && trim((string) $title) === '') {
+            $title = null;
+        }
+
+        return [
+            'product_id' => (int) $data['product_id'],
+            'quantity' => PriceValidator::validateQuantity($data['quantity'] ?? 1),
+            'price' => array_key_exists('price', $data) && $data['price'] !== null && (string) $data['price'] !== ''
+                ? PriceValidator::validateAmount($data['price'], 'Price')
+                : null,
+            'period' => $period !== null ? (string) $period : null,
+            'config' => $config,
+            'group_id' => $groupId !== null ? (string) $groupId : null,
+            'title' => $title !== null ? (string) $title : null,
+        ];
+    }
+
+    /**
+     * Create the order (no invoice of its own) and attach it to the invoice as
+     * an order line. The caller must hold the invoice row lock; the order and
+     * the line are created in the caller's transaction.
+     */
+    private function createAndAttachOrder(Invoice $invoice, array $payload): Order
+    {
+        $orderService = $this->di['mod_service']('Order');
+
+        if (isset($payload['order_id'])) {
+            $order = $this->di['em']->getRepository(Order::class)->find($payload['order_id']);
+            if (!$order instanceof Order) {
+                throw new InformationException('Order not found');
+            }
+        } else {
+            $client = $this->di['em']->getRepository(Client::class)->find($invoice->getClientId());
+            if (!$client instanceof Client) {
+                throw new InformationException('Client not found');
+            }
+            $product = $this->di['mod_service']('Product')->findProductById($payload['product_id']);
+
+            $orderData = [
+                'quantity' => $payload['quantity'],
+                'invoice_option' => 'no-invoice',
+                'activate' => false,
+                'config' => $payload['config'],
+            ];
+            if ($payload['price'] !== null) {
+                $orderData['price'] = $payload['price'];
+            }
+            if ($payload['period'] !== null) {
+                $orderData['period'] = $payload['period'];
+            }
+            if ($payload['group_id'] !== null) {
+                $orderData['group_id'] = $payload['group_id'];
+            }
+            if ($payload['title'] !== null) {
+                $orderData['title'] = $payload['title'];
+            }
+
+            $orderId = $orderService->createOrder($client, $product, $orderData);
+            $order = $this->di['em']->getRepository(Order::class)->find($orderId);
+            if (!$order instanceof Order) {
+                throw new \FOSSBilling\Core\Exception\BaseException('Order could not be created');
+            }
+        }
+
+        // Lock the order before reading any of its state: two staff requests
+        // attaching the same pending order hold different invoice locks, so
+        // only the order row itself serializes them. Held through line
+        // creation and linking below.
+        $this->lockAndRefreshOrder($order);
+
+        if ((int) $order->getClientId() !== (int) $invoice->getClientId()) {
+            throw new InformationException('Order does not belong to this invoice\'s client');
+        }
+        if ($order->getUnpaidInvoiceId() !== null) {
+            throw new InformationException('Order is already attached to invoice #:id', [':id' => $order->getUnpaidInvoiceId()]);
+        }
+        if ($order->getStatus() !== Order::STATUS_PENDING_SETUP) {
+            throw new InformationException('Only pending orders can be attached to an invoice');
+        }
+        if ($order->getCurrency() !== $invoice->getCurrency()) {
+            throw new InformationException('Order currency does not match the invoice currency');
+        }
+
+        $this->di['mod_service']('Invoice', 'InvoiceItem')->generateFromOrder(
+            $invoice,
+            $order,
+            InvoiceItem::TASK_ACTIVATE,
+            $order->getPrice(),
+            ['quantity' => $order->getQuantity()],
+            false
+        );
+        $this->addNote($invoice, "Order #{$order->getId()} attached.");
+
+        return $order;
+    }
+
+    /**
+     * Ids of debit notes issued against the given invoice.
+     *
+     * @return list<int|null>
+     */
+    public function getDebitingInvoiceIds(Invoice $invoice): array
+    {
+        $notes = $this->di['em']->getRepository(Invoice::class)->findBy(['debitNoteForInvoiceId' => $invoice->getId()]);
+
+        return array_map(fn (Invoice $debitNote): ?int => $debitNote->getId(), $notes);
+    }
+
+    public function updateInvoice(Invoice $model, array $data): bool
+    {
+        // Fast rejection for the common case; the authoritative check is repeated after the row
+        // lock inside the mutation transaction below.
+        if (!$this->isInvoiceEditable($model)) {
+            throw new InformationException('This invoice can no longer be edited. Issued invoices are immutable; correct them with a credit note or a replacement invoice.');
+        }
+        $this->assertIssuedIdentityUnchanged($model, $data);
+
+        // Drafts have no lifecycle side effects attached to the status
+        // column, so only the states a draft may legally hold are accepted.
+        // Anything else (paid, refunded, or free-form strings) would put the
+        // row in a state the payment, refund, and issuance paths never expect.
+        // Empty values fall through to the legacy write below (blank form
+        // submits); only meaningful values are validated.
+        if (!empty($data['status']) && !$model->isIssued() && !in_array($data['status'], [Invoice::STATUS_UNPAID, Invoice::STATUS_CANCELED], true)) {
+            throw new InformationException('Invalid invoice status: :status. Draft invoices can only be unpaid or canceled.', [':status' => (string) $data['status']]);
+        }
+
+        $invoiceItemService = $this->di['mod_service']('Invoice', 'InvoiceItem');
+        $previousStatus = null;
+        $wasIssued = false;
+
+        $changedFields = array_values(array_intersect(array_filter(array_keys($data), is_string(...)), self::UPDATABLE_FIELDS));
+        sort($changedFields);
+        $this->di['event_dispatcher']->dispatch(new BeforeAdminInvoiceUpdateEvent((int) $model->getId(), $changedFields));
+
+        $this->di['em']->wrapInTransaction(function () use ($model, $data, $invoiceItemService, $changedFields, &$previousStatus, &$wasIssued): void {
+            $this->lockAndRefreshInvoice($model);
+            if (!$this->isInvoiceEditable($model)) {
+                throw new InformationException('This invoice can no longer be edited. Issued invoices are immutable; correct them with a credit note or a replacement invoice.');
+            }
+            $this->assertIssuedIdentityUnchanged($model, $data);
+
+            $previousStatus = $model->getStatus();
+            $wasIssued = $model->isIssued();
+
+            if (!empty($data['gateway_id'])) {
+                $gateway = $this->di['em']->getRepository(PayGateway::class)->find((int) $data['gateway_id']);
+                if (!$gateway instanceof PayGateway) {
+                    throw new InformationException('Payment gateway not found');
+                }
+                if (!$gateway->isEnabled()) {
+                    throw new InformationException('Payment gateway is not enabled');
+                }
+                $model->setGateway($gateway);
+            } elseif (array_key_exists('gateway_id', $data) && $data['gateway_id'] === null) {
+                $model->setGateway(null);
+            }
+            $model->setText1($data['text_1'] ?? $model->getText1());
+            $model->setText2($data['text_2'] ?? $model->getText2());
+            // No buyer/seller writes: drafts carry no snapshot, issued
+            // invoices keep theirs - parties freeze at issuance.
+
+            $paid_at = $data['paid_at'] ?? ($model->getPaidAt() ? $model->getPaidAt()->format('Y-m-d H:i:s') : null);
+            if (empty($paid_at)) {
+                $model->setPaidAt(null);
+            } else {
+                $paidAtTimestamp = strtotime((string) $paid_at);
+                if ($paidAtTimestamp === false) {
+                    throw new InformationException('Invalid date format for paid_at: :value', [':value' => (string) $paid_at]);
+                }
+                $model->setPaidAt(new \DateTimeImmutable(date('Y-m-d H:i:s', $paidAtTimestamp)));
+            }
+
+            $due_at = $data['due_at'] ?? ($model->getDueAt() ? $model->getDueAt()->format('Y-m-d H:i:s') : null);
+            if (empty($due_at)) {
+                $model->setDueAt(null);
+            } else {
+                $dueAtTimestamp = strtotime((string) $due_at);
+                if ($dueAtTimestamp === false) {
+                    throw new InformationException('Invalid date format for due_at: :value', [':value' => (string) $due_at]);
+                }
+                $model->setDueAt(new \DateTimeImmutable(date('Y-m-d H:i:s', $dueAtTimestamp)));
+            }
+
+            $model->setSerie($data['serie'] ?? $model->getSerie());
+            $model->setNr($data['nr'] ?? $model->getNr());
+            $model->setStatus($data['status'] ?? $model->getStatus());
+            $model->setTaxrate($data['taxrate'] ?? $model->getTaxrate());
+            $model->setTaxname($data['taxname'] ?? $model->getTaxname());
+            // Issuance runs only through issueInvoice() (number claim, party snapshot,
+            // journal, events): flipping the flag here would silently mint or un-mint
+            // a legal document, so any change is refused outright.
+            if (array_key_exists('issued', $data) && (bool) $data['issued'] !== $model->isIssued()) {
+                throw new InformationException('The issued flag cannot be changed here. Issue a draft through the issue action.');
+            }
+            $model->setNotes($data['notes'] ?? $model->getNotes());
+
+            $created_at = $data['created_at'] ?? '';
+            if (!empty($created_at)) {
+                $createdAtTimestamp = strtotime((string) $created_at);
+                if ($createdAtTimestamp === false) {
+                    throw new InformationException('Invalid date format for created_at: :value', [':value' => (string) $created_at]);
+                }
+                $model->setCreatedAt(new \DateTimeImmutable(date('Y-m-d H:i:s', $createdAtTimestamp)));
+            }
+
+            $ni = $data['new_item'] ?? [];
+            if (isset($ni['title']) && !empty($ni['title'])) {
+                $invoiceItemService->addNew($model, $ni);
+            }
+
+            $items = $data['items'] ?? [];
+            foreach ($items as $id => $d) {
+                $item = $this->getInvoiceItemRepository()->find((int) $id);
+                if ($item instanceof InvoiceItem) {
+                    $invoiceItemService->update($item, $d);
+                }
+            }
+
+            $this->di['em']->persist($model);
+            $this->di['em']->flush();
+
+            if ($previousStatus === Invoice::STATUS_UNPAID && $model->getStatus() === Invoice::STATUS_CANCELED) {
+                $productService = $this->di['mod_service']('Product');
+                $productService->releaseReservedPromoRedemptionsForInvoice($model, 'invoice_canceled');
+                $productService->releaseReservedStockForInvoice($model, 'invoice_canceled');
+            }
+
+            // Commits atomically with the edits above.
+            $this->recordJournalEvent($model, InvoiceEvent::TYPE_UPDATED, ['changed_fields' => $changedFields]);
+        });
+
+        // The fee follows a new gateway: changing it re-prices the fee line.
+        if ($model->getStatus() === Invoice::STATUS_UNPAID) {
+            $this->di['mod_service']('Invoice', 'GatewayFees')->apply($model, $model->getGateway());
+        }
+
+        $this->di['event_dispatcher']->dispatch(new AfterAdminInvoiceUpdateEvent((int) $model->getId()));
+
+        $this->di['logger']->info('Updated invoice #{invoice_id}', ['invoice_id' => $model->getId()]);
+
+        // An edit to an already-issued invoice changes what the client was
+        // sent, so re-send it (the issue path sends on its own).
+        if ($wasIssued && $model->isIssued() && empty($data['issue'])) {
+            $this->resendUpdatedInvoice($model);
+        }
+
+        return true;
+    }
+
+    /**
+     * Re-send an issued invoice whose content just changed, keeping the
+     * client's copy and payment link in sync with what they will be charged.
+     */
+    protected function resendUpdatedInvoice(Invoice $model): void
+    {
+        $invoiceData = $this->toApiArray($model);
+        if (($invoiceData['total'] ?? 0) > 0
+            && $model->getStatus() !== Invoice::STATUS_PAID
+            && $model->getClientId() !== null
+        ) {
+            $this->sendInvoiceEmail($model, $invoiceData, 'mod_invoice_created');
+        }
+        $this->extendInvoiceHashLifetime($model);
+    }
+
+    /**
+     * Apply an existing promo to one order on an unpaid invoice.
+     *
+     * The discount is recorded as that promo (order discount, discount line,
+     * and checkout redemption) rather than a hand-typed negative line, so it
+     * shows up in promo reporting and carries to renewals when recurring.
+     *
+     * @return float the applied discount amount (invoice currency)
+     */
+    public function promoAddToInvoice(Invoice $invoice, \Box\Mod\Product\Entity\Promo $promo, ?Order $order = null): float
+    {
+        if ($invoice->getStatus() !== Invoice::STATUS_UNPAID) {
+            throw new InformationException('Promotions can only be applied to unpaid invoices');
+        }
+        if (!$this->isInvoiceEditable($invoice)) {
+            throw new InformationException('This invoice can no longer be edited. Issued invoices are immutable; correct them with a credit note or a replacement invoice.');
+        }
+
+        $order = $this->findPromoTargetOrder($invoice, $order);
+        $client = $this->di['em']->getRepository(Client::class)->find($invoice->getClientId())
+            ?? throw new InformationException('Client not found');
+
+        $productService = $this->di['mod_service']('Product');
+        if (!$productService->promoCanBeApplied($promo)) {
+            throw new InformationException('The promo code has expired or does not exist');
+        }
+
+        if (!$productService->isPromoAvailableForClientGroup($promo, $client)) {
+            throw new InformationException('Promo code cannot be applied to this client');
+        }
+
+        if (!$productService->canClientUsePromo($client, $promo)) {
+            throw new InformationException('This client has already used this promo code');
+        }
+
+        $product = $productService->findProductById((int) $order->getProductId());
+        $promoConfig = $order->getConfig() ?? [];
+        if ($product->getType() !== \Box\Mod\Product\Service::DOMAIN && !isset($promoConfig['period']) && $order->getPeriod()) {
+            $promoConfig['period'] = $order->getPeriod();
+        }
+
+        if (!$productService->isPromoApplicableToProduct($promo, $product, $promoConfig)) {
+            throw new InformationException('This promo code does not apply to the selected product or billing period');
+        }
+
+        $currencyService = $this->di['mod_service']('Currency');
+        $currencyRepository = $currencyService->getCurrencyRepository();
+        $rate = $currencyRepository->getRateByCode((string) $order->getCurrency());
+        if ($rate === null) {
+            throw new \FOSSBilling\Core\Exception\BaseException("Currency rate for '{$order->getCurrency()}' is not configured");
+        }
+
+        if ($promo->getType() === \Box\Mod\Product\Entity\Promo::PERCENTAGE) {
+            // Percentage comes off the invoice order line (already in the
+            // invoice currency), which repriced renewals and edited lines
+            // diverge from the order record. Absolute promos stay on the
+            // catalog-based path so their base value keeps the conversion.
+            $discountBase = round($this->getOrderLineTotal($invoice, $order) * (float) $promo->getValue() / 100, 2);
+        } else {
+            $rawDiscount = (float) $productService->getProductDiscount($product, $promo, $promoConfig);
+            $discountBase = $rawDiscount * $rate;
+        }
+        if ($discountBase <= 0) {
+            throw new InformationException('This promo code gives no discount on the selected order');
+        }
+
+        $amount = $this->di['em']->wrapInTransaction(function () use ($invoice, $order, $client, $promo, $productService, $discountBase): float {
+            // The unpaid pre-check above races with payment: re-read the
+            // status under a row lock so a concurrent markAsPaid cannot slip
+            // between the check and these writes. The lock also serializes
+            // concurrent promo edits on this invoice.
+            if ($this->getInvoiceRepository()->lockAndGetStatus((int) $invoice->getId()) !== Invoice::STATUS_UNPAID) {
+                throw new InformationException('Promotions can only be applied to unpaid invoices');
+            }
+
+            // Refresh under the held lock so the check below sees
+            // the current issue state rather than a stale snapshot.
+            $this->di['em']->refresh($invoice);
+            if (!$this->isInvoiceEditable($invoice)) {
+                throw new InformationException('This invoice can no longer be edited. Issued invoices are immutable; correct them with a credit note or a replacement invoice.');
+            }
+
+            // Refresh against changes committed while waiting for the lock,
+            // then value the discount from that state rather than the
+            // pre-transaction snapshot.
+            $this->di['em']->refresh($order);
+
+            // In-transaction re-check so concurrent applications cannot both
+            // consume the last once-per-client use.
+            if ($productService->clientHasActivePromoApplicationForUpdate($client, $promo)) {
+                throw new InformationException('This client has already used this promo code');
+            }
+
+            $productService->usePromo($promo);
+
+            // Cap against the same line total, re-resolved under the lock so
+            // concurrent line edits are honored.
+            $remaining = $this->getOrderLineTotal($invoice, $order) - (float) ($order->getDiscount() ?? 0);
+            $amount = min($discountBase, $remaining);
+            if ($amount <= 0) {
+                throw new InformationException('This promo code gives no discount on the selected order');
+            }
+
+            $order->setDiscount((float) ($order->getDiscount() ?? 0) + $amount);
+            if ($order->getPromoId() === null) {
+                $order->setPromoId((int) $promo->getId());
+                $order->setPromoRecurring($promo->isRecurring());
+            } else {
+                // promo_recurring follows the primary promo only: stacking a
+                // recurring promo beside a one-time primary must not make the
+                // primary renew. The stacked promo carries forward through
+                // its own checkout redemption instead. A deleted primary
+                // keeps its existing flag; renewal skips it either way.
+                try {
+                    $primaryPromo = $productService->findPromoById($order->getPromoId());
+                    $order->setPromoRecurring($primaryPromo->isRecurring());
+                } catch (\FOSSBilling\Core\Exception\BaseException) {
+                    // Leave the existing flag untouched.
+                }
+            }
+            $order->setPromoUsed(1);
+            $this->di['em']->persist($order);
+
+            $discountLine = $this->findOrderDiscountLine($invoice, $order);
+            if ($discountLine instanceof InvoiceItem) {
+                $discountLine->setPrice((float) ($discountLine->getPrice() ?? 0) - $amount);
+                $this->di['em']->persist($discountLine);
+            } else {
+                $clientService = $this->di['mod_service']('client');
+                $invoiceItemService = $this->di['mod_service']('Invoice', 'InvoiceItem');
+                // Promo application holds the invoice lock with its own unpaid
+                // check, so it bypasses the edit lock by design.
+                $invoiceItemService->addNew($invoice, [
+                    'title' => __trans('Discount: :product', [':product' => $order->getTitle()]),
+                    'price' => $amount * -1,
+                    'quantity' => 1,
+                    'unit' => 'discount',
+                    'rel_id' => (string) $order->getId(),
+                    'taxed' => $clientService->isClientTaxable($client),
+                ], true);
+            }
+
+            $productService->createPromoRedemption(
+                $promo,
+                $client,
+                $order,
+                $invoice,
+                \Box\Mod\Product\Entity\PromoRedemption::PHASE_CHECKOUT,
+                $amount,
+                $order->getCurrency(),
+                $order->getCreatedAt()?->format('Y-m-d H:i:s'),
+                \Box\Mod\Product\Entity\PromoRedemption::STATUS_RESERVED,
+            );
+
+            $this->di['em']->flush();
+
+            return $amount;
+        });
+
+        $this->di['logger']->info('Applied promo {promo_code} to invoice #{invoice_id}', ['promo_code' => $promo->getCode(), 'invoice_id' => $invoice->getId()]);
+
+        return $amount;
+    }
+
+    /**
+     * Remove a previously applied promo from one order on an unpaid invoice.
+     *
+     * @return float the removed discount amount (invoice currency)
+     */
+    public function promoRemoveFromInvoice(Invoice $invoice, \Box\Mod\Product\Entity\Promo $promo, ?Order $order = null): float
+    {
+        if ($invoice->getStatus() !== Invoice::STATUS_UNPAID) {
+            throw new InformationException('Promotions can only be removed from unpaid invoices');
+        }
+        if (!$this->isInvoiceEditable($invoice)) {
+            throw new InformationException('This invoice can no longer be edited. Issued invoices are immutable; correct them with a credit note or a replacement invoice.');
+        }
+
+        $order = $this->findPromoTargetOrder($invoice, $order);
+
+        $productService = $this->di['mod_service']('Product');
+
+        // Reserved redemptions are read inside the transaction, after the
+        // lock: a concurrent removal (or cancellation releasing them) must
+        // not make this call subtract a discount twice.
+        $amount = $this->di['em']->wrapInTransaction(function () use ($invoice, $order, $promo, $productService): float {
+            // Same race as applying: a concurrent markAsPaid must not slip
+            // between the pre-check and these writes.
+            if ($this->getInvoiceRepository()->lockAndGetStatus((int) $invoice->getId()) !== Invoice::STATUS_UNPAID) {
+                throw new InformationException('Promotions can only be removed from unpaid invoices');
+            }
+
+            // Refresh under the held lock so the check below sees
+            // the current issue state rather than a stale snapshot.
+            $this->di['em']->refresh($invoice);
+            if (!$this->isInvoiceEditable($invoice)) {
+                throw new InformationException('This invoice can no longer be edited. Issued invoices are immutable; correct them with a credit note or a replacement invoice.');
+            }
+
+            $redemptions = $productService->getPromoRedemptionRepository()->findBy([
+                'clientOrderId' => (int) $order->getId(),
+                'promo' => $promo,
+                'phase' => \Box\Mod\Product\Entity\PromoRedemption::PHASE_CHECKOUT,
+                'status' => \Box\Mod\Product\Entity\PromoRedemption::STATUS_RESERVED,
+            ]);
+
+            if ($redemptions === []) {
+                throw new InformationException('This promotion is not applied to the selected order');
+            }
+
+            $amount = 0.0;
+            foreach ($redemptions as $redemption) {
+                $amount += (float) ($redemption->getDiscountAmount() ?? 0);
+            }
+
+            if ($amount <= 0) {
+                throw new InformationException('This promotion has no discount recorded on the selected order');
+            }
+
+            $released = $productService->releaseCheckoutPromoRedemptions($order, $promo, 'admin_removed', $invoice);
+            if ($released === 0) {
+                throw new InformationException('This promotion is not applied to the selected order');
+            }
+
+            $this->di['em']->refresh($order);
+
+            $order->setDiscount(max(0.0, (float) ($order->getDiscount() ?? 0) - $amount));
+
+            // Recompute the primary promo from the remaining active checkout
+            // applications on this order.
+            $remaining = $productService->getPromoRedemptionRepository()->findBy(
+                [
+                    'clientOrderId' => (int) $order->getId(),
+                    'phase' => \Box\Mod\Product\Entity\PromoRedemption::PHASE_CHECKOUT,
+                    'status' => [
+                        \Box\Mod\Product\Entity\PromoRedemption::STATUS_RESERVED,
+                        \Box\Mod\Product\Entity\PromoRedemption::STATUS_COMMITTED,
+                    ],
+                ],
+                ['id' => 'ASC']
+            );
+
+            $remainingPromos = [];
+            foreach ($remaining as $redemption) {
+                $remainingPromo = $redemption->getPromo();
+                if ($remainingPromo instanceof \Box\Mod\Product\Entity\Promo) {
+                    $remainingPromos[(int) $remainingPromo->getId()] = $remainingPromo;
+                }
+            }
+
+            if ($remainingPromos === []) {
+                $order->setPromoId(null);
+                $order->setPromoRecurring(false);
+                $order->setPromoUsed(0);
+            } else {
+                // Keep the current primary when it remains applied; otherwise
+                // fall back to the earliest remaining application. Either way
+                // promo_recurring follows that primary promo only.
+                $primaryId = (int) $order->getPromoId();
+                if (!isset($remainingPromos[$primaryId])) {
+                    $primaryId = array_key_first($remainingPromos);
+                    $order->setPromoId($primaryId);
+                }
+                $order->setPromoRecurring($remainingPromos[$primaryId]->isRecurring());
+                $order->setPromoUsed(1);
+            }
+            $this->di['em']->persist($order);
+
+            $discountLine = $this->findOrderDiscountLine($invoice, $order);
+            if ($discountLine instanceof InvoiceItem) {
+                $newPrice = (float) ($discountLine->getPrice() ?? 0) + $amount;
+                if ($newPrice >= 0) {
+                    $this->di['em']->remove($discountLine);
+                } else {
+                    $discountLine->setPrice($newPrice);
+                    $this->di['em']->persist($discountLine);
+                }
+            }
+
+            $this->di['em']->flush();
+
+            return $amount;
+        });
+
+        $this->di['logger']->info('Removed promo {promo_code} from invoice #{invoice_id}', ['promo_code' => $promo->getCode(), 'invoice_id' => $invoice->getId()]);
+
+        return $amount;
+    }
+
+    private function findPromoTargetOrder(Invoice $invoice, ?Order $order): Order
+    {
+        if ($order instanceof Order) {
+            if ($this->orderBelongsToInvoice($invoice, $order)) {
+                return $order;
+            }
+
+            throw new InformationException('The selected order is not on this invoice');
+        }
+
+        $orderIds = [];
+        foreach ($this->getInvoiceItemRepository()->findByInvoiceId((int) $invoice->getId()) as $item) {
+            if ($item->getType() === InvoiceItem::TYPE_ORDER && is_numeric((string) $item->getRelId())) {
+                $orderIds[(int) $item->getRelId()] = true;
+            }
+        }
+
+        $orderService = $this->di['mod_service']('Order');
+        foreach ($orderService->getOrderRepository()->findByUnpaidInvoiceId((int) $invoice->getId()) as $linkedOrder) {
+            $orderIds[(int) $linkedOrder->getId()] = true;
+        }
+
+        $orderIds = array_keys($orderIds);
+        if ($orderIds === []) {
+            throw new InformationException('This invoice has no orders to apply the promotion to');
+        }
+
+        if (count($orderIds) > 1) {
+            throw new InformationException('This invoice covers several orders; select which order to apply the promotion to');
+        }
+
+        return $this->di['em']->getRepository(Order::class)->find($orderIds[0])
+            ?? throw new InformationException('Order not found');
+    }
+
+    private function orderBelongsToInvoice(Invoice $invoice, Order $order): bool
+    {
+        if ((int) $order->getUnpaidInvoiceId() === (int) $invoice->getId()) {
+            return true;
+        }
+
+        foreach ($this->getInvoiceItemRepository()->findByInvoiceId((int) $invoice->getId()) as $item) {
+            if (is_numeric((string) $item->getRelId()) && (int) $item->getRelId() === (int) $order->getId()) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function findOrderDiscountLine(Invoice $invoice, Order $order): ?InvoiceItem
+    {
+        foreach ($this->getInvoiceItemRepository()->findByInvoiceId((int) $invoice->getId()) as $item) {
+            if ($item->getUnit() === 'discount' && (string) $item->getRelId() === (string) $order->getId()) {
+                return $item;
+            }
+        }
+
+        return null;
+    }
+
+    private function getOrderLineTotal(Invoice $invoice, Order $order): float
+    {
+        foreach ($this->getInvoiceItemRepository()->findByInvoiceId((int) $invoice->getId()) as $item) {
+            if ($item->getType() === InvoiceItem::TYPE_ORDER && (string) $item->getRelId() === (string) $order->getId()) {
+                return (float) $item->getPrice() * (float) ($item->getQuantity() ?? 1);
+            }
+        }
+
+        return (float) $order->getPrice() * (float) $order->getQuantity();
+    }
+
+    /**
+     * A guarded removal returns null if the selected order is no longer stale.
+     * A false result means the invoice itself must be kept.
+     *
+     * @param array{id: int, cutoff: \DateTimeImmutable}|null $staleOrder the order that qualified the invoice for automatic removal
+     *
+     * @param-out list<int>|null $detachedOrderIds IDs detached by a successful guarded removal
+     *
+     * @return ($staleOrder is null ? bool : bool|null)
+     */
+    public function rmInvoice(Invoice $model, bool $requireUnissuedUnpaid = false, bool $anonymizeTransactions = false, bool $requireNoPaidLinkedOrder = false, ?array &$detachedOrderIds = null, ?array $staleOrder = null): ?bool
+    {
+        /** @var EntityManagerInterface $entityManager */
+        $entityManager = $this->di['em'];
+        $requireNoPaidLinkedOrder = $requireNoPaidLinkedOrder || $staleOrder !== null;
+        $removal = $entityManager->wrapInTransaction(function () use ($model, $entityManager, $requireUnissuedUnpaid, $anonymizeTransactions, $requireNoPaidLinkedOrder, $staleOrder): array|false|null {
+            $this->lockAndRefreshInvoice($model, $requireNoPaidLinkedOrder);
+
+            $connection = $entityManager->getConnection();
+            $linkedOrderIds = [];
+            if ($requireNoPaidLinkedOrder) {
+                // Lock before reading settings or payment state so MySQL's first
+                // snapshot read sees payments that committed while we waited.
+                $linkedOrderIds = array_map(intval(...), $connection->fetchFirstColumn(
+                    'SELECT id FROM client_order WHERE unpaid_invoice_id = :invoice_id ORDER BY id' . RowLock::suffix($connection),
+                    ['invoice_id' => $model->getId()],
+                ));
+            }
+
+            if ($staleOrder !== null && ($model->getStatus() !== Invoice::STATUS_UNPAID
+                || ($model->getDueAt() !== null && $model->getDueAt() >= $staleOrder['cutoff']))) {
+                return false;
+            }
+
+            if ($requireUnissuedUnpaid && !$this->isDeletableByAdmin($model)) {
+                throw new InformationException('Only unissued, unpaid invoices (drafts) can be deleted. Cancel (void) an issued unpaid invoice, or reissue/refund it instead. Relax invoice immutability to delete issued invoices for cleanup.');
+            }
+
+            if ($staleOrder !== null && $connection->fetchOne(
+                'SELECT 1 FROM client_order o INNER JOIN invoice i ON i.id = o.unpaid_invoice_id
+                 WHERE o.id = :order_id AND i.id = :invoice_id AND o.status = :pending_status AND i.status = :unpaid_status
+                 AND COALESCE(i.due_at, o.created_at) < :cutoff',
+                [
+                    'order_id' => $staleOrder['id'],
+                    'invoice_id' => $model->getId(),
+                    'pending_status' => Order::STATUS_PENDING_SETUP,
+                    'unpaid_status' => Invoice::STATUS_UNPAID,
+                    'cutoff' => $staleOrder['cutoff']->format('Y-m-d H:i:s'),
+                ],
+            ) === false) {
+                return null;
+            }
+
+            if ($requireNoPaidLinkedOrder) {
+                // A clearing payment can arrive while cleanup waits for the invoice lock.
+                if (PendingPayments::forInvoice($connection, (int) $model->getId()) !== null) {
+                    return false;
+                }
+                /** @var OrderRepository $orderRepository */
+                $orderRepository = $entityManager->getRepository(Order::class);
+                foreach ($linkedOrderIds as $orderId) {
+                    if ($orderRepository->hasPaidInvoiceItem($orderId)) {
+                        return false;
+                    }
+                }
+            }
+
+            $productService = $this->di['mod_service']('Product');
+            $productService->releaseReservedPromoRedemptionsForInvoice($model, 'invoice_deleted');
+            $productService->releaseReservedStockForInvoice($model, 'invoice_deleted');
+
+            // remove related invoice from orders
+            $sql = '
+                UPDATE client_order
+                SET unpaid_invoice_id = NULL
+                WHERE unpaid_invoice_id = :id';
+            $connection->executeStatement($sql, ['id' => $model->getId()]);
+
+            // Detach (not delete) transactions referencing this invoice - a transaction is a real
+            // record of a payment attempt/event, same reasoning as unpaid_invoice_id above. On the
+            // client-erasure path the surviving rows are additionally anonymized (see
+            // TransactionRepository::detachFromInvoice): ordinary deletion keeps them intact.
+            // Runs inside the same transaction as the flushes below: without that, a later flush
+            // failing (e.g. removing the invoice itself) would leave these transactions
+            // permanently detached from an invoice that was never actually deleted.
+            /** @var TransactionRepository $transactionRepository */
+            $transactionRepository = $entityManager->getRepository(Transaction::class);
+            $transactionRepository->detachFromInvoice((int) $model->getId(), $anonymizeTransactions);
+
+            // Applied credit is an internal earmark, not a payment record: it dies with the invoice.
+            $this->getInvoiceCreditRepository()->deleteByInvoiceId((int) $model->getId());
+
+            $invoiceItems = $this->getInvoiceItemRepository()->findByInvoiceId((int) $model->getId());
+            foreach ($invoiceItems as $item) {
+                $entityManager->remove($item);
+            }
+            $entityManager->flush();
+            // Drafts and GDPR erasure take the journal with them; relaxed-mode
+            // deletions of issued invoices keep it as the audit trail of a
+            // numbered document.
+            if (!$model->isIssued() || $anonymizeTransactions) {
+                /** @var InvoiceEventRepository $invoiceEventRepository */
+                $invoiceEventRepository = $entityManager->getRepository(InvoiceEvent::class);
+                $invoiceEventRepository->deleteByInvoiceId((int) $model->getId());
+            }
+            $entityManager->remove($model);
+            $entityManager->flush();
+
+            return $linkedOrderIds;
+        });
+        if (is_array($removal)) {
+            $detachedOrderIds = $removal;
+
+            return true;
+        }
+        $detachedOrderIds = null;
+
+        return $removal;
+    }
+
+    /**
+     * Returns false for an invoice-wide cleanup refusal, or null if only the
+     * selected order failed the stale-order guard.
+     *
+     * @param array{id: int, cutoff: \DateTimeImmutable}|null $staleOrder the order that qualified the invoice for automatic removal
+     *
+     * @param-out list<int>|null $detachedOrderIds IDs detached by a successful guarded removal
+     *
+     * @return ($staleOrder is null ? bool : bool|null)
+     */
+    public function deleteInvoiceByAdmin(Invoice $model, bool $requireNoPaidLinkedOrder = false, ?array &$detachedOrderIds = null, ?array $staleOrder = null): ?bool
+    {
+        // Fast rejection for the common case; rmInvoice rechecks the fresh state under its row
+        // lock before detaching or deleting anything.
+        if (!$this->isDeletableByAdmin($model)) {
+            throw new InformationException('Only unissued, unpaid invoices (drafts) can be deleted. Cancel (void) an issued unpaid invoice, or reissue/refund it instead. Relax invoice immutability to delete issued invoices for cleanup.');
+        }
+
+        $this->di['event_dispatcher']->dispatch(new BeforeAdminInvoiceDeleteEvent((int) $model->getId()));
+
+        $id = $model->getId();
+        $removed = $this->rmInvoice($model, true, false, $requireNoPaidLinkedOrder, $detachedOrderIds, $staleOrder);
+        if ($removed !== true) {
+            return $removed;
+        }
+
+        $this->di['event_dispatcher']->dispatch(new AfterAdminInvoiceDeleteEvent((int) $id));
+
+        $this->di['logger']->info('Removed invoice #{id}', ['id' => $id]);
+
+        return true;
+    }
+
+    public function renewInvoice(Order $model, array $data): ?int
+    {
+        $this->di['event_dispatcher']->dispatch(new BeforeAdminGenerateRenewalInvoiceEvent((int) $model->getId()));
+
+        $due_days = isset($data['due_days']) ? (int) $data['due_days'] : null;
+        $invoice = $this->generateForOrder($model, $due_days);
+        $this->issueInvoice($invoice, ['id' => $invoice->getId(), 'use_credits' => true]);
+
+        $this->di['event_dispatcher']->dispatch(new AfterAdminGenerateRenewalInvoiceEvent((int) $model->getId(), (int) $invoice->getId()));
+
+        $this->di['logger']->info('Generated renewal invoice #{invoice_id}', ['invoice_id' => $invoice->getId()]);
+
+        return $invoice->getId();
+    }
+
+    public function doBatchPayWithCredits(array $data): bool
+    {
+        $unpaid = $this->findAllUnpaid($data);
+        $invoiceIds = array_map(static fn (array $proforma): int => (int) ($proforma['id'] ?? 0), $unpaid);
+        $models = $this->getInvoiceRepository()->findBy(['id' => $invoiceIds]);
+        $covered = 0;
+        $skipped = 0;
+        $failed = 0;
+        foreach ($models as $selected) {
+            $invoiceId = (int) $selected->getId();
+
+            try {
+                // A previous failure can replace the manager and detach every
+                // selected entity. Resolve each invoice through the current one.
+                $model = $this->getInvoiceRepository()->find($invoiceId);
+                if (!$model instanceof Invoice) {
+                    ++$skipped;
+
+                    continue;
+                }
+                if ($this->tryPayWithCredits($model)) {
+                    ++$covered;
+                } else {
+                    ++$skipped;
+                }
+            } catch (\Exception $e) {
+                ++$failed;
+                $this->di['logger']->warning('Failed to cover invoice #{id} with client credits: {message}', [
+                    'id' => $invoiceId,
+                    'message' => $e->getMessage(),
+                ]);
+                if (!$this->di['em']->isOpen()) {
+                    $this->resetEntityManager();
+                }
+            }
+        }
+        $this->di['logger']->info('Covered {covered} of {total} unpaid invoices with client credits ({skipped} skipped, {failed} failed).', [
+            'covered' => $covered,
+            'total' => count($models),
+            'skipped' => $skipped,
+            'failed' => $failed,
+        ]);
+
+        return true;
+    }
+
+    public function payInvoiceWithCredits(Invoice $model, bool $gatewayPayment = false): bool
+    {
+        $paid = $gatewayPayment ? $this->tryPayWithCredits($model, true) : $this->tryPayWithCredits($model);
+        if ($paid) {
+            $this->di['logger']->info('Covered invoice #{id} with client credits.', ['id' => $model->getId()]);
+        } else {
+            $this->di['logger']->warning('Could not cover invoice #{id} with client credits: insufficient balance, or the invoice is unissued, already paid, or awaiting order deletion recovery.', ['id' => $model->getId()]);
+        }
+
+        return $paid;
+    }
+
+    /**
+     * Resolves the renewal price and line overrides for a single order.
+     *
+     * Domain renewal pricing comes from the registrar/config rather than the
+     * order, since it legitimately changes between registration and renewal.
+     * Other products keep the order's own price so admin-edited prices are
+     * respected.
+     *
+     * Public so subscription eligibility can compare the gateway's per-cycle
+     * amount against what a renewal invoice will actually bill.
+     *
+     * @return array{price: float|string, line: array<string, mixed>}
+     */
+    public function resolveRenewalLine(Order $order): array
+    {
+        if ($order->getId() !== null) {
+            \Box\Mod\Order\DeletionRecovery::assertNotHeld($this->di['em']->getConnection(), $order->getId());
+        }
+        $price = $order->getPrice();
         $line = [
-            'price' => $order->price,
-            'quantity' => $order->quantity,
+            'price' => $order->getPrice(),
+            'quantity' => $order->getQuantity(),
         ];
 
-        // Domain renewal pricing is resolved from the registrar/config rather than
-        // the order, since it legitimately changes between registration and renewal.
-        // Other products keep the order's own price so admin-edited prices are respected.
-        if (in_array($order->status, [
-            \Model_ClientOrder::STATUS_ACTIVE,
-            \Model_ClientOrder::STATUS_FAILED_RENEW,
-            \Model_ClientOrder::STATUS_SUSPENDED,
+        if (in_array($order->getStatus(), [
+            Order::STATUS_ACTIVE,
+            Order::STATUS_FAILED_RENEW,
+            Order::STATUS_SUSPENDED,
         ], true)) {
             $productService = $this->di['mod_service']('Product');
-            $product = $productService->findProductById((int) $order->product_id);
+            $product = $productService->findProductById((int) $order->getProductId());
 
             if ($productService instanceof \Box\Mod\Product\Service && $product->getType() === \Box\Mod\Product\Service::DOMAIN) {
-                $config = json_decode($order->config ?? '', true) ?? [];
+                $config = $order->getConfig() ?? [];
                 $currencyService = $this->di['mod_service']('Currency');
                 $currencyRepository = $currencyService->getCurrencyRepository();
-                $rate = $currencyRepository->getRateByCode($order->currency);
+                $rate = $currencyRepository->getRateByCode($order->getCurrency());
                 if ($rate === null) {
-                    throw new \FOSSBilling\Exception("Currency rate for '{$order->currency}' is not configured");
+                    throw new \FOSSBilling\Core\Exception\BaseException("Currency rate for '{$order->getCurrency()}' is not configured");
                 }
 
                 $renewalLine = $productService->getProductRenewalLineConfig($product, $config);
                 $price = $renewalLine['price'] * $rate;
+                $paidHosting = $productService->hasFreeDomainRenewal((int) $order->getId());
+                $freeDomainRenewal = $paidHosting || $productService->isFreeDomainRenewalOffered((int) $order->getId());
+                // Existing subscriptions retain their priced renewal until
+                // cancellation at the provider is confirmed locally.
+                if ($freeDomainRenewal && $this->di['mod_service']('Invoice', 'Subscription')->hasUncanceledSubscriptionForOrder($order)) {
+                    $freeDomainRenewal = false;
+                }
+                if ($freeDomainRenewal) {
+                    $price = 0.0;
+                }
                 $line = [
                     'price' => $price,
                     'quantity' => $renewalLine['quantity'],
+                    'free_domain_renewal' => $freeDomainRenewal,
+                    'free_domain_waiting_hosting' => $freeDomainRenewal && !$paidHosting,
                 ];
+
+                $domainService = $productService->getProductModuleService($product);
+                if (method_exists($domainService, 'getRenewalTitle')) {
+                    $renewalTitle = $domainService->getRenewalTitle($config);
+                    if ($renewalTitle !== null) {
+                        $line['title'] = $renewalTitle;
+                    }
+                }
             }
         }
 
@@ -1495,51 +5617,578 @@ class Service implements InjectionAwareInterface
             throw new InformationException('Invoices are not generated for negative amount orders.');
         }
 
-        $client = $this->di['db']->getExistingModelById('Client', $order->client_id, 'Client not found');
+        return ['price' => $price, 'line' => $line];
+    }
+
+    /** Initial activation joins the transaction that creates the new order. */
+    public function generateInitialInvoiceForOrder(Order $order): Invoice
+    {
+        if ($order->getStatus() !== Order::STATUS_PENDING_SETUP || $order->getUnpaidInvoiceId() !== null
+            || !$this->di['em']->getConnection()->isTransactionActive()) {
+            throw new InformationException('Initial invoicing requires a new pending order inside its creation transaction.');
+        }
+
+        return $this->generateForOrderLocked($order, null, false, InvoiceItem::TASK_ACTIVATE);
+    }
+
+    public function generateForOrder(Order $order, $due_days = null, bool $applyPromo = true, bool $subscriptionPayment = false, ?string $expectedMergeKey = null): Invoice
+    {
+        return $this->withRenewalQuoteLocks([$order], fn (): Invoice => $this->generateForOrderWithRenewalLock($order, $due_days, $applyPromo, $subscriptionPayment, $expectedMergeKey));
+    }
+
+    private function generateForOrderWithRenewalLock(Order $order, $due_days, bool $applyPromo, bool $subscriptionPayment, ?string $expectedMergeKey): Invoice
+    {
+        $order = $this->reloadRenewalOrder($order);
+
+        try {
+            $this->assertNoRenewalHold((int) $order->getId());
+        } catch (Exception\RenewalHoldException $e) {
+            if ($subscriptionPayment) {
+                $this->retireSubscriptionDraft($order, requireCancellationHold: true);
+            }
+
+            throw $e;
+        }
+        if ($subscriptionPayment && !$this->isSubscriptionRenewalOrder($order)) {
+            throw new Exception\RenewalHoldException('This order is no longer eligible for a subscription renewal.');
+        }
+
+        try {
+            $invoice = $this->di['em']->getConnection()->transactional(function () use ($order, $due_days, $applyPromo, $subscriptionPayment, $expectedMergeKey): ?Invoice {
+                if ($expectedMergeKey !== null) {
+                    $this->lockAndRefreshOrder($order);
+                    if (!$this->isCronRenewalOrder($order) || $this->renewalMergeKey($order) !== $expectedMergeKey) {
+                        return null;
+                    }
+                }
+
+                return $this->generateForOrderLocked($order, $due_days, $applyPromo, subscriptionPayment: $subscriptionPayment, cronRenewal: $expectedMergeKey !== null);
+            });
+        } catch (\Throwable $e) {
+            // DBAL rollback does not undo ORM identity-map changes from prior flushes.
+            $this->di['em']->close();
+            $this->resetEntityManager();
+
+            throw $e;
+        }
+
+        return $invoice ?? throw new InformationException('The order changed after renewal selection.');
+    }
+
+    private function isSubscriptionRenewalOrder(Order $order): bool
+    {
+        return in_array($order->getStatus(), [Order::STATUS_ACTIVE, Order::STATUS_SUSPENDED, Order::STATUS_FAILED_RENEW], true);
+    }
+
+    private function reloadRenewalOrder(Order $order): Order
+    {
+        $current = $this->di['em']->contains($order) ? $order : $this->di['em']->getRepository(Order::class)->find($order->getId());
+        if (!$current instanceof Order) {
+            throw new InformationException('Order not found');
+        }
+        $this->di['em']->refresh($current);
+
+        return $current;
+    }
+
+    private function findUnpaidInvoiceForOrder(Order $order): ?Invoice
+    {
+        if ($order->getUnpaidInvoiceId() === null) {
+            return null;
+        }
+        $invoice = $this->getInvoiceRepository()->find($order->getUnpaidInvoiceId());
+        if (!$invoice instanceof Invoice) {
+            return null;
+        }
+        $this->di['em']->refresh($invoice);
+
+        return $invoice->getStatus() === Invoice::STATUS_UNPAID ? $invoice : null;
+    }
+
+    private function isSingleOrderRenewal(Invoice $invoice, int $orderId): bool
+    {
+        $links = $this->di['em']->getConnection()->fetchAllAssociative(
+            'SELECT order_id, rel_id, task FROM invoice_item WHERE invoice_id = ? AND type = ?',
+            [$invoice->getId(), InvoiceItem::TYPE_ORDER]
+        );
+        foreach ($links as $link) {
+            $linkedOrder = isset($link['order_id']) ? (int) $link['order_id']
+                : ($invoice->isIssued()
+                    ? ServiceInvoiceItem::resolveLegacyPaidOrderReference($link['rel_id'])
+                    : ServiceInvoiceItem::resolveOrderReference(InvoiceItem::TYPE_ORDER, null, $link['rel_id']));
+            if ($linkedOrder !== $orderId || $link['task'] !== InvoiceItem::TASK_RENEW) {
+                return false;
+            }
+        }
+
+        return $links !== [];
+    }
+
+    private function generateForOrderLocked(Order $order, $due_days, bool $applyPromo, string $task = InvoiceItem::TASK_RENEW, bool $subscriptionPayment = false, bool $cronRenewal = false): Invoice
+    {
+        if ($order->getId() !== null) {
+            \Box\Mod\Order\DeletionRecovery::assertNotHeld($this->di['em']->getConnection(), $order->getId());
+        }
+        // check if we do have invoice prepared already
+        if ($order->getUnpaidInvoiceId() !== null) {
+            $existing = $this->findUnpaidInvoiceForOrder($order);
+            if ($existing !== null) {
+                if ($subscriptionPayment && !$this->isSingleOrderRenewal($existing, (int) $order->getId())) {
+                    throw new Exception\RenewalHoldException('The linked invoice is not a single-order subscription renewal. Review the retained payment before applying it.');
+                }
+
+                return $existing;
+            }
+
+            $orderService = $this->di['mod_service']('Order');
+            $orderService->unsetUnpaidInvoice($order);
+        }
+
+        ['price' => $price, 'line' => $line] = $this->resolveRenewalLine($order);
+
+        if (array_key_exists('free_domain_renewal', $line)) {
+            $pending = $this->getInvoiceItemRepository()->findPaidPendingRenewal((int) $order->getId());
+            if ($pending?->getInvoice() instanceof Invoice) {
+                return $pending->getInvoice();
+            }
+        }
+
+        $client = $this->di['em']->getRepository(Client::class)->find($order->getClientId())
+            ?? throw new InformationException('Client not found');
 
         // generate proforma after validating the resolved renewal amount
-        $proforma = $this->di['db']->dispense('Invoice');
-        $proforma->client_id = $client->id;
-        $proforma->status = \Model_Invoice::STATUS_UNPAID;
-        $proforma->currency = $order->currency;
-        $proforma->approved = false;
-        $proforma->created_at = date('Y-m-d H:i:s');
-        $proforma->updated_at = date('Y-m-d H:i:s');
-        $this->di['db']->store($proforma);
+        $proforma = new Invoice();
+        $proforma->setClientId($client->getId() !== null ? (int) $client->getId() : null);
+        $proforma->setStatus(Invoice::STATUS_UNPAID);
+        $proforma->setCurrency($order->getCurrency());
+        $proforma->setIssued(false);
+        if ($subscriptionPayment) {
+            $proforma->setSubscriptionPaymentDraft();
+        }
+        if ($cronRenewal) {
+            $proforma->setCronRenewalExpiries([(int) $order->getId() => $order->getExpiresAt()?->format('Y-m-d H:i:s')]);
+        }
+        $this->di['em']->persist($proforma);
+        $this->di['em']->flush();
 
         $this->setInvoiceDefaults($proforma);
 
         $invoiceItemService = $this->di['mod_service']('Invoice', 'InvoiceItem');
-        $invoiceItemService->generateFromOrder($proforma, $order, InvoiceItem::TASK_RENEW, $price, $line);
+        $invoiceItemService->generateFromOrder($proforma, $order, $task, $price, $line, $applyPromo);
 
         // invoice due date
         if ($due_days > 0) {
-            $proforma->due_at = date('Y-m-d H:i:s', strtotime('+' . $due_days . ' days'));
-            $this->di['db']->store($proforma);
-        } elseif ($order->expires_at) {
-            $proforma->due_at = $order->expires_at;
-            $this->di['db']->store($proforma);
+            $proforma->setDueAt(new \DateTimeImmutable('+' . $due_days . ' days'));
+            $this->di['em']->persist($proforma);
+            $this->di['em']->flush();
+        } else {
+            $expiresAt = $order->getExpiresAt();
+            if ($expiresAt !== null) {
+                $proforma->setDueAt($expiresAt);
+                $this->di['em']->persist($proforma);
+                $this->di['em']->flush();
+            }
         }
+
+        $this->recordJournalEvent($proforma, InvoiceEvent::TYPE_CREATED);
 
         return $proforma;
     }
 
-    public function generateInvoicesForExpiringOrders(): bool
+    /**
+     * Resolves whether an order's renewals merge with other orders.
+     * Precedence: per-order meta override, then the client's tri-state
+     * preference, then the global `invoice_merge_renewals` setting (off
+     * unless explicitly enabled).
+     */
+    public function shouldMergeRenewalsForOrder(Order $order): bool
     {
         $orderService = $this->di['mod_service']('Order');
-        $orders = $orderService->getSoonExpiringActiveOrders();
+        $meta = $orderService->getOrderMetaRepository()->getPairsForOrder((int) $order->getId());
+        $override = $meta[\Box\Mod\Order\Service::META_MERGE_RENEWALS] ?? null;
+        if ($override === '1') {
+            return true;
+        }
+        if ($override === '0') {
+            return false;
+        }
 
-        if (Tools::safeCount($orders) == 0) {
+        $client = $this->di['em']->getRepository(Client::class)->find($order->getClientId());
+        $preference = $client instanceof Client ? $client->getMergeRenewals() : null;
+        if ($preference !== null) {
+            return $preference;
+        }
+
+        $systemService = $this->di['mod_service']('system');
+
+        return (bool) $systemService->getParamValue('invoice_merge_renewals', false);
+    }
+
+    private function isCronRenewalOrder(Order $order): bool
+    {
+        return $order->getStatus() === Order::STATUS_ACTIVE && $order->getInvoiceOption() === 'issue-invoice';
+    }
+
+    /**
+     * Groups mergeable renewals so one invoice covers the same client,
+     * currency, due date, and billing period. The period is part of the key
+     * because mixing billing cycles on one invoice confuses direct debits
+     * and standing orders.
+     */
+    private function renewalMergeKey(Order $order): string
+    {
+        $expiresAt = $order->getExpiresAt();
+
+        return implode('|', [
+            $order->getClientId(),
+            $order->getCurrency(),
+            $expiresAt instanceof \DateTimeInterface ? $expiresAt->format('Y-m-d') : '',
+            $order->getPeriod() ?? '',
+        ]);
+    }
+
+    /**
+     * Builds one draft renewal invoice covering several orders, then returns
+     * it unissued for the caller to issue. Each order gets its own renewal
+     * line (via generateFromOrder, which also stamps `unpaid_invoice_id` on
+     * every order so none are picked up again on the next run), and the
+     * invoice falls due with the latest expiry in the bucket.
+     *
+     * All renewal lines resolve before anything persists, and creation runs
+     * in a transaction: a failing order rolls back the draft and every order
+     * link instead of stranding a partial invoice that would hide linked
+     * orders from the next batch.
+     *
+     * Like generateForOrder, everything happens while the invoice is a draft,
+     * so invoice immutability is never violated: lines are never appended to
+     * an already-issued invoice.
+     *
+     * @param list<Order> $orders non-empty, same merge bucket
+     */
+    public function generateMergedInvoiceForOrders(array $orders, bool $applyPromo = true, ?string $expectedMergeKey = null): Invoice
+    {
+        $generate = function () use ($orders, $applyPromo, $expectedMergeKey): Invoice {
+            if ($expectedMergeKey !== null) {
+                $orderIds = array_map(static fn (Order $order): int => (int) $order->getId(), $orders);
+                sort($orderIds);
+                $repository = $this->di['em']->getRepository(Order::class);
+                // Take every row lock before an ORM read establishes a snapshot.
+                foreach ($orderIds as $orderId) {
+                    $repository->lockAndGetUnpaidInvoiceId($orderId);
+                }
+            }
+            $orders = array_map($this->reloadRenewalOrder(...), $orders);
+            foreach ($orders as $order) {
+                if ($order->getId() !== null) {
+                    \Box\Mod\Order\DeletionRecovery::assertNotHeld($this->di['em']->getConnection(), $order->getId());
+                }
+            }
+
+            $eligible = array_values(array_filter($orders, function (Order $order) use ($expectedMergeKey): bool {
+                if ($expectedMergeKey !== null && (!$this->isCronRenewalOrder($order)
+                    || $this->renewalMergeKey($order) !== $expectedMergeKey
+                    || $this->di['mod_service']('Invoice', 'Subscription')->hasUncanceledSubscriptionForOrder($order))) {
+                    return false;
+                }
+                if ($this->hasRenewalHold((int) $order->getId())) {
+                    return false;
+                }
+
+                return $this->findUnpaidInvoiceForOrder($order) === null;
+            }));
+
+            return $this->generateMergedInvoiceForOrdersLocked($eligible, $applyPromo, $expectedMergeKey !== null);
+        };
+
+        return $this->withRenewalQuoteLocks($orders, fn (): Invoice => $expectedMergeKey === null
+            ? $generate()
+            : $this->di['em']->getConnection()->transactional($generate));
+    }
+
+    private function generateMergedInvoiceForOrdersLocked(array $orders, bool $applyPromo, bool $cronRenewal): Invoice
+    {
+        $first = reset($orders);
+        if (!$first instanceof Order) {
+            throw new InformationException('No orders were provided for the merged renewal invoice.');
+        }
+
+        $client = $this->di['em']->getRepository(Client::class)->find($first->getClientId())
+            ?? throw new InformationException('Client not found');
+
+        $resolved = [];
+        foreach ($orders as $order) {
+            $line = $this->resolveRenewalLine($order);
+            if (array_key_exists('free_domain_renewal', $line['line'])
+                && $this->getInvoiceItemRepository()->findPaidPendingRenewal((int) $order->getId()) instanceof InvoiceItem) {
+                throw new InformationException('The domain renewal is already waiting for completion.');
+            }
+            $resolved[] = [$order, $line];
+        }
+
+        return $this->di['em']->wrapInTransaction(function () use ($resolved, $client, $first, $applyPromo, $cronRenewal): Invoice {
+            $proforma = new Invoice();
+            $proforma->setClientId($client->getId() !== null ? (int) $client->getId() : null);
+            $proforma->setStatus(Invoice::STATUS_UNPAID);
+            $proforma->setCurrency($first->getCurrency());
+            $proforma->setIssued(false);
+            if ($cronRenewal) {
+                $expiries = [];
+                foreach ($resolved as [$order]) {
+                    $expiries[(int) $order->getId()] = $order->getExpiresAt()?->format('Y-m-d H:i:s');
+                }
+                $proforma->setCronRenewalExpiries($expiries);
+            }
+            $this->di['em']->persist($proforma);
+            $this->di['em']->flush();
+
+            $this->setInvoiceDefaults($proforma);
+
+            $invoiceItemService = $this->di['mod_service']('Invoice', 'InvoiceItem');
+            $dueAt = null;
+            foreach ($resolved as [$order, ['price' => $price, 'line' => $line]]) {
+                $invoiceItemService->generateFromOrder($proforma, $order, InvoiceItem::TASK_RENEW, $price, $line, $applyPromo);
+
+                $expiresAt = $order->getExpiresAt();
+                if ($expiresAt instanceof \DateTimeImmutable && ($dueAt === null || $expiresAt > $dueAt)) {
+                    $dueAt = $expiresAt;
+                }
+            }
+
+            if ($dueAt instanceof \DateTimeImmutable) {
+                $proforma->setDueAt($dueAt);
+                $this->di['em']->persist($proforma);
+                $this->di['em']->flush();
+            }
+
+            $this->recordJournalEvent($proforma, InvoiceEvent::TYPE_CREATED);
+
+            return $proforma;
+        });
+    }
+
+    /** Cancellation request creation takes the same order mutex before persisting. */
+    private function withRenewalQuoteLocks(array $orders, \Closure $operation): mixed
+    {
+        $connection = $this->di['em']->getConnection();
+        $ids = array_unique(array_map(static fn (Order|int $order): int => $order instanceof Order ? (int) $order->getId() : $order, $orders));
+        sort($ids);
+        if ($ids !== [] && $connection->isTransactionActive()) {
+            throw new InformationException('Renewal invoices require a committed transaction before generation or issuance.');
+        }
+        $held = [];
+
+        try {
+            foreach ($ids as $id) {
+                $name = 'fb:cancel-request-order:' . $id;
+                if (!NamedLock::acquire($connection, $name, 0)) {
+                    throw new Exception\RenewalLockException('A cancellation request is being processed. Please retry renewal later.');
+                }
+                $held[] = $name;
+            }
+
+            return $operation();
+        } finally {
+            foreach (array_reverse($held) as $name) {
+                NamedLock::release($connection, $name);
+            }
+        }
+    }
+
+    private function hasRenewalHold(int $orderId): bool
+    {
+        $connection = $this->di['em']->getConnection();
+        $currentRead = $connection->isTransactionActive() ? RowLock::suffix($connection) : '';
+        if ((int) $connection->fetchOne(
+            'SELECT id FROM client_order_cancel_request WHERE client_order_id = ? AND status = ?' . $currentRead,
+            [$orderId, \Box\Mod\Order\Entity\ClientOrderCancelRequest::STATUS_PENDING]
+        ) > 0) {
+            return true;
+        }
+        if ((int) $connection->fetchOne(
+            "SELECT id FROM client_order_meta WHERE client_order_id = ? AND ((name = ? AND value = '1') OR (name = ? AND value IN ('1', '2')))" . $currentRead,
+            [$orderId, \Box\Mod\Order\Service::META_CANCEL_AT_PERIOD_END, \Box\Mod\Order\Service::META_SCHEDULED_CANCEL_CLAIM]
+        ) > 0) {
             return true;
         }
 
-        foreach ($orders as $order) {
+        return $connection->fetchOne('SELECT status FROM client_order WHERE id = ?' . $currentRead, [$orderId]) === Order::STATUS_CANCELED;
+    }
+
+    private function assertNoRenewalHold(int $orderId): void
+    {
+        if (\Box\Mod\Order\DeletionRecovery::isHeld($this->di['em']->getConnection(), $orderId)) {
+            throw new Exception\RenewalHoldException('Order deletion is awaiting recovery. Retry deletion before billing or changing the service.');
+        }
+        if ($this->hasRenewalHold($orderId)) {
+            throw new Exception\RenewalHoldException('Withdraw the cancellation request or have staff resolve the order hold before renewing this service.');
+        }
+    }
+
+    /** Caller holds the renewal order's request mutex. */
+    private function retireSubscriptionDraft(Order $order, bool $requireCancellationHold, ?int $expectedDraftId = null): void
+    {
+        $invoice = $this->findUnpaidInvoiceForOrder($order);
+        if ($invoice === null || ($expectedDraftId !== null && $expectedDraftId !== $invoice->getId())) {
+            return;
+        }
+
+        $em = $this->di['em'];
+        $orderId = (int) $order->getId();
+        $clientId = $order->getClientId();
+        $em->wrapInTransaction(function () use ($em, $invoice, $orderId, $clientId, $requireCancellationHold): void {
+            $state = $this->lockAndRefreshInvoice($invoice);
+            if ($state['issued'] || $state['status'] !== Invoice::STATUS_UNPAID
+                || !$invoice->isSubscriptionPaymentDraft() || $invoice->getClientId() !== $clientId) {
+                return;
+            }
+            $linkedInvoiceId = $em->getRepository(Order::class)->lockAndGetUnpaidInvoiceId($orderId);
+            if ($linkedInvoiceId !== $invoice->getId() || $this->renewalOrderIds($invoice) !== [$orderId]
+                || \Box\Mod\Order\DeletionRecovery::isHeld($em->getConnection(), $orderId, true)
+                || ($requireCancellationHold && !$this->hasRenewalHold($orderId))) {
+                return;
+            }
+
+            // Release only an unfunded draft that is still linked to this order.
+            $reason = $requireCancellationHold ? 'renewal_cancellation_hold' : 'subscription_issuance_failed';
+            $this->removeRenewalsFromDraft($invoice, [$orderId], $reason);
+        });
+    }
+
+    private function retryUnissuedRenewalInvoices(): void
+    {
+        $ids = $this->di['em']->getConnection()->fetchFirstColumn(
+            'SELECT DISTINCT i.id FROM invoice i INNER JOIN invoice_item ii ON ii.invoice_id = i.id WHERE EXISTS (SELECT 1 FROM client_order o WHERE o.unpaid_invoice_id = i.id) AND i.issued = :issued AND i.subscription_payment_draft = :issued AND i.status = :status AND ii.type = :type AND ii.task = :task ORDER BY i.id',
+            ['issued' => false, 'status' => Invoice::STATUS_UNPAID, 'type' => InvoiceItem::TYPE_ORDER, 'task' => InvoiceItem::TASK_RENEW],
+            ['issued' => \Doctrine\DBAL\ParameterType::BOOLEAN]
+        );
+        foreach ($ids as $id) {
             try {
-                $model = $this->di['db']->getExistingModelById('ClientOrder', $order['id'] ?? null);
-                $invoice = $this->generateForOrder($model);
-                $this->approveInvoice($invoice, ['id' => $invoice->id, 'use_credits' => true]);
+                $invoice = $this->getInvoiceRepository()->find((int) $id);
+                if ($invoice instanceof Invoice) {
+                    $this->issueInvoice($invoice, ['use_credits' => true, 'deferred_issue_use_credits' => true]);
+                }
+            } catch (\Throwable $e) {
+                $this->di['logger']->warning('Could not issue renewal draft #{id}: {message}', ['id' => $id, 'message' => $e->getMessage()]);
+                if (!$this->di['em']->isOpen()) {
+                    $this->resetEntityManager();
+                }
+            }
+        }
+    }
+
+    public function generateInvoicesForExpiringOrders(): bool
+    {
+        $this->retryUnissuedRenewalInvoices();
+        $orderService = $this->di['mod_service']('Order');
+        $orders = $orderService->getSoonExpiringActiveOrders();
+
+        if (\FOSSBilling\Core\Utils\Arr::safeCount($orders) == 0) {
+            return true;
+        }
+
+        $selection = array_column($orders, null, 'id');
+        $models = $this->di['em']->getRepository(Order::class)->findBy(['id' => array_keys($selection)]);
+
+        $subscriptionService = $this->di['mod_service']('Invoice', 'Subscription');
+
+        /** @var array<string, list<int>> $buckets */
+        $buckets = [];
+        foreach ($models as $selected) {
+            // Issuance of a previous renewal can replace the manager.
+            $model = $this->di['em']->getRepository(Order::class)->find($selected->getId());
+            if (!$model instanceof Order) {
+                continue;
+            }
+            // Validate the date on the reloaded entity against the cutoff
+            // that selected it. The quote lock then checks this bucket key.
+            $cutoff = $selection[$model->getId()]['renewal_cutoff'] ?? null;
+            if ($cutoff !== null && ($model->getExpiresAt() === null || $model->getPeriod() === null
+                || $model->getExpiresAt()->format('Y-m-d H:i:s') >= $cutoff
+                || !$this->isCronRenewalOrder($model))) {
+                continue;
+            }
+            $mergeKey = $this->renewalMergeKey($model);
+            $mergeable = false;
+
+            try {
+                $mergeable = $this->shouldMergeRenewalsForOrder($model)
+                    && !$subscriptionService->hasUncanceledSubscriptionForOrder($model);
+            } catch (\Exception $e) {
+                // Conservative fallback: an order that cannot be evaluated
+                // for merging keeps the historical one-invoice-per-order path.
+                $this->di['logger']->warning($e->getMessage());
+            }
+
+            if (!$mergeable) {
+                try {
+                    $invoice = $this->generateForOrder($model, expectedMergeKey: $mergeKey);
+                    $this->issueInvoice($invoice, ['id' => $invoice->getId(), 'use_credits' => true, 'deferred_issue_use_credits' => true]);
+                } catch (\Exception $e) {
+                    $this->di['logger']->warning($e->getMessage());
+                }
+
+                continue;
+            }
+
+            $buckets[$mergeKey][] = (int) $model->getId();
+        }
+
+        foreach ($buckets as $mergeKey => $bucketIds) {
+            $bucket = [];
+            foreach ($bucketIds as $orderId) {
+                $order = $this->di['em']->getRepository(Order::class)->find($orderId);
+                if ($order instanceof Order) {
+                    $bucket[] = $order;
+                }
+            }
+            if ($bucket === []) {
+                continue;
+            }
+            $invoices = [];
+
+            try {
+                // Single-order buckets keep the exact single-order behavior,
+                // including the existing unpaid-invoice reuse branch.
+                $invoices = count($bucket) === 1
+                    ? [$this->generateForOrder($bucket[0], expectedMergeKey: $mergeKey)]
+                    : [$this->generateMergedInvoiceForOrders($bucket, expectedMergeKey: $mergeKey)];
             } catch (\Exception $e) {
                 $this->di['logger']->warning($e->getMessage());
+
+                // A failed ORM flush closes the EntityManager and clear()
+                // can't reopen it: replace it so the process stays usable,
+                // then stop the batch, mirroring doBatchPaidInvoiceActivation.
+                // Otherwise retry each order on the historical single-invoice
+                // path so one bad order cannot block its bucket-mates.
+                if (!$this->di['em']->isOpen()) {
+                    $this->resetEntityManager();
+
+                    break;
+                }
+
+                if (count($bucket) > 1) {
+                    foreach ($bucket as $order) {
+                        try {
+                            $invoices[] = $this->generateForOrder($order, expectedMergeKey: $mergeKey);
+                        } catch (\Exception $fallback) {
+                            $this->di['logger']->warning($fallback->getMessage());
+                        }
+                    }
+                }
+            }
+
+            // Issuance runs outside generation: an issue failure retries
+            // neither generation (which would duplicate lines) nor credits.
+            foreach ($invoices as $selected) {
+                try {
+                    $invoice = $this->getInvoiceRepository()->find($selected->getId());
+                    if (!$invoice instanceof Invoice) {
+                        continue;
+                    }
+                    $this->issueInvoice($invoice, ['id' => $invoice->getId(), 'use_credits' => true, 'deferred_issue_use_credits' => true]);
+                } catch (\Exception $e) {
+                    $this->di['logger']->warning($e->getMessage());
+                }
             }
         }
 
@@ -1556,26 +6205,58 @@ class Service implements InjectionAwareInterface
         $connection = $this->di['em']->getConnection();
         foreach ($invoiceItems as $item) {
             try {
-                $connection->transactional(function () use ($connection, $item, $invoiceItemService): void {
+                // Renewal owns its order transaction and cancellation lock;
+                // free domain renewals also commit a claim before provider I/O.
+                // The shared executor owns the item lock for callbacks and cron.
+                if (($item['type'] ?? null) === InvoiceItem::TYPE_ORDER
+                    && ($item['task'] ?? null) === InvoiceItem::TASK_RENEW) {
+                    if ($connection->isTransactionActive()) {
+                        throw new InformationException('Renewal recovery requires a committed transaction before external actions.');
+                    }
+                    $model = $this->getInvoiceItemRepository()->find((int) ($item['id'] ?? 0));
+                    if ($model instanceof InvoiceItem) {
+                        $invoiceItemService->executeTask($model);
+                    }
+
+                    continue;
+                }
+                $model = $this->getInvoiceItemRepository()->find((int) ($item['id'] ?? 0));
+                $process = fn () => $connection->transactional(function () use ($connection, $item, $invoiceItemService, $model): void {
                     // Claim the row so concurrent cron processes cannot execute the same item twice.
                     $status = $connection->fetchOne(
-                        'SELECT status FROM invoice_item WHERE id = :id FOR UPDATE',
+                        'SELECT status FROM invoice_item WHERE id = :id' . RowLock::suffix($connection),
                         ['id' => (int) ($item['id'] ?? 0)]
                     );
                     if (in_array($status, [InvoiceItem::STATUS_EXECUTED, InvoiceItem::STATUS_FAILED], true)) {
                         return;
                     }
 
-                    $model = $this->getInvoiceItemRepository()->find((int) ($item['id'] ?? 0));
                     if (!$model instanceof InvoiceItem) {
                         throw new InformationException('Invoice item was not found');
                     }
                     $invoiceItemService->executeTask($model);
                 });
+                $order = $model instanceof InvoiceItem && $model->getType() === InvoiceItem::TYPE_ORDER
+                    ? $this->di['em']->getRepository(Order::class)->find((int) $model->getRelId()) : null;
+                if ($order instanceof Order) {
+                    // Keep provisioning and its outer commit under one lifecycle lock.
+                    $this->di['mod_service']('Order')->withLifecycleLock($order, $process);
+                } else {
+                    $process();
+                }
             } catch (\Exception $e) {
-                // Clear the identity map so subsequent iterations work with fresh, database-consistent entities.
-                $this->di['em']->clear();
                 $this->di['logger']->error($e->getMessage());
+
+                // A failed ORM flush closes the EntityManager and clear() can't reopen
+                // it. Replace it with a fresh instance so the rest of the cron run can
+                // keep writing, then stop the batch. Otherwise clear the identity map
+                // between iterations.
+                if (!$this->di['em']->isOpen()) {
+                    $this->resetEntityManager();
+
+                    break;
+                }
+                $this->di['em']->clear();
             }
         }
         $this->di['logger']->info('Executed action to activate paid invoices.');
@@ -1585,7 +6266,7 @@ class Service implements InjectionAwareInterface
 
     public function doBatchRemindersSend(): bool
     {
-        $this->di['events_manager']->fire(['event' => 'onBeforeAdminInvoiceSendReminders']);
+        $this->di['event_dispatcher']->dispatch(new BeforeAdminInvoiceSendRemindersEvent());
         $result = $this->doBatchInvokeDueEvent(['once_per_day' => true]);
         if (!$result) {
             // Pick up invoices that became reminder-eligible after today's due-event batch ran.
@@ -1603,11 +6284,10 @@ class Service implements InjectionAwareInterface
         $once_per_day = isset($data['once_per_day']) ? (bool) $data['once_per_day'] : true;
         $key = 'invoice_overdue_invoked';
 
-        // do not use api call to get system param to avoid invoking system module event hooks
+        // Read the setting directly to avoid dispatching system module events.
         $ss = $this->di['mod_service']('System');
         $last_time = $ss->getParamValue($key);
         if ($once_per_day && $last_time && (time() - strtotime((string) $last_time)) < 86400) {
-            // error_log('Already executed today.');
             return false;
         }
 
@@ -1627,7 +6307,7 @@ class Service implements InjectionAwareInterface
     }
 
     /**
-     * Fires the before/after due-date events for every unpaid, approved invoice in range, same
+     * Fires the before/after due-date events for every unpaid, issued invoice in range, same
      * as before this class started reminder-throttling. Listeners (built-in or third-party
      * extensions) decide for themselves whether a given invoice is actionable; this method does
      * not filter by reminder interval so it does not narrow what extensions can observe. The
@@ -1642,35 +6322,68 @@ class Service implements InjectionAwareInterface
         $beforeDueReminderIntervals = $this->parseInvoiceReminderIntervals($ss->getParamValue('invoice_reminder_before_due_days', ''));
         $afterDueReminderIntervals = $this->parseInvoiceReminderIntervals($ss->getParamValue('invoice_reminder_after_due_days', '5'));
 
-        $beforeDueList = $this->di['db']->getAll("SELECT id, DATEDIFF(due_at, NOW()) as days_left FROM invoice WHERE status = 'unpaid' AND approved = 1 AND due_at > NOW()");
+        $connection = $this->di['em']->getConnection();
+        $now = new \DateTimeImmutable();
+        $tomorrowStart = $now->modify('today')->modify('+1 day')->format('Y-m-d H:i:s');
+        $nowFormatted = $now->format('Y-m-d H:i:s');
+
+        $daysLeft = SqlExpr::dateDiffDays($connection, 'due_at', ':now');
+        $beforeDueList = $connection->fetchAllAssociative(
+            "SELECT id, {$daysLeft} as days_left FROM invoice WHERE status = 'unpaid' AND issued = true AND due_at > :now",
+            ['now' => $nowFormatted]
+        );
         foreach ($beforeDueList as $params) {
-            $params['reminder_intervals'] = $beforeDueReminderIntervals;
-            $this->di['events_manager']->fire(['event' => 'onEventBeforeInvoiceIsDue', 'params' => $params]);
+            $this->di['event_dispatcher']->dispatch(new BeforeInvoiceIsDueEvent(
+                (int) $params['id'],
+                (int) $params['days_left'],
+                $beforeDueReminderIntervals,
+            ));
         }
 
-        $afterDueList = $this->di['db']->getAll("SELECT id, ABS(DATEDIFF(due_at, NOW())) as days_passed FROM invoice WHERE status = 'unpaid' AND approved = 1 AND ((due_at < NOW()) OR (ABS(DATEDIFF(due_at, NOW())) = 0))");
+        // due_at < :tomorrow_start is a portable stand-in for MySQL's
+        // (due_at < NOW()) OR (ABS(DATEDIFF(due_at, NOW())) = 0): "already overdue, or due
+        // sometime today" is exactly "due before the start of tomorrow".
+        $daysPassed = SqlExpr::dateDiffDays($connection, 'due_at', ':now');
+        $afterDueList = $connection->fetchAllAssociative(
+            "SELECT id, ABS({$daysPassed}) as days_passed FROM invoice WHERE status = 'unpaid' AND issued = true AND due_at < :tomorrow_start",
+            ['now' => $nowFormatted, 'tomorrow_start' => $tomorrowStart]
+        );
         foreach ($afterDueList as $params) {
-            $params['reminder_intervals'] = $afterDueReminderIntervals;
-            $this->di['events_manager']->fire(['event' => 'onEventAfterInvoiceIsDue', 'params' => $params]);
+            $this->di['event_dispatcher']->dispatch(new AfterInvoiceIsDueEvent(
+                (int) $params['id'],
+                (int) $params['days_passed'],
+                $afterDueReminderIntervals,
+            ));
         }
     }
 
-    public function sendInvoiceReminder(\Model_Invoice $invoice): bool
+    public function sendInvoiceReminder(Invoice $invoice): bool
     {
         // do not send accidental reminder for paid invoices
-        if ($invoice->status == \Model_Invoice::STATUS_PAID) {
+        if ($invoice->getStatus() == Invoice::STATUS_PAID) {
             return true;
         }
 
-        $this->di['events_manager']->fire(['event' => 'onBeforeAdminInvoiceSendReminder', 'params' => ['id' => $invoice->id]]);
+        $this->di['event_dispatcher']->dispatch(new BeforeAdminInvoiceSendReminderEvent((int) $invoice->getId()));
 
-        $invoice->reminded_at = date('Y-m-d H:i:s');
-        $invoice->updated_at = date('Y-m-d H:i:s');
-        $this->di['db']->store($invoice);
+        $invoice->setRemindedAt(new \DateTimeImmutable());
+        $this->di['em']->persist($invoice);
+        $this->di['em']->flush();
 
-        $this->di['events_manager']->fire(['event' => 'onAfterAdminInvoiceReminderSent', 'params' => ['id' => $invoice->id]]);
+        $recordedEvent = new AfterAdminInvoiceReminderRecordedEvent((int) $invoice->getId());
+        $this->sendInvoiceReminderEmail($recordedEvent);
 
-        $this->di['logger']->info('Invoice payment reminder sent');
+        try {
+            $this->di['event_dispatcher']->dispatch($recordedEvent);
+        } catch (\Throwable $error) {
+            // The reminder was already recorded and the built-in email was attempted. A failing
+            // observer must not release the daily claim and cause a duplicate email on retry.
+            $this->di['logger']->withChannel('email')->error('Invoice reminder event listener failed', ['exception' => $error]);
+        }
+
+        $this->di['logger']->info('Invoice payment reminder recorded');
+
+        $this->recordJournalEvent($invoice, InvoiceEvent::TYPE_REMINDER);
 
         return true;
     }
@@ -1680,7 +6393,7 @@ class Service implements InjectionAwareInterface
         $sql = 'SELECT status, count(id) as counter
                  FROM invoice
                  group by status';
-        $rows = $this->di['db']->getAll($sql);
+        $rows = $this->di['em']->getConnection()->fetchAllAssociative($sql);
         $data = [];
         foreach ($rows as $row) {
             $data[$row['status']] = $row['counter'];
@@ -1688,17 +6401,28 @@ class Service implements InjectionAwareInterface
 
         return [
             'total' => array_sum($data),
-            \Model_Invoice::STATUS_PAID => $data[\Model_Invoice::STATUS_PAID] ?? 0,
-            \Model_Invoice::STATUS_UNPAID => $data[\Model_Invoice::STATUS_UNPAID] ?? 0,
-            \Model_Invoice::STATUS_REFUNDED => $data[\Model_Invoice::STATUS_REFUNDED] ?? 0,
-            \Model_Invoice::STATUS_CANCELED => $data[\Model_Invoice::STATUS_CANCELED] ?? 0,
+            Invoice::STATUS_PAID => $data[Invoice::STATUS_PAID] ?? 0,
+            Invoice::STATUS_UNPAID => $data[Invoice::STATUS_UNPAID] ?? 0,
+            Invoice::STATUS_REFUNDED => $data[Invoice::STATUS_REFUNDED] ?? 0,
+            Invoice::STATUS_CANCELED => $data[Invoice::STATUS_CANCELED] ?? 0,
         ];
     }
 
-    public function generateFundsInvoice(\Model_Client $client, $amount)
+    public function isFundsEnabled(): bool
     {
-        if (!$client->currency) {
+        $systemService = $this->di['mod_service']('system');
+
+        return (bool) $systemService->getParamValue('funds_enabled', true);
+    }
+
+    public function generateFundsInvoice(Client $client, $amount): Invoice
+    {
+        if (!$client->getCurrency()) {
             throw new InformationException('You must have at least one active order before you can add funds so you cannot proceed at the current time!');
+        }
+
+        if (!$this->isFundsEnabled()) {
+            throw new InformationException('Adding funds to the account balance is currently disabled', null, 980);
         }
 
         $systemService = $this->di['mod_service']('system');
@@ -1714,21 +6438,65 @@ class Service implements InjectionAwareInterface
             throw new InformationException('Amount cannot exceed :max_amount', [':max_amount' => $max_amount], 982);
         }
 
-        $proforma = $this->di['db']->dispense('Invoice');
-        $proforma->client_id = $client->id;
-        $proforma->status = \Model_Invoice::STATUS_UNPAID;
-        $proforma->currency = $client->currency;
-        $proforma->approved = $this->_isAutoApproved();
-        $proforma->created_at = date('Y-m-d H:i:s');
-        $proforma->updated_at = date('Y-m-d H:i:s');
-        $this->di['db']->store($proforma);
+        // Publish the complete invoice, its number and notification intent together.
+        return $this->di['em']->wrapInTransaction(function () use ($client, $amount): Invoice {
+            $proforma = new Invoice();
+            $proforma->setClientId($client->getId() ?? null);
+            $proforma->setStatus(Invoice::STATUS_UNPAID);
+            $proforma->setCurrency($client->getCurrency());
+            $this->di['em']->persist($proforma);
+            $this->di['em']->flush();
 
-        $this->setInvoiceDefaults($proforma);
+            $this->setInvoiceDefaults($proforma);
 
-        $invoiceItemService = $this->di['mod_service']('Invoice', 'InvoiceItem');
-        $invoiceItemService->generateForAddFunds($proforma, $amount);
+            // With auto-issue the invoice is born issued, so the issue path's
+            // snapshot never runs for it. Freeze the parties here, before the
+            // issued flag goes on, so funds invoices carry a snapshot like any
+            // other issued invoice.
+            $this->snapshotPartiesFromLiveRecords($proforma);
+            $invoiceItemService = $this->di['mod_service']('Invoice', 'InvoiceItem');
+            $invoiceItemService->generateForAddFunds($proforma, $amount);
 
-        return $proforma;
+            $autoIssued = $this->_isAutoIssued();
+            if ($autoIssued) {
+                $this->assignInvoiceNumberIfMissing($proforma);
+            }
+            $proforma->setIssued($autoIssued);
+            $proforma->setIssueNotificationState($autoIssued ? 2 : 0);
+            $this->di['em']->persist($proforma);
+            $this->di['em']->flush();
+
+            $this->recordJournalEvent($proforma, InvoiceEvent::TYPE_CREATED);
+
+            return $proforma;
+        });
+    }
+
+    public function invoiceHasDeletionHold(Invoice $invoice): bool
+    {
+        $connection = $this->di['em']->getConnection();
+        $orderLinks = $connection->fetchAllAssociative(
+            'SELECT order_id, rel_id FROM invoice_item WHERE invoice_id = :invoice_id AND type = :type',
+            ['invoice_id' => $invoice->getId(), 'type' => InvoiceItem::TYPE_ORDER],
+        );
+        $orderIds = [];
+        foreach ($orderLinks as $link) {
+            $orderId = $link['order_id'] === null
+                ? ServiceInvoiceItem::resolveLegacyPaidOrderReference($link['rel_id'])
+                : (int) $link['order_id'];
+            if ($orderId !== null) {
+                $orderIds[$orderId] = $orderId;
+            }
+        }
+        // Consistent lock order for multi-order invoices.
+        sort($orderIds);
+        foreach ($orderIds as $orderId) {
+            if (\Box\Mod\Order\DeletionRecovery::isHeld($connection, $orderId, true)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     public function processInvoice(array $data): array
@@ -1736,12 +6504,37 @@ class Service implements InjectionAwareInterface
         $allowSubscribe = $data['allow_subscription'] ?? true;
         $subscribe = false;
 
-        $invoice = $this->di['db']->findOne('Invoice', 'hash = ?', [$data['hash']]);
-        if (!$invoice instanceof \Model_Invoice) {
+        $invoice = $this->getInvoiceRepository()->findByHash($data['hash']);
+        if (!$invoice instanceof Invoice) {
             throw new InformationException('Invoice not found', null, 812);
         }
 
         $this->checkInvoiceAuth($invoice, InvoiceOperation::PAYMENT);
+
+        if ($invoice->getStatus() === Invoice::STATUS_CANCELED || $invoice->getReplacedByInvoiceId() !== null) {
+            throw new InformationException('This invoice was canceled and cannot be paid', [], 403);
+        }
+
+        if ($invoice->getStatus() === Invoice::STATUS_PAID) {
+            throw new InformationException('This invoice is already paid', [], 403);
+        }
+
+        // A bank debit still clearing pays this invoice: starting another
+        // payment now would charge the client twice. Matches the invoice
+        // page, which hides the payment form while a payment is pending.
+        if (PendingPayments::forInvoice($this->di['em']->getConnection(), (int) $invoice->getId()) !== null) {
+            throw new InformationException('A payment for this invoice is still clearing', [], 403);
+        }
+
+        // A provider timeout can leave only the durable attempt, with no
+        // transaction yet. Require reconciliation before starting any checkout.
+        if (GatewayChargeAttempts::pending($this->di['em']->getConnection(), (int) $invoice->getId()) !== null) {
+            throw new InformationException('A previous payment attempt needs reconciliation before another payment can be started', [], 403);
+        }
+
+        if ($this->invoiceHasDeletionHold($invoice)) {
+            throw new InformationException('Order deletion is awaiting recovery. Retry deletion before billing or changing the service.');
+        }
 
         $gtw = $this->di['em']->getRepository(PayGateway::class)->find((int) $data['gateway_id']);
         if (!$gtw instanceof PayGateway) {
@@ -1749,18 +6542,46 @@ class Service implements InjectionAwareInterface
         }
 
         if (!$gtw->isEnabled()) {
-            throw new \FOSSBilling\Exception('Payment method not enabled', null, 814);
+            throw new \FOSSBilling\Core\Exception\BaseException('Payment method not enabled', null, 814);
         }
 
         $subscribeService = $this->di['mod_service']('Invoice', 'Subscription');
         $payGatewayService = $this->di['mod_service']('Invoice', 'PayGateway');
-        if ($subscribeService->isSubscribable($invoice->id) && $payGatewayService->canPerformRecurrentPayment($gtw) && $allowSubscribe) {
+        if ($this->getAmountPaid($invoice) <= 0.0 && $subscribeService->isSubscribable($invoice->getId()) && $payGatewayService->canPerformRecurrentPayment($gtw) && $allowSubscribe) {
             $subscribe = true;
         }
 
-        if (!$subscribe && !$payGatewayService->canPerformSinglePayment($gtw)) {
-            throw new \FOSSBilling\Exception('One-time payments are not enabled for the selected payment gateway', null, 815);
+        // A renewal must not start a second gateway subscription for a service
+        // that already has one — pay it as a one-time payment instead.
+        if ($subscribe) {
+            $orderIds = [];
+            foreach ($this->di['em']->getConnection()->fetchAllAssociative(
+                "SELECT rel_id FROM invoice_item WHERE invoice_id = :id AND type = 'order'",
+                ['id' => $invoice->getId()]
+            ) as $row) {
+                if (is_numeric($row['rel_id'] ?? null)) {
+                    $orderIds[(int) $row['rel_id']] = true;
+                }
+            }
+            if ($orderIds !== []) {
+                $orders = $this->di['em']->getRepository(Order::class)->findBy(['id' => array_keys($orderIds)]);
+                foreach ($orders as $order) {
+                    if ($order instanceof Order && $subscribeService->hasActiveSubscriptionForOrder($order)) {
+                        $subscribe = false;
+
+                        break;
+                    }
+                }
+            }
         }
+
+        if (!$subscribe && !$payGatewayService->canPerformSinglePayment($gtw)) {
+            throw new \FOSSBilling\Core\Exception\BaseException('One-time payments are not enabled for the selected payment gateway', null, 815);
+        }
+
+        // Paying with a gateway applies its fee to the invoice; switching
+        // gateways replaces it. Credit payments carry no fee.
+        $this->di['mod_service']('Invoice', 'GatewayFees')->apply($invoice, $gtw);
 
         $adapter = $payGatewayService->getPaymentAdapter($gtw, $invoice, $data);
         if (method_exists($adapter, 'setDi')) {
@@ -1775,7 +6596,7 @@ class Service implements InjectionAwareInterface
 
         // @since v2.9.15
         if (method_exists($adapter, 'getHtml')) {
-            $html = $adapter->getHtml($this->di['api_system'], (int) $invoice->id, $subscribe);
+            $html = $adapter->getHtml($this->di['api_system'], (int) $invoice->getId(), $subscribe);
 
             return [
                 'iframe' => isset($pgc['can_load_in_iframe']) && (bool) $pgc['can_load_in_iframe'],
@@ -1789,7 +6610,7 @@ class Service implements InjectionAwareInterface
         $i = clone $invoice;
         $mpi = $this->getPaymentInvoice($i, $subscribe);
         $r = ($subscribe) ? $adapter->recurrentPayment($mpi) : $adapter->singlePayment($mpi);
-        $this->di['logger']->info('Went to pay for invoice #%s via %s', $invoice->id, $gtw->getGateway());
+        $this->di['logger']->info('Went to pay for invoice #{invoice_id} via {gateway}', ['invoice_id' => $invoice->getId(), 'gateway' => $gtw->getGateway()]);
 
         // @bug https://github.com/boxbilling/boxbilling/issues/108
         if ($adapter->getType() != 'html') {
@@ -1806,9 +6627,9 @@ class Service implements InjectionAwareInterface
 
     public function generatePDF($hash, $identity): Response
     {
-        $invoiceModel = $this->di['db']->findOne('Invoice', 'hash = :hash', [':hash' => $hash]);
+        $invoiceModel = $this->getInvoiceRepository()->findByHash($hash);
 
-        if (!$invoiceModel instanceof \Model_Invoice) {
+        if (!$invoiceModel instanceof Invoice) {
             throw new InformationException('Invoice not found');
         }
 
@@ -1827,7 +6648,7 @@ class Service implements InjectionAwareInterface
      *
      * @return array{content: string, name: string, mime: string}|null
      */
-    public function getInvoicePdfAttachment(\Model_Invoice $invoiceModel): ?array
+    public function getInvoicePdfAttachment(Invoice $invoiceModel): ?array
     {
         $systemService = $this->di['mod_service']('system');
         if (!$systemService->getParamValue('invoice_email_attach_pdf')) {
@@ -1844,23 +6665,24 @@ class Service implements InjectionAwareInterface
                 'mime' => 'application/pdf',
             ];
         } catch (\Exception $e) {
-            $this->di['logger']->setChannel('email')->error('Failed to generate PDF invoice attachment: ' . $e->getMessage());
+            $this->di['logger']->withChannel('email')->error('Failed to generate PDF invoice attachment: ' . $e->getMessage());
 
             return null;
         }
     }
 
-    protected function renderInvoicePdfContent(\Model_Invoice $invoiceModel, array $invoice): string
+    protected function renderInvoicePdfContent(Invoice $invoiceModel, array $invoice): string
     {
         $systemService = $this->di['mod_service']('system');
         $c = $systemService->getCompany();
         $document_format = $systemService->getParamValue('invoice_document_format', 'Letter');
 
-        if (isset($invoiceModel->currency)) {
-            $currencyCode = $invoiceModel->currency;
+        if ($invoiceModel->getCurrency() !== null) {
+            $currencyCode = $invoiceModel->getCurrency();
         } else {
-            $client = $this->di['db']->getExistingModelById('Client', $invoiceModel->client_id, 'Client not found');
-            $currencyCode = $client->currency;
+            $client = $this->di['em']->getRepository(Client::class)->find($invoiceModel->getClientId())
+                ?? throw new InformationException('Client not found');
+            $currencyCode = $client->getCurrency();
         }
 
         $CSS = $this->getPdfCss();
@@ -1873,10 +6695,10 @@ class Service implements InjectionAwareInterface
         $sellerLines = 0;
         $buyerLines = 0;
         $logoSource = '';
+        $options->set('isRemoteEnabled', false);
 
         if (!empty($c['logo_url'])) {
-            [$logoSource, $remote] = $this->getPdfLogoSource($c['logo_url']);
-            $options->set('isRemoteEnabled', $remote);
+            [$logoSource] = $this->getPdfLogoSource($c['logo_url']);
         }
 
         $vars = [
@@ -1889,7 +6711,7 @@ class Service implements InjectionAwareInterface
             'buyer' => $this->getBuyerData($invoice, $buyerLines),
             'buyer_lines' => $buyerLines,
             'invoice' => $invoice,
-            'locale' => i18n::getActiveLocale($this->di['request'], true, $this->di['cookie_queue']),
+            'locale' => I18n::getActiveLocale($this->di['request'], true, $this->di['cookie_queue']),
         ];
 
         $twigFactory = $this->di['twig_factory'];
@@ -1905,12 +6727,12 @@ class Service implements InjectionAwareInterface
         return $pdf->output();
     }
 
-    public function addNote(\Model_Invoice $model, $note): bool
+    public function addNote(Invoice $model, $note): bool
     {
-        $n = $model->notes;
-        $model->notes = $n . date('Y-m-d H:i:s') . ': ' . $note . '       ' . PHP_EOL;
-        $model->updated_at = date('Y-m-d H:i:s');
-        $this->di['db']->store($model);
+        $n = $model->getNotes();
+        $model->setNotes($n . date('Y-m-d H:i:s') . ': ' . $note . '       ' . PHP_EOL);
+        $this->di['em']->persist($model);
+        $this->di['em']->flush();
 
         return true;
     }
@@ -1929,10 +6751,10 @@ class Service implements InjectionAwareInterface
                     LEFT JOIN client_balance as cb on m.client_id = cb.client_id
                     LEFT JOIN invoice_item as pi on pi.invoice_id = m.id
                 WHERE m.status = :status
-                    AND m.approved = 1
+                    AND m.issued = true
                     AND cb.amount >= pi.price
                     AND pi.type != :type';
-        $params = ['status' => \Model_Invoice::STATUS_UNPAID, 'type' => InvoiceItem::TYPE_DEPOSIT];
+        $params = ['status' => Invoice::STATUS_UNPAID, 'type' => InvoiceItem::TYPE_DEPOSIT];
 
         $client_id = isset($filter['client_id']) ? (int) $filter['client_id'] : null;
 
@@ -1944,19 +6766,25 @@ class Service implements InjectionAwareInterface
         $sql .= ' GROUP BY m.id, cl.id
                  ORDER BY m.id DESC';
 
-        return $this->di['db']->getAll($sql, $params);
+        return $this->di['em']->getConnection()->fetchAllAssociative($sql, $params);
     }
 
+    /**
+     * @return Invoice[]
+     */
     public function findAllPaid()
     {
-        return $this->di['db']->find('Invoice', 'status = ? order by id desc', [\Model_Invoice::STATUS_PAID]);
+        return $this->getInvoiceRepository()->findPaid();
     }
 
+    /**
+     * @return Invoice[]
+     */
     public function getUnpaidInvoicesLateFor($days_after_issue = 2)
     {
-        $conditions = 'status = ? and approved = 1 and reminded_at is null and DATEDIFF(NOW(), created_at) > ?';
+        $cutoff = strtotime("-{$days_after_issue} days");
 
-        return $this->di['db']->find('Invoice', $conditions, [\Model_Invoice::STATUS_UNPAID, $days_after_issue]);
+        return $this->getInvoiceRepository()->findUnpaidIssuedNotRemindedBefore($cutoff);
     }
 
     public function isInvoiceReminderIntervalEnabled(string $param, int $days, string $default = '', mixed $intervals = null): bool
@@ -1999,20 +6827,251 @@ class Service implements InjectionAwareInterface
         return $days;
     }
 
-    private function _isAutoApproved(): bool
+    /**
+     * Whether automatic reminders may be sent yet today. An empty or invalid
+     * `invoice_reminder_send_time` means disabled (legacy behavior); otherwise
+     * true once local time reaches `HH:MM`, so the first cron at/after the
+     * configured time sends.
+     */
+    public function isReminderSendTimeReached(?\DateTimeImmutable $now = null): bool
+    {
+        try {
+            $systemService = $this->di['mod_service']('system');
+            $configured = $systemService->getParamValue('invoice_reminder_send_time', '');
+        } catch (\Throwable) {
+            return true;
+        }
+
+        $configured = trim((string) ($configured ?? ''));
+        if ($configured === '') {
+            return true;
+        }
+
+        if (!preg_match('/^(\d{1,2}):(\d{2})$/', $configured, $matches)) {
+            return true;
+        }
+
+        $hour = (int) $matches[1];
+        $minute = (int) $matches[2];
+        if ($hour > 23 || $minute > 59) {
+            return true;
+        }
+
+        $now ??= new \DateTimeImmutable();
+
+        return ((int) $now->format('H')) * 60 + ((int) $now->format('i')) >= $hour * 60 + $minute;
+    }
+
+    private function _isAutoIssued(): bool
     {
         /**
          * @var \Box\Mod\System\Service $systemService
          */
         $systemService = $this->di['mod_service']('system');
 
-        return (bool) $systemService->getParamValue('invoice_auto_approval', true);
+        return (bool) $systemService->getParamValue('invoice_auto_issue', true);
+    }
+
+    /**
+     * Whether the invoice immutability escape hatch is enabled.
+     *
+     * Strict (default) keeps every issued invoice immutable: no
+     * content edits and no hard deletes. Relaxed restores the pre-immutability
+     * behavior for unpaid invoices only (content edits and cleanup deletes).
+     * Paid, refunded, canceled, note, and reissue-linked invoices stay
+     * immutable in both modes.
+     *
+     * This is a transitional setting and will be removed in a future release,
+     * at which point strict becomes the only behavior.
+     */
+    public function isImmutabilityRelaxed(): bool
+    {
+        /** @var \Box\Mod\System\Service $systemService */
+        $systemService = $this->di['mod_service']('system');
+
+        $mode = $systemService->getParamValue('invoice_immutability', null);
+        if ($mode === null || $mode === '') {
+            // Pre-migration fallback: honor the retired per-action keys until
+            // the update patcher migrates them (see UpdatePatcher).
+            return (bool) $systemService->getParamValue('invoice_allow_edit_unpaid', false)
+                || (bool) $systemService->getParamValue('invoice_allow_delete_approved', false);
+        }
+
+        return $mode === 'relaxed';
+    }
+
+    /**
+     * Whether the invoice can be canceled (voided) without a replacement.
+     *
+     * Only issued unpaid invoices qualify. Drafts should be deleted, paid
+     * invoices refunded, and credit/debit notes or already-reissued invoices
+     * are never cancellable.
+     */
+    public function isInvoiceCancellable(Invoice $invoice): bool
+    {
+        return $invoice->isIssued()
+            && $invoice->getStatus() === Invoice::STATUS_UNPAID
+            && $invoice->getCreditNoteForInvoiceId() === null
+            && $invoice->getDebitNoteForInvoiceId() === null
+            && $invoice->getReplacedByInvoiceId() === null;
+    }
+
+    /**
+     * Whether the invoice can be hard-deleted by an admin.
+     *
+     * Unissued unpaid drafts (without note/reissue links) are always
+     * deletable. Issued unpaid and canceled invoices additionally require
+     * relaxed invoice immutability. Paid, refunded, note, and reissue-linked
+     * invoices are never deletable so the audit trail survives.
+     */
+    public function isDeletableByAdmin(Invoice $invoice): bool
+    {
+        if ($invoice->getCreditNoteForInvoiceId() !== null
+            || $invoice->getDebitNoteForInvoiceId() !== null
+            || $invoice->getReplacesInvoiceId() !== null
+            || $invoice->getReplacedByInvoiceId() !== null
+        ) {
+            return false;
+        }
+
+        if (!$invoice->isIssued() && $invoice->getStatus() === Invoice::STATUS_CANCELED && $invoice->getNr() === null
+            && $this->getInvoiceItemRepository()->findByInvoiceId((int) $invoice->getId()) === []
+            && $this->getAmountPaid($invoice) === 0.0
+            && $this->getTransactionRepository()->findOneBy(['invoice' => $invoice]) === null) {
+            return true;
+        }
+
+        if (!$invoice->isIssued() && $invoice->getStatus() === Invoice::STATUS_UNPAID) {
+            return true;
+        }
+
+        if (!in_array($invoice->getStatus(), [Invoice::STATUS_UNPAID, Invoice::STATUS_CANCELED], true)) {
+            return false;
+        }
+
+        return $this->isImmutabilityRelaxed();
+    }
+
+    /**
+     * Whether the invoice's content (lines, amounts, details) may be changed.
+     *
+     * Unissued invoices are drafts and always editable. Issued invoices
+     * are immutable once paid, refunded, or canceled; an issued unpaid
+     * invoice is only editable when invoice immutability is relaxed, which
+     * treats it as an editable quote (edited invoices are re-sent to the
+     * client afterwards).
+     */
+    public function isInvoiceEditable(Invoice $invoice): bool
+    {
+        return $this->isInvoiceStateEditable($invoice->getStatus(), $invoice->isIssued());
+    }
+
+    public function isInvoiceStateEditable(string $status, bool $issued): bool
+    {
+        if (in_array($status, [Invoice::STATUS_PAID, Invoice::STATUS_REFUNDED, Invoice::STATUS_CANCELED], true)) {
+            return false;
+        }
+
+        if (!$issued) {
+            return true;
+        }
+
+        return $this->isImmutabilityRelaxed();
+    }
+
+    /**
+     * Reject attempts to rewrite an issued invoice's identity (numbering
+     * series/number, lifecycle status, issue state), even when relaxed
+     * editing is enabled. Identity fields define the legal document; changing
+     * them edits history rather than correcting it. Issued invoices are
+     * corrected through payment, credit notes, reissue, or cancel (void).
+     */
+    private function assertIssuedIdentityUnchanged(Invoice $model, array $data): void
+    {
+        if (!$model->isIssued()) {
+            return;
+        }
+
+        $issued = array_key_exists('issued', $data) ? (bool) $data['issued'] : $model->isIssued();
+        $status = array_key_exists('status', $data) ? (string) $data['status'] : $model->getStatus();
+        $serie = array_key_exists('serie', $data) ? (string) $data['serie'] : (string) $model->getSerie();
+        $nr = array_key_exists('nr', $data) ? (string) $data['nr'] : (string) $model->getNr();
+
+        if ($issued !== $model->isIssued()
+            || $status !== $model->getStatus()
+            || $serie !== (string) $model->getSerie()
+            || $nr !== (string) $model->getNr()
+        ) {
+            throw new InformationException('Invoice number, status, and issue state are locked once issued. Correct issued invoices with a payment, credit note, reissue, or cancel (void) instead.');
+        }
+    }
+
+    /**
+     * Lock an invoice row and return its current issue/status state.
+     *
+     * Callers must keep the surrounding transaction open until their mutation is complete. The
+     * lock is the serialization point shared by invoice edits, item edits, issuing, payment,
+     * and deletion.
+     *
+     * @return array{status: string, issued: bool}
+     */
+    public function lockInvoiceState(Invoice $invoice): array
+    {
+        if ($invoice->getId() === null) {
+            return [
+                'status' => $invoice->getStatus(),
+                'issued' => $invoice->isIssued(),
+            ];
+        }
+
+        $state = $this->getInvoiceRepository()->lockAndGetState($invoice->getId());
+        if ($state === null) {
+            throw new InformationException('Invoice not found');
+        }
+
+        return $state;
+    }
+
+    /**
+     * @return array{status: string, issued: bool}
+     */
+    private function lockAndRefreshInvoice(Invoice $invoice, bool $currentRead = false): array
+    {
+        $state = $this->lockInvoiceState($invoice);
+
+        if ($invoice->getId() !== null) {
+            if ($currentRead) {
+                // Keep the transaction's first snapshot read after the order locks.
+                $this->di['em']->refresh($invoice, \Doctrine\DBAL\LockMode::PESSIMISTIC_WRITE);
+            } else {
+                $this->di['em']->refresh($invoice);
+            }
+        }
+
+        return $state;
+    }
+
+    /**
+     * Lock an order row and refresh the entity, so a concurrent request
+     * cannot attach the same order to another invoice between the link check
+     * and the line creation below. The caller must hold the surrounding
+     * transaction open until linking is complete.
+     */
+    private function lockAndRefreshOrder(Order $order): void
+    {
+        if ($order->getId() === null) {
+            return;
+        }
+
+        $this->di['em']->getRepository(Order::class)->lockAndGetUnpaidInvoiceId($order->getId(), true);
+        \Box\Mod\Order\DeletionRecovery::assertNotHeld($this->di['em']->getConnection(), $order->getId(), true);
+        $this->di['em']->refresh($order, \Doctrine\DBAL\LockMode::PESSIMISTIC_WRITE);
     }
 
     /**
      * @param bool $subscribe
      */
-    public function getPaymentInvoice(\Model_Invoice $invoice, $subscribe = false): \Payment_Invoice
+    public function getPaymentInvoice(Invoice $invoice, $subscribe = false): \Payment_Invoice
     {
         $proforma = $this->toApiArray($invoice);
         $client = $this->getBuyer($invoice);
@@ -2043,7 +7102,7 @@ class Service implements InjectionAwareInterface
                 ->setTax($item['tax'])
                 ->setQuantity($item['quantity']);
             $items[] = $pi;
-            if (is_null($first_title) && Tools::safeCount($proforma['lines']) == 1) {
+            if (is_null($first_title) && \FOSSBilling\Core\Utils\Arr::safeCount($proforma['lines']) == 1) {
                 $first_title = $item['title'];
             }
         }
@@ -2063,62 +7122,97 @@ class Service implements InjectionAwareInterface
         }
 
         $mpi = new \Payment_Invoice();
-        $mpi->setId($invoice->id);
+        $mpi->setId($invoice->getId());
         $mpi->setNumber($proforma['nr']);
         $mpi->setBuyer($buyer);
         $mpi->setCurrency($proforma['currency']);
         $mpi->setTitle($title);
+        if (!$subscribe && (float) ($proforma['amount_paid'] ?? 0) > 0.0) {
+            // Legacy adapters read the DTO's items as well as its total. A
+            // balance-only item prevents either contract charging paid funds.
+            $items = [(new \Payment_Invoice_Item())->setId($invoice->getId())
+                ->setTitle(__trans('Remaining balance for invoice :id', [':id' => $proforma['nr']]))
+                ->setPrice(max(0.0, round((float) $proforma['balance_due'], 2)))->setTax(0)->setQuantity(1)];
+        } else {
+            $lineTax = array_sum(array_map(static fn (\Payment_Invoice_Item $item): float => (float) $item->getTax() * $item->getQuantity(), $items));
+            $tax = round((float) ($proforma['tax'] ?? 0) - $lineTax, 2);
+            if ($tax != 0.0) {
+                $items[] = (new \Payment_Invoice_Item())->setTitle(__trans('Invoice tax'))->setPrice(0)->setTax($tax)->setQuantity(1);
+            }
+        }
         $mpi->setItems($items);
 
         $subscribeService = $this->di['mod_service']('Invoice', 'Subscription');
         // can subscribe only if proforma has one item with defined period
-        if ($subscribe && $subscribeService->isSubscribable($invoice->id)) {
-            $subitem = $invoice->InvoiceItem->getFirst();
-            $period = $this->di['period']($subitem->period);
+        if ($subscribe && $subscribeService->isSubscribable($invoice->getId())) {
+            $subitem = $this->getInvoiceItemRepository()->findOneByInvoiceIdAndType($invoice->getId(), InvoiceItem::TYPE_ORDER);
+            if ($subitem instanceof InvoiceItem) {
+                $period = $this->di['period']($subitem->getPeriod());
 
-            $bs = new \Payment_Invoice_Subscription();
-            $bs->setId($proforma['id']);
-            $bs->setAmount($mpi->getTotalWithTax());
-            $bs->setCycle($period->getQty());
-            $bs->setUnit($period->getUnit());
+                $bs = new \Payment_Invoice_Subscription();
+                $bs->setId($proforma['id']);
+                $bs->setAmount($mpi->getTotalWithTax());
+                $bs->setCycle($period->getQty());
+                $bs->setUnit($period->getUnit());
 
-            $mpi->setSubscription($bs);
-            $mpi->setTitle('Subscription for ' . $subitem->title);
+                $mpi->setSubscription($bs);
+                $mpi->setTitle('Subscription for ' . $subitem->getTitle());
+            }
         }
 
         return $mpi;
     }
 
-    public function getBuyer(\Model_Invoice $invoice): array
+    public function getBuyer(Invoice $invoice): array
     {
-        return [
-            'first_name' => $invoice->buyer_first_name,
-            'last_name' => $invoice->buyer_last_name,
-            'company' => $invoice->buyer_company,
-            'address' => $invoice->buyer_address,
-            'city' => $invoice->buyer_city,
-            'state' => $invoice->buyer_state,
-            'country' => $invoice->buyer_country,
-            'phone' => $invoice->buyer_phone,
-            'phone_cc' => '',
-            'email' => $invoice->buyer_email,
-            'zip' => $invoice->buyer_zip,
+        $buyer = [
+            'first_name' => $invoice->getBuyerFirstName(),
+            'last_name' => $invoice->getBuyerLastName(),
+            'company' => $invoice->getBuyerCompany(),
+            'address' => $invoice->getBuyerAddress(),
+            'city' => $invoice->getBuyerCity(),
+            'state' => $invoice->getBuyerState(),
+            'country' => $invoice->getBuyerCountry(),
+            'phone' => $invoice->getBuyerPhone(),
+            'email' => $invoice->getBuyerEmail(),
+            'zip' => $invoice->getBuyerZip(),
         ];
+
+        // The invoice snapshot no longer stores a country code, but payment
+        // gateways still take one: source it from the live client record.
+        $buyer['phone_cc'] = '';
+        if ($invoice->getClientId() !== null) {
+            $client = $this->di['em']->getRepository(Client::class)->find($invoice->getClientId());
+            if ($client instanceof Client) {
+                $buyer['phone_cc'] = $client->getPhoneCc() ?? '';
+            }
+        }
+
+        return $buyer;
     }
 
-    public function rmByClient(\Model_Client $client): void
+    /**
+     * Delete every invoice of a client being deleted, in any state — paid,
+     * refunded, canceled, and linked notes included, together with their
+     * journal entries. This is intentional erasure (client deletion is the
+     * GDPR-style "forget me" path), not cleanup: it deliberately bypasses
+     * the never-delete guards that protect financial records everywhere
+     * else, so it must only ever be called from client removal.
+     *
+     * Transactions survive (they are payment records, not invoice data) but
+     * are anonymized in place: personal data goes, the financial record stays.
+     */
+    public function rmByClient(Client $client): void
     {
-        $invoices = $this->di['db']->find('Invoice', 'client_id = ?', [$client->id]);
+        $invoices = $this->getInvoiceRepository()->findByClientId((int) $client->getId());
         foreach ($invoices as $invoice) {
-            if ($invoice instanceof \Model_Invoice) {
-                $this->rmInvoice($invoice);
-            }
+            $this->rmInvoice($invoice, false, true);
         }
     }
 
-    public function isInvoiceTypeDeposit(\Model_Invoice $invoice): bool
+    public function isInvoiceTypeDeposit(Invoice $invoice): bool
     {
-        $invoiceItems = $this->getInvoiceItemRepository()->findByInvoiceId((int) $invoice->id);
+        $invoiceItems = $this->getInvoiceItemRepository()->findByInvoiceId((int) $invoice->getId());
 
         foreach ($invoiceItems as $item) {
             if ($item->getType() == InvoiceItem::TYPE_DEPOSIT) {
@@ -2142,13 +7236,18 @@ class Service implements InjectionAwareInterface
         return $this->di['csv_response_factory']->create('invoice', 'invoices.csv', $headers);
     }
 
-    public function checkInvoiceAuth(\Model_Invoice $invoice, InvoiceOperation $operation = InvoiceOperation::READ): void
+    public function checkInvoiceAuth(Invoice $invoice, InvoiceOperation $operation = InvoiceOperation::READ): void
     {
-        if ($this->di['auth']->isAdminLoggedIn() || Environment::isCLI()) {
+        if (Environment::isCLI()) {
+            return;
+        }
+        if ($this->di['auth']->isAdminLoggedIn()) {
+            $this->di['mod_service']('Staff')->checkPermissionsAndThrowException('invoice', 'view');
+
             return;
         }
 
-        $invoiceClientId = $invoice->client_id;
+        $invoiceClientId = $invoice->getClientId();
         $systemService = $this->di['mod_service']('system');
         $hash_access = $systemService->getParamValue('invoice_accessible_from_hash', '0');
         $hashAccessAllowed = $hash_access === '1' && in_array($operation, [InvoiceOperation::READ, InvoiceOperation::PAYMENT], true);
@@ -2157,7 +7256,7 @@ class Service implements InjectionAwareInterface
         if ($this->di['auth']->isClientLoggedIn()) {
             $client = $this->di['loggedin_client'];
         }
-        $isOwner = $client !== null && (int) $invoiceClientId === (int) $client->id;
+        $isOwner = $client !== null && (int) $invoiceClientId === (int) $client->getId();
 
         if (!$isOwner && $this->isHashExpired($invoice)) {
             throw new InformationException('This invoice link has expired', [], 403);
@@ -2172,14 +7271,14 @@ class Service implements InjectionAwareInterface
      * Computes the hash_expires_at timestamp. Returns null when the admin
      * has disabled hash expiration (invoice_hash_lifetime_days = 0).
      */
-    private function computeHashExpiration(): ?string
+    private function computeHashExpiration(): ?\DateTimeImmutable
     {
         $days = (int) $this->di['mod_service']('system')->getParamValue('invoice_hash_lifetime_days', '90');
         if ($days <= 0) {
             return null;
         }
 
-        return date('Y-m-d H:i:s', strtotime("+{$days} days"));
+        return new \DateTimeImmutable("+{$days} days");
     }
 
     /**
@@ -2188,42 +7287,44 @@ class Service implements InjectionAwareInterface
      * hash is empty or in a legacy format by generating a fresh modern
      * hash. Called when an admin re-sends an invoice or payment reminder.
      */
-    public function extendInvoiceHashLifetime(\Model_Invoice $invoice): void
+    public function extendInvoiceHashLifetime(Invoice $invoice): void
     {
-        $hash = $invoice->hash ?? null;
+        $hash = $invoice->getHash();
         $isModern = is_string($hash) && preg_match('/^[a-f0-9]{30,60}$/', $hash) === 1;
         if (!$isModern) {
-            $invoice->hash = bin2hex(random_bytes(random_int(15, 30)));
+            $invoice->setHash(bin2hex(random_bytes(random_int(15, 30))));
         }
-        $invoice->hash_expires_at = $this->computeHashExpiration();
-        $this->di['db']->store($invoice);
+        $invoice->setHashExpiresAt($this->computeHashExpiration());
+        $this->di['em']->persist($invoice);
+        $this->di['em']->flush();
     }
 
     /**
      * Regenerates the hash if it is missing or in a legacy format. No-op
      * for valid hashes, making it safe to call from read paths.
      */
-    public function ensureValidHash(\Model_Invoice $invoice): void
+    public function ensureValidHash(Invoice $invoice): void
     {
-        $hash = $invoice->hash ?? null;
+        $hash = $invoice->getHash();
         $isModern = is_string($hash) && preg_match('/^[a-f0-9]{30,60}$/', $hash) === 1;
         if ($isModern) {
             return;
         }
 
-        $invoice->hash = bin2hex(random_bytes(random_int(15, 30)));
-        $invoice->hash_expires_at = $this->computeHashExpiration();
-        $this->di['db']->store($invoice);
+        $invoice->setHash(bin2hex(random_bytes(random_int(15, 30))));
+        $invoice->setHashExpiresAt($this->computeHashExpiration());
+        $this->di['em']->persist($invoice);
+        $this->di['em']->flush($invoice);
     }
 
-    private function isHashExpired(\Model_Invoice $invoice): bool
+    private function isHashExpired(Invoice $invoice): bool
     {
-        $expires = $invoice->hash_expires_at ?? null;
-        if (empty($expires)) {
+        $expires = $invoice->getHashExpiresAt();
+        if ($expires === null) {
             return false;
         }
 
-        return strtotime((string) $expires) < time();
+        return $expires->getTimestamp() < time();
     }
 
     // Start of PDF related functions
@@ -2306,6 +7407,9 @@ class Service implements InjectionAwareInterface
     {
         $source = parse_url($originalUrl, PHP_URL_PATH);
         $remote = false;
+        if (!is_string($source) || $source === '') {
+            return [$this->fetchPdfLogo($originalUrl), false];
+        }
 
         // prevent openbasedir error from preventing pdf creation when debug mode is enabled
         if (@!$this->filesystem->exists($source)) {
@@ -2328,18 +7432,11 @@ class Service implements InjectionAwareInterface
             }
         }
 
-        // Only permit http/https remote URLs. Other schemes such as file://, php://, or phar://
-        // could be passed to Dompdf with remote loading enabled, leading to local file disclosure
-        // or other server-side vulnerabilities. Malformed URLs (where parse_url returns non-string)
-        // are also rejected by skipping the logo entirely.
         if ($remote) {
-            $scheme = parse_url($source, PHP_URL_SCHEME);
-            if (!is_string($scheme) || !in_array(strtolower($scheme), ['http', 'https'], true)) {
-                return ['', false];
-            }
+            return [$this->fetchPdfLogo($originalUrl), false];
         }
 
-        if (!$remote && str_ends_with($source, '.svg')) {
+        if (str_ends_with($source, '.svg')) {
             $source = 'data:image/svg+xml;base64,' . base64_encode($this->filesystem->readFile($source));
             $remote = false;
         }
@@ -2347,20 +7444,124 @@ class Service implements InjectionAwareInterface
         return [$source, $remote];
     }
 
+    /** Fetch logos without allowing the PDF renderer to access the network. */
+    private function fetchPdfLogo(string $url): string
+    {
+        $scheme = parse_url($url, PHP_URL_SCHEME);
+        if (!is_string($scheme) || !in_array(strtolower($scheme), ['http', 'https'], true)) {
+            return '';
+        }
+
+        $client = new \Symfony\Component\HttpClient\NoPrivateNetworkHttpClient($this->di['http_client']);
+        $response = null;
+
+        try {
+            $response = $client->request('GET', $url, [
+                'max_redirects' => 3,
+                'timeout' => 5,
+                'max_duration' => 10,
+                'on_progress' => static function (int $downloaded, int $size): void {
+                    if ($downloaded > 2 * 1024 * 1024 || $size > 2 * 1024 * 1024) {
+                        throw new \Symfony\Component\HttpClient\Exception\TransportException('Invoice logo is too large');
+                    }
+                },
+            ]);
+            if ($response->getStatusCode() !== 200) {
+                return '';
+            }
+            $mime = strtolower(trim(explode(';', $response->getHeaders()['content-type'][0] ?? '')[0]));
+            $mime = match ($mime) {
+                'image/x-png' => 'image/png',
+                'image/jpg', 'image/pjpeg' => 'image/jpeg',
+                'image/x-ms-bmp' => 'image/bmp',
+                default => $mime,
+            };
+            if (!in_array($mime, ['', 'application/octet-stream', 'image/png', 'image/jpeg', 'image/gif', 'image/bmp', 'image/webp', 'image/svg+xml'], true)) {
+                return '';
+            }
+            $bytes = '';
+            foreach ($client->stream($response) as $chunk) {
+                $bytes .= $chunk->getContent();
+                if (strlen($bytes) > 2 * 1024 * 1024) {
+                    return '';
+                }
+            }
+            $image = @getimagesizefromstring($bytes);
+            if ($image !== false && $image['mime'] !== 'image/svg+xml') {
+                if (!in_array($image['mime'], ['image/png', 'image/jpeg', 'image/gif', 'image/bmp', 'image/webp'], true)
+                    || !in_array($mime, ['', 'application/octet-stream', $image['mime']], true)
+                    || 16 * 1024 * 1024 < $image[0] * $image[1]) {
+                    return '';
+                }
+                $mime = $image['mime'];
+            } elseif (in_array($mime, ['', 'application/octet-stream', 'image/svg+xml'], true) && $this->isSelfContainedPdfSvg($bytes)) {
+                $mime = 'image/svg+xml';
+            } else {
+                return '';
+            }
+
+            return 'data:' . $mime . ';base64,' . base64_encode($bytes);
+        } catch (\Symfony\Contracts\HttpClient\Exception\ExceptionInterface) {
+            // An unavailable or unsafe logo must not prevent invoice generation.
+            return '';
+        } finally {
+            $response?->cancel();
+        }
+    }
+
+    /** Remote SVGs may use internal fragments, but may not load other resources. */
+    private function isSelfContainedPdfSvg(string $bytes): bool
+    {
+        $document = new \DOMDocument();
+        if (!@$document->loadXML($bytes, LIBXML_NONET) || $document->doctype !== null
+            || $document->documentElement?->localName !== 'svg') {
+            return false;
+        }
+        $content = $document->textContent;
+        foreach ($document->getElementsByTagName('*') as $element) {
+            foreach ($element->attributes as $attribute) {
+                $content .= "\n" . $attribute->value;
+                if ($attribute->localName === 'href' && !str_starts_with(trim($attribute->value), '#')) {
+                    if (!preg_match('~^data:(image/(?:png|jpeg|gif|bmp|webp));base64,([A-Za-z0-9+/=]+)$~D', $attribute->value, $data)) {
+                        return false;
+                    }
+                    $imageBytes = base64_decode($data[2], true);
+                    $image = $imageBytes === false ? false : @getimagesizefromstring($imageBytes);
+                    if ($image === false || $image['mime'] !== $data[1] || 16 * 1024 * 1024 < $image[0] * $image[1]) {
+                        return false;
+                    }
+                }
+            }
+        }
+        // Inspect decoded XML values so character references cannot hide CSS URLs.
+        if (str_contains($content, '\\') || stripos($content, '@import') !== false
+            || stripos($bytes, '<?xml-stylesheet') !== false) {
+            return false;
+        }
+        preg_match_all('/url\(([^)]*)\)/i', $content, $urls);
+        foreach ($urls[1] as $url) {
+            if (!str_starts_with(trim($url, " \t\r\n\"'"), '#')) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     private function getSellerData(array $invoice, int &$lines): array
     {
         $sourceData = [
-            'Name' => $invoice['seller']['company'],
-            'Address 1' => $invoice['seller']['address_1'],
-            'Address 2' => $invoice['seller']['address_2'],
-            'Address 3' => $invoice['seller']['address_3'],
-            'Phone' => $invoice['seller']['phone'],
-            'Email' => $invoice['seller']['email'],
-            'VAT Number' => $invoice['seller']['company_vat'],
+            'Name' => $invoice['seller']['company'] ?? null,
+            'Address 1' => $invoice['seller']['address_1'] ?? null,
+            'Address 2' => $invoice['seller']['address_2'] ?? null,
+            'Address 3' => $invoice['seller']['address_3'] ?? null,
+            'Phone' => $invoice['seller']['phone'] ?? null,
+            'Email' => $invoice['seller']['email'] ?? null,
+            'VAT Number' => $invoice['seller']['company_vat'] ?? null,
         ];
 
         foreach ($sourceData as $label => $data) {
-            if ($data === null || empty(trim($data))) {
+            if ($data === null || empty(trim((string) $data))) {
                 unset($sourceData[$label]);
             } else {
                 ++$lines;
@@ -2373,19 +7574,19 @@ class Service implements InjectionAwareInterface
     private function getBuyerData(array $invoice, int &$lines): array
     {
         $sourceData = [
-            'Company' => $invoice['buyer']['company'],
-            'Name' => $invoice['buyer']['first_name'] . ' ' . $invoice['buyer']['last_name'],
-            'Address' => $invoice['buyer']['address'],
-            'City' => $invoice['buyer']['city'],
-            'State' => $invoice['buyer']['state'],
-            'Zip' => $invoice['buyer']['zip'],
-            'Country' => $invoice['buyer']['country'],
-            'Phone' => $invoice['buyer']['phone'],
-            'VAT Number' => $invoice['buyer']['company_vat'],
+            'Company' => $invoice['buyer']['company'] ?? null,
+            'Name' => trim(($invoice['buyer']['first_name'] ?? '') . ' ' . ($invoice['buyer']['last_name'] ?? '')),
+            'Address' => $invoice['buyer']['address'] ?? null,
+            'City' => $invoice['buyer']['city'] ?? null,
+            'State' => $invoice['buyer']['state'] ?? null,
+            'Zip' => $invoice['buyer']['zip'] ?? null,
+            'Country' => $invoice['buyer']['country'] ?? null,
+            'Phone' => $invoice['buyer']['phone'] ?? null,
+            'VAT Number' => $invoice['buyer']['company_vat'] ?? null,
         ];
 
         foreach ($sourceData as $label => $data) {
-            if ($data === null || empty(trim($data))) {
+            if ($data === null || empty(trim((string) $data))) {
                 unset($sourceData[$label]);
             } else {
                 ++$lines;
@@ -2397,30 +7598,23 @@ class Service implements InjectionAwareInterface
 
     private function getFooterInfo(array $company): array
     {
-        $sourceData = [
-            'company_name' => $company['name'],
-            'bank_name' => $company['bank_name'],
-            'account_number' => $company['account_number'],
-            'bic' => $company['bic'],
-            'display_bank_info' => $company['display_bank_info'],
-            'company_vat' => $company['vat_number'],
-            'company_number' => $company['number'],
-            'www' => $company['www'],
-            'email' => $company['email'],
-            'phone' => $company['tel'],
-            'signature' => $company['signature'],
-            'address_1' => $company['address_1'],
-            'address_2' => $company['address_2'],
-            'address_3' => $company['address_3'],
+        // Keep all keys defined so PDF templates rendered with strict_variables don't fail on missing optional company details.
+        return [
+            'company_name' => $company['name'] ?? null,
+            'bank_name' => $company['bank_name'] ?? null,
+            'account_number' => $company['account_number'] ?? null,
+            'bic' => $company['bic'] ?? null,
+            'display_bank_info' => $company['display_bank_info'] ?? null,
+            'company_vat' => $company['vat_number'] ?? null,
+            'company_number' => $company['number'] ?? null,
+            'www' => $company['www'] ?? null,
+            'email' => $company['email'] ?? null,
+            'phone' => $company['tel'] ?? null,
+            'signature' => $company['signature'] ?? null,
+            'address_1' => $company['address_1'] ?? null,
+            'address_2' => $company['address_2'] ?? null,
+            'address_3' => $company['address_3'] ?? null,
         ];
-
-        foreach ($sourceData as $label => $data) {
-            if ($data === null || empty(trim($data))) {
-                unset($sourceData[$label]);
-            }
-        }
-
-        return $sourceData;
     }
 
     /**
@@ -2436,7 +7630,7 @@ class Service implements InjectionAwareInterface
         $item = $this->getInvoiceItemRepository()->findOneByInvoiceIdAndType($invoiceId, InvoiceItem::TYPE_ORDER);
 
         if ($item instanceof InvoiceItem) {
-            return (int) $item->getRelId();
+            return $item->getOrderId() ?? ServiceInvoiceItem::resolveLegacyPaidOrderReference($item->getRelId());
         }
 
         return null;
@@ -2447,18 +7641,20 @@ class Service implements InjectionAwareInterface
      * This handles the case where PayPal/Stripe sends a subscription payment before
      * the cron job generates the renewal invoice.
      *
-     * @param string $subscriptionSid The subscription ID from the payment gateway
-     * @param int    $clientId        The client ID
-     *
-     * @return \Model_Invoice|null The generated invoice or null if unable to generate
+     * The adapter supplies the gateway and original invoice verified on the callback.
      */
-    public function generateRenewalInvoiceForSubscriptionPayment(string $subscriptionSid, int $clientId): ?\Model_Invoice
+    public function generateRenewalInvoiceForSubscriptionPayment(string $subscriptionSid, int $clientId, int $gatewayId, int $originalInvoiceId, ?int $callbackId = null): ?Invoice
     {
-        $subscriptionService = $this->di['mod_service']('Invoice', 'Subscription');
-        $orderService = $this->di['mod_service']('Order');
+        $originalOrder = null;
+        $attemptedDraftId = null;
 
         try {
-            $subscription = $this->di['em']->getRepository(Entity\Subscription::class)->findOneBy(['sid' => $subscriptionSid]);
+            $subscription = $this->di['em']->getRepository(Entity\Subscription::class)->findOneBy([
+                'sid' => $subscriptionSid,
+                'payGateway' => $gatewayId,
+                'relType' => 'invoice',
+                'relId' => $originalInvoiceId,
+            ]);
             if (!$subscription instanceof Entity\Subscription) {
                 return null;
             }
@@ -2467,36 +7663,114 @@ class Service implements InjectionAwareInterface
                 return null;
             }
 
-            $originalOrderId = $this->getOrderIdFromInvoice((int) $subscription->getRelId());
+            if ($subscription->getRelId() !== $originalInvoiceId) {
+                return null;
+            }
+            $originalOrderId = $this->getOrderIdFromInvoice($originalInvoiceId);
             if ($originalOrderId === null) {
                 return null;
             }
 
-            $originalOrder = $this->di['db']->load('ClientOrder', $originalOrderId);
-            if (!$originalOrder instanceof \Model_ClientOrder) {
+            $originalOrder = $this->di['em']->getRepository(Order::class)->find($originalOrderId);
+            if (!$originalOrder instanceof Order || $originalOrder->getClientId() !== $clientId) {
                 return null;
             }
 
-            // Use the original order directly. A previous approach searched for
-            // any active order with the same product_id, but that is broken for
-            // products like domain registrations where multiple orders share
-            // the same product — it would find an unrelated order and generate
-            // a renewal invoice for the wrong service.
-            if ($originalOrder->status !== \Model_ClientOrder::STATUS_ACTIVE) {
+            $callback = $callbackId === null ? null : $this->getTransactionRepository()->find($callbackId);
+            $attempt = $callback?->getIpn() ?? [];
+            if ((int) ($attempt['subscription_renewal_failures'] ?? 0) >= self::SUBSCRIPTION_RENEWAL_FAILURE_LIMIT) {
+                $this->retireExhaustedSubscriptionDraft($originalOrder, $attempt['subscription_renewal_draft_id'] ?? null);
+
                 return null;
             }
 
-            $invoice = $this->generateForOrder($originalOrder);
-            $this->approveInvoice($invoice, ['use_credits' => false]);
+            if (!$this->isSubscriptionRenewalOrder($originalOrder)) {
+                return null;
+            }
 
-            $this->di['logger']->info("Generated renewal invoice #{$invoice->id} for subscription payment (SID: {$subscriptionSid}).");
+            $invoice = $this->withRenewalQuoteLocks([$originalOrderId], function () use ($originalOrder, $originalOrderId, &$attemptedDraftId): ?Invoice {
+                $invoice = $this->generateForOrderWithRenewalLock($originalOrder, null, true, true, null);
+                $attemptedDraftId = $invoice->getId();
+                if (!$this->issueInvoiceWithRenewalLock($invoice, ['use_credits' => false], [$originalOrderId], $originalOrderId)) {
+                    return null;
+                }
+
+                return $invoice;
+            });
+            if ($invoice === null) {
+                return null;
+            }
+
+            $this->di['logger']->info("Generated renewal invoice #{$invoice->getId()} for subscription payment (SID: {$subscriptionSid}, client: {$clientId}).");
 
             return $invoice;
-        } catch (\Exception $e) {
-            $this->di['logger']->warning('Failed to generate renewal invoice for subscription payment: ' . $e->getMessage());
+        } catch (Exception\RenewalHoldException $e) {
+            $this->di['logger']->info('Subscription renewal is held: {message}', ['message' => $e->getMessage()]);
 
             return null;
+        } catch (Exception\RetryableCallbackException $e) {
+            throw $e;
+        } catch (\Throwable $e) {
+            $this->di['logger']->warning('Failed to generate or issue a subscription renewal invoice.', ['exception' => $e]);
+            if (!$this->di['em']->isOpen()) {
+                $this->resetEntityManager();
+            }
+
+            $attempt = $callbackId === null ? null : $this->recordSubscriptionRenewalFailure($callbackId, $originalInvoiceId, $attemptedDraftId);
+            if ($attempt !== null) {
+                // The adapter retains the verified receipt through its existing
+                // unallocated credit path, including receipt deduplication.
+                if ($originalOrder instanceof Order) {
+                    $this->retireExhaustedSubscriptionDraft($originalOrder, $attempt['subscription_renewal_draft_id'] ?? null);
+                }
+
+                return null;
+            }
+
+            throw new Exception\RetryableCallbackException('The subscription renewal invoice is temporarily unavailable.');
         }
+    }
+
+    private function retireExhaustedSubscriptionDraft(Order $order, ?int $draftId): void
+    {
+        if ($draftId === null) {
+            return;
+        }
+
+        try {
+            $this->withRenewalQuoteLocks([$order], fn () => $this->retireSubscriptionDraft($this->reloadRenewalOrder($order), requireCancellationHold: false, expectedDraftId: $draftId));
+        } catch (\Throwable $e) {
+            $this->di['logger']->warning('Could not retire an exhausted subscription renewal draft.', ['exception' => $e]);
+
+            throw new Exception\RetryableCallbackException('The subscription renewal draft is temporarily unavailable.');
+        }
+    }
+
+    /** @return array<string, mixed>|null The exhausted callback checkpoint, if reached. */
+    private function recordSubscriptionRenewalFailure(int $callbackId, int $originalInvoiceId, ?int $draftId): ?array
+    {
+        $transaction = $this->getTransactionRepository()->find($callbackId);
+        if (!$transaction instanceof Transaction) {
+            return null;
+        }
+        $this->di['em']->refresh($transaction);
+        $ipn = $transaction->getIpn() ?? [];
+        $failures = min(self::SUBSCRIPTION_RENEWAL_FAILURE_LIMIT, (int) ($ipn['subscription_renewal_failures'] ?? 0) + 1);
+        $ipn['subscription_renewal_failures'] = $failures;
+        if ($draftId !== null) {
+            $ipn['subscription_renewal_draft_id'] = $draftId;
+        }
+        $transaction->setIpn($ipn);
+        if ($failures === self::SUBSCRIPTION_RENEWAL_FAILURE_LIMIT) {
+            $message = "Subscription renewal could not be issued after three attempts. Review the retained payment for original invoice #{$originalInvoiceId}.";
+            $note = $transaction->getNote();
+            if (!str_contains((string) $note, $message)) {
+                $transaction->setNote(trim($note . "\n" . $message));
+            }
+        }
+        $this->di['em']->flush();
+
+        return $failures === self::SUBSCRIPTION_RENEWAL_FAILURE_LIMIT ? $ipn : null;
     }
 
     // End of PDF related functions

@@ -12,16 +12,39 @@ declare(strict_types=1);
 namespace Box\Mod\Profile;
 
 use Box\Mod\Client\Entity\Client;
+use Box\Mod\Client\Entity\ClientPasswordReset;
+use Box\Mod\Profile\Event\AfterAdminApiKeyChangeEvent;
+use Box\Mod\Profile\Event\AfterAdminProfilePasswordChangeEvent;
+use Box\Mod\Profile\Event\AfterAdminProfileUpdateEvent;
+use Box\Mod\Profile\Event\AfterClientProfilePasswordChangeEvent;
+use Box\Mod\Profile\Event\AfterClientProfileUpdateEvent;
+use Box\Mod\Profile\Event\BeforeAdminApiKeyChangeEvent;
+use Box\Mod\Profile\Event\BeforeAdminProfilePasswordChangeEvent;
+use Box\Mod\Profile\Event\BeforeAdminProfileUpdateEvent;
+use Box\Mod\Profile\Event\BeforeClientProfilePasswordChangeEvent;
+use Box\Mod\Profile\Event\BeforeClientProfileUpdateEvent;
 use Box\Mod\Staff\Entity\Admin;
-use FOSSBilling\i18n;
-use FOSSBilling\InformationException;
-use FOSSBilling\InjectionAwareInterface;
-use FOSSBilling\Tools;
+use Box\Mod\Staff\Entity\AdminPasswordReset;
+use FOSSBilling\Core\Container\InjectionAwareInterface;
+use FOSSBilling\Core\Exception\InformationException;
+use FOSSBilling\Core\I18n\I18n;
 use Symfony\Component\Intl\Countries;
 use Symfony\Component\Intl\Locales;
 
 class Service implements InjectionAwareInterface
 {
+    private const string SESSION_ATTRIBUTES_PREFIX = '_sf2_attributes|';
+    private const array SENSITIVE_PROFILE_EVENT_FIELDS = [
+        'password',
+        'password_confirm',
+        'password_confirmation',
+        'current_password',
+        'new_password',
+        'confirm_password',
+        'pass',
+        'api_token',
+    ];
+
     protected ?\Pimple\Container $di = null;
 
     public function getModulePermissions(): array
@@ -44,16 +67,13 @@ class Service implements InjectionAwareInterface
 
     public function changeAdminPassword(Admin $admin, $new_password): bool
     {
-        $event_params = ['id' => $admin->getId()];
-        $this->di['events_manager']->fire(['event' => 'onBeforeAdminStaffProfilePasswordChange', 'params' => $event_params]);
+        $adminId = (int) $admin->getId();
+        $this->di['event_dispatcher']->dispatch(new BeforeAdminProfilePasswordChangeEvent($adminId));
 
-        $admin->setPass($this->di['password']->hashIt($new_password));
-        $this->di['em']->persist($admin);
-        $this->di['em']->flush();
+        $this->di['em']->getRepository(AdminPasswordReset::class)
+            ->changePassword($admin, $this->di['password']->hashIt($new_password));
 
-        $event_params = [];
-        $event_params['id'] = $admin->getId();
-        $this->di['events_manager']->fire(['event' => 'onAfterAdminStaffProfilePasswordChange', 'params' => $event_params]);
+        $this->di['event_dispatcher']->dispatch(new AfterAdminProfilePasswordChangeEvent($adminId));
 
         $this->di['logger']->info('Changed profile password');
 
@@ -62,15 +82,16 @@ class Service implements InjectionAwareInterface
 
     public function generateNewApiKey(Admin $admin): bool
     {
-        $event_params = [];
-        $event_params['id'] = $admin->getId();
-        $this->di['events_manager']->fire(['event' => 'onBeforeAdminStaffApiKeyChange', 'params' => $event_params]);
+        $adminId = (int) $admin->getId();
+        $this->di['event_dispatcher']->dispatch(new BeforeAdminApiKeyChangeEvent($adminId));
 
-        $admin->setApiToken($this->di['tools']->generatePassword(32));
+        $admin->setApiToken(\FOSSBilling\Core\Security\Credential::generatePassword(32));
         $this->di['em']->persist($admin);
         $this->di['em']->flush();
 
-        $this->di['events_manager']->fire(['event' => 'onAfterAdminStaffApiKeyChange', 'params' => $event_params]);
+        $this->invalidateSessions('admin', (int) $admin->getId());
+
+        $this->di['event_dispatcher']->dispatch(new AfterAdminApiKeyChangeEvent($adminId));
 
         $this->di['logger']->info('Generated new API key');
 
@@ -79,22 +100,19 @@ class Service implements InjectionAwareInterface
 
     public function updateAdmin(Admin $admin, array $data): bool
     {
-        $event_params = $data;
-        $event_params['id'] = $admin->getId();
-        $this->di['events_manager']->fire(['event' => 'onBeforeAdminStaffProfileUpdate', 'params' => $event_params]);
+        $adminId = (int) $admin->getId();
+        $this->di['event_dispatcher']->dispatch(new BeforeAdminProfileUpdateEvent($adminId, $this->profileEventData($data)));
 
         $admin->setEmail($data['email'] ?? $admin->getEmail());
         $admin->setName($data['name'] ?? $admin->getName());
         $admin->setSignature($data['signature'] ?? $admin->getSignature());
         if (array_key_exists('timezone', $data)) {
-            $admin->setTimezone(i18n::validateTimezone($data['timezone']));
+            $admin->setTimezone(I18n::validateTimezone($data['timezone']));
         }
         $this->di['em']->persist($admin);
         $this->di['em']->flush();
 
-        $event_params = [];
-        $event_params['id'] = $admin->getId();
-        $this->di['events_manager']->fire(['event' => 'onAfterAdminStaffProfileUpdate', 'params' => $event_params]);
+        $this->di['event_dispatcher']->dispatch(new AfterAdminProfileUpdateEvent($adminId));
 
         $this->di['logger']->info('Updated profile');
 
@@ -118,15 +136,21 @@ class Service implements InjectionAwareInterface
 
     public function updateClient(Client $client, array $data = []): bool
     {
-        $event_params = $data;
-        $event_params['id'] = $client->getId();
-        $this->di['events_manager']->fire(['event' => 'onBeforeClientProfileUpdate', 'params' => $event_params]);
+        return $this->di['em']->getConnection()->transactional(fn (): bool => $this->updateClientProfile($client, $data));
+    }
+
+    private function updateClientProfile(Client $client, array $data): bool
+    {
+        $clientId = (int) $client->getId();
+        $this->di['event_dispatcher']->dispatch(new BeforeClientProfileUpdateEvent($clientId, $this->profileEventData($data)));
 
         $mod = $this->di['mod']('client');
         $config = $mod->getConfig();
         $email = $data['email'] ?? '';
+        // An omitted email leaves it unchanged (see below), so only a submitted one can be a change.
         if (
-            $client->getEmail() != $email
+            !empty($email)
+            && $client->getEmail() != $email
             && isset($config['disable_change_email'])
             && $config['disable_change_email']
         ) {
@@ -134,7 +158,7 @@ class Service implements InjectionAwareInterface
         }
 
         if (!empty($email)) {
-            $this->di['tools']->validateAndSanitizeEmail($data['email']);
+            \FOSSBilling\Core\Validation\EmailValidator::validateAndSanitizeEmail($data['email']);
 
             $clientService = $this->di['mod_service']('client');
             if ($clientService->emailAlreadyRegistered($email, $client)) {
@@ -142,6 +166,12 @@ class Service implements InjectionAwareInterface
             }
 
             if ($client->getEmail() !== $email) {
+                // Lock the row and reset the stored flag even if the managed entity
+                // still has its original false value after a concurrent confirmation.
+                $this->di['em']->getConnection()->executeStatement('UPDATE client SET email_approved = false WHERE id = :id', ['id' => $clientId]);
+                $clientService->revokeEmailConfirmations($clientId);
+                // An email change must also invalidate outstanding password-reset links.
+                $this->di['em']->getConnection()->delete('client_password_reset', ['client_id' => $clientId]);
                 $client->setEmail($email);
                 $client->setEmailApproved(false);
 
@@ -154,11 +184,11 @@ class Service implements InjectionAwareInterface
         }
 
         if (isset($data['phone_cc']) && $data['phone_cc'] !== '') {
-            $client->setPhoneCc((string) Tools::validatePhoneCC($data['phone_cc']));
+            $client->setPhoneCc((string) \FOSSBilling\Core\Validation\PhoneValidator::validatePhoneCC($data['phone_cc']));
         }
 
         if (isset($data['phone']) && is_string($data['phone']) && $data['phone'] !== '') {
-            $client->setPhone(Tools::validatePhoneNumber($data['phone']));
+            $client->setPhone(\FOSSBilling\Core\Validation\PhoneValidator::validatePhoneNumber($data['phone']));
         }
 
         $client->setFirstName($data['first_name'] ?? $client->getFirstName());
@@ -168,7 +198,7 @@ class Service implements InjectionAwareInterface
         $client->setLastName($data['last_name'] ?? $client->getLastName());
         $client->setGender(ClientValidator::validateGender($data['gender'] ?? $client->getGender()));
         $birthday = ClientValidator::validateBirthday($data['birthday'] ?? $client->getBirthday()?->format('Y-m-d'));
-        $client->setBirthday($birthday !== null ? new \DateTime($birthday) : null);
+        $client->setBirthday($birthday !== null ? new \DateTimeImmutable($birthday) : null);
         $client->setCompany($data['company'] ?? $client->getCompany());
         $client->setCompanyVat($data['company_vat'] ?? $client->getCompanyVat());
         $client->setCompanyNumber($data['company_number'] ?? $client->getCompanyNumber());
@@ -189,7 +219,7 @@ class Service implements InjectionAwareInterface
         }
         $client->setLang($lang);
         if (array_key_exists('timezone', $data)) {
-            $client->setTimezone(i18n::validateTimezone($data['timezone']));
+            $client->setTimezone(I18n::validateTimezone($data['timezone']));
         }
         $client->setNotes($data['notes'] ?? $client->getNotes());
         $client->setCustom1($data['custom_1'] ?? $client->getCustom1());
@@ -216,7 +246,7 @@ class Service implements InjectionAwareInterface
         $this->di['em']->persist($client);
         $this->di['em']->flush();
 
-        $this->di['events_manager']->fire(['event' => 'onAfterClientProfileUpdate', 'params' => ['id' => $client->getId()]]);
+        $this->di['event_dispatcher']->dispatch(new AfterClientProfileUpdateEvent($clientId));
 
         $this->di['logger']->info('Updated profile');
 
@@ -225,26 +255,40 @@ class Service implements InjectionAwareInterface
 
     public function resetApiKey(Client $client): ?string
     {
-        $client->setApiToken($this->di['tools']->generatePassword(32));
+        $client->setApiToken(\FOSSBilling\Core\Security\Credential::generatePassword(32));
 
         $this->di['em']->persist($client);
         $this->di['em']->flush();
+
+        $this->invalidateSessions('client', (int) $client->getId());
 
         $this->di['logger']->info('Generated new API key');
 
         return $client->getApiToken();
     }
 
+    /**
+     * @param array<string, mixed> $data
+     *
+     * @return array<string, mixed>
+     */
+    private function profileEventData(array $data): array
+    {
+        foreach (self::SENSITIVE_PROFILE_EVENT_FIELDS as $field) {
+            unset($data[$field]);
+        }
+
+        return $data;
+    }
+
     public function changeClientPassword(Client $client, $new_password): bool
     {
-        $event_params = ['id' => $client->getId()];
-        $this->di['events_manager']->fire(['event' => 'onBeforeClientProfilePasswordChange', 'params' => $event_params]);
+        $clientId = (int) $client->getId();
+        $this->di['event_dispatcher']->dispatch(new BeforeClientProfilePasswordChangeEvent($clientId));
 
-        $client->setPass($this->di['password']->hashIt($new_password));
-        $this->di['em']->persist($client);
-        $this->di['em']->flush();
+        $this->di['em']->getRepository(ClientPasswordReset::class)->changePassword($client, $this->di['password']->hashIt($new_password));
 
-        $this->di['events_manager']->fire(['event' => 'onAfterClientProfilePasswordChange', 'params' => ['id' => $client->getId()]]);
+        $this->di['event_dispatcher']->dispatch(new AfterClientProfilePasswordChangeEvent($clientId));
 
         $this->di['logger']->info('Changed profile password');
 
@@ -262,13 +306,13 @@ class Service implements InjectionAwareInterface
     public function invalidateSessions(?string $type = null, ?int $id = null): bool
     {
         if (empty($type)) {
-            $auth = new \Box_Authorization($this->di);
+            $auth = new \FOSSBilling\Core\Security\Authorization($this->di);
             if ($auth->isAdminLoggedIn()) {
                 $type = 'admin';
             } elseif ($auth->isClientLoggedIn()) {
                 $type = 'client';
             } else {
-                throw new \FOSSBilling\Exception('Unable to invalidate sessions, nobody is logged in');
+                throw new \FOSSBilling\Core\Exception\BaseException('Unable to invalidate sessions, nobody is logged in');
             }
         }
 
@@ -276,18 +320,18 @@ class Service implements InjectionAwareInterface
             switch ($type) {
                 case 'admin':
                     $admin = $this->di['session']->get('admin');
-                    $id = $admin['id'];
+                    $id = (int) $admin['id'];
 
                     break;
                 case 'client':
-                    $id = $this->di['session']->get('client_id');
+                    $id = (int) $this->di['session']->get('client_id');
 
                     break;
             }
         }
 
         if ($type !== 'admin' && $type !== 'client') {
-            throw new \FOSSBilling\Exception('Unable to invalidate sessions, an invalid type was used');
+            throw new \FOSSBilling\Core\Exception\BaseException('Unable to invalidate sessions, an invalid type was used');
         }
 
         $sessions = $this->getSessions();
@@ -300,46 +344,53 @@ class Service implements InjectionAwareInterface
 
     private function getSessions(): array
     {
-        $query = 'SELECT * FROM session WHERE content IS NOT NULL AND content <> ""';
+        $query = 'SELECT id, content FROM session WHERE content IS NOT NULL AND OCTET_LENGTH(content) > 0';
 
         return $this->di['em']->getConnection()->fetchAllAssociative($query);
     }
 
     private function deleteSessionIfMatching(array $session, string $type, int $id): void
     {
-        $data = base64_decode((string) $session['content']);
-        $stringStart = ($type === 'admin') ? 'admin|' : 'client_id|';
-        if (!str_starts_with($data, $stringStart)) {
+        $content = $session['content'] ?? '';
+        $data = is_resource($content) ? stream_get_contents($content) : (string) $content;
+        if (!is_string($data)) {
             return;
         }
 
-        $data = str_replace($stringStart, '', $data);
+        $attributes = $this->decodeSessionAttributes($data);
+        if ($attributes === []) {
+            return;
+        }
 
         if ($type === 'admin') {
-            $dataArray = $this->phpSessionDecode($data);
-            if (is_array($dataArray) && isset($dataArray['id']) && (int) $dataArray['id'] === $id) {
+            $admin = $attributes['admin'] ?? null;
+            if (is_array($admin) && isset($admin['id']) && (int) $admin['id'] === $id) {
                 $this->trashSessionByArray($session);
             }
-        } else {
-            $clientId = $this->phpSessionDecode($data);
-            if (is_int($clientId) && $clientId === $id) {
-                $this->trashSessionByArray($session);
-            }
+        } elseif (($attributes['client_id'] ?? null) === $id) {
+            $this->trashSessionByArray($session);
         }
     }
 
-    private function phpSessionDecode(string $data): array|int|false
+    private function decodeSessionAttributes(string $data): array
     {
-        if ($data === '' || !in_array($data[0], ['a', 'i'], true)) {
-            return false;
+        if (!str_starts_with($data, self::SESSION_ATTRIBUTES_PREFIX)) {
+            return [];
         }
 
-        $result = unserialize($data, ['allowed_classes' => false]);
-        if (is_array($result) || is_int($result)) {
-            return $result;
+        // PHP concatenates the serialized session bags. unserialize() returns
+        // the first value and emits an "extra data" warning for the following
+        // bags. Suppress warnings emitted by this unserialize call only; a
+        // malformed record is treated as a non-matching session.
+        set_error_handler(static fn (int $severity, string $message): bool => $severity === E_WARNING && str_starts_with($message, 'unserialize():'), E_WARNING);
+
+        try {
+            $attributes = unserialize(substr($data, strlen(self::SESSION_ATTRIBUTES_PREFIX)), ['allowed_classes' => false]);
+        } finally {
+            restore_error_handler();
         }
 
-        return false;
+        return is_array($attributes) ? $attributes : [];
     }
 
     private function trashSessionByArray(array $session): void

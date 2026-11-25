@@ -12,9 +12,9 @@ declare(strict_types=1);
 
 namespace Tests\Support;
 
-use FOSSBilling\Twig\Extension\ApiExtension;
-use FOSSBilling\Twig\Extension\FOSSBillingExtension;
-use FOSSBilling\Twig\Extension\LegacyExtension;
+use FOSSBilling\Core\Twig\Extension\ApiExtension;
+use FOSSBilling\Core\Twig\Extension\FOSSBillingExtension;
+use FOSSBilling\Core\Twig\Extension\LegacyExtension;
 use Symfony\Component\Finder\Finder;
 use Twig\Environment;
 use Twig\Extension\AttributeExtension;
@@ -325,8 +325,8 @@ final class StrictTemplateRenderer
                 'FOSSBillingVersion' => '0.0.0',
                 'default_currency' => 'USD',
                 'app_area' => 'email',
-                'current_theme' => 'admin_default',
-                'theme' => ['code' => 'admin_default', 'name' => 'admin_default', 'url' => '/themes/admin_default/'],
+                'current_theme' => 'default/admin',
+                'theme' => ['code' => 'default/admin', 'name' => 'default/admin', 'url' => '/themes/default/admin/'],
                 'settings' => $stub,
                 'guest' => [
                     'system_company' => [
@@ -350,8 +350,8 @@ final class StrictTemplateRenderer
             'FOSSBillingVersion' => '0.0.0',
             'default_currency' => 'USD',
             'app_area' => 'admin',
-            'current_theme' => 'admin_default',
-            'theme' => ['code' => 'admin_default', 'name' => 'admin_default', 'url' => '/themes/admin_default/'],
+            'current_theme' => 'default/admin',
+            'theme' => ['code' => 'default/admin', 'name' => 'default/admin', 'url' => '/themes/default/admin/'],
             'settings' => $stub,
             'admin' => $stub,
             'client' => $stub,
@@ -480,6 +480,16 @@ final class StrictTemplateRenderer
             return 'test-infra';
         }
         if (str_contains($message, 'must be of type float') || str_contains($message, 'must be of type int')) {
+            return 'test-infra';
+        }
+        if (str_contains($message, 'Unsupported operand types') && str_contains($message, PermissiveStub::class)) {
+            // Templates that do arithmetic directly on two attribute lookups
+            // (e.g. `order.total - order.discount`) hit this when both sides
+            // resolve to PermissiveStub instead of a real number. PHP objects
+            // don't support arithmetic operators, so this is a stub
+            // limitation, not a template bug. The class-name check keeps a
+            // genuine "Unsupported operand types" bug elsewhere in a
+            // template (unrelated to the stub) classified as real-bug.
             return 'test-infra';
         }
         if (str_contains($message, 'NumberFormatter::formatCurrency')) {

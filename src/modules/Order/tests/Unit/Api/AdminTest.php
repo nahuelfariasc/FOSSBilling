@@ -10,6 +10,8 @@
 
 declare(strict_types=1);
 
+// cspell:words cancelrequest
+
 use Box\Mod\Order\Api\Admin;
 use Box\Mod\Order\Repository\OrderRepository;
 use Box\Mod\Order\Service;
@@ -42,10 +44,10 @@ test('gets list of orders', function (): void {
     $serviceMock->shouldReceive('getSearchQuery')->atLeast()->once()->andReturn(['query', []]);
     $serviceMock->shouldReceive('getBatchForApi')->atLeast()->once()->andReturn([]);
 
-    $paginatorMock = Mockery::mock(FOSSBilling\Pagination::class);
+    $paginatorMock = Mockery::mock(FOSSBilling\Core\Pagination\Service::class);
     $paginatorMock->shouldReceive('getPaginatedResultSet')->atLeast()->once()->andReturn(['list' => []]);
 
-    $modMock = Mockery::mock(FOSSBilling\Module::class);
+    $modMock = Mockery::mock(FOSSBilling\Core\Module::class);
     $modMock->shouldReceive('getConfig')->atLeast()->once()->andReturn(['show_addons' => 0]);
 
     $di = container();
@@ -112,7 +114,7 @@ test('rejects order create with mark invoice paid when invoice permission is mis
     $staffServiceMock->shouldReceive('checkPermissionsAndThrowException')
         ->once()
         ->with('invoice', null, null, Mockery::any())
-        ->andThrow(new FOSSBilling\InformationException('Denied', [], 403));
+        ->andThrow(new FOSSBilling\Core\Exception\InformationException('Denied', [], 403));
 
     $di = container();
     $di['mod_service'] = $di->protect(fn (string $name): Mockery\MockInterface => match (strtolower($name)) {
@@ -129,7 +131,7 @@ test('rejects order create with mark invoice paid when invoice permission is mis
         'invoice_option' => 'issue-invoice',
         'mark_invoice_paid' => 1,
         'gateway_id' => 5,
-    ]))->toThrow(FOSSBilling\InformationException::class);
+    ]))->toThrow(FOSSBilling\Core\Exception\InformationException::class);
 });
 
 test('uses invoice service to validate mark paid request when permission granted', function (): void {
@@ -223,7 +225,7 @@ test('rejects invalid invoice payment payload before order creation', function (
     $invoiceServiceMock = Mockery::mock(Box\Mod\Invoice\Service::class);
     $invoiceServiceMock->shouldReceive('validateAdminMarkAsPaidRequest')
         ->once()
-        ->andThrow(new FOSSBilling\InformationException('Transaction ID is required when using the Custom payment gateway.'));
+        ->andThrow(new FOSSBilling\Core\Exception\InformationException('Transaction ID is required when using the Custom payment gateway.'));
 
     $di = container();
     $di['mod_service'] = $di->protect(fn (string $name): Mockery\MockInterface => match (strtolower($name)) {
@@ -241,7 +243,7 @@ test('rejects invalid invoice payment payload before order creation', function (
         'invoice_option' => 'issue-invoice',
         'mark_invoice_paid' => 1,
         'gateway_id' => 5,
-    ]))->toThrow(FOSSBilling\InformationException::class, 'Transaction ID is required when using the Custom payment gateway.');
+    ]))->toThrow(FOSSBilling\Core\Exception\InformationException::class, 'Transaction ID is required when using the Custom payment gateway.');
 });
 
 test('updates an order', function (): void {
@@ -364,7 +366,7 @@ test('throws exception when unsuspending non-suspended order', function (): void
 
     $data = [];
 
-    expect(fn () => $apiMock->unsuspend($data))->toThrow(FOSSBilling\Exception::class);
+    expect(fn () => $apiMock->unsuspend($data))->toThrow(FOSSBilling\Core\Exception\BaseException::class);
 });
 
 test('cancels an order', function (): void {
@@ -416,11 +418,7 @@ test('checks whether an order supports cancellation at period end', function ():
     $api->shouldReceive('_getOrder')->once()->andReturn($order);
 
     $subscriptionService = Mockery::mock(Box\Mod\Invoice\ServiceSubscription::class);
-    $legacyOrder = new Model_ClientOrder();
-    $legacyOrder->loadBean(new Tests\Helpers\DummyBean(['id' => 1]));
-    $service = Mockery::mock(Service::class);
-    $service->shouldReceive('getLegacyOrder')->once()->with($order)->andReturn($legacyOrder);
-    $subscriptionService->shouldReceive('canCancelAtPeriodEndForOrder')->once()->with($legacyOrder)->andReturn(true);
+    $subscriptionService->shouldReceive('canCancelAtPeriodEndForOrder')->once()->with($order)->andReturn(true);
 
     $staffService = Mockery::mock(Box\Mod\Staff\Service::class);
     $staffService->shouldReceive('checkPermissionsAndThrowException')->once()->andReturn(true);
@@ -428,7 +426,7 @@ test('checks whether an order supports cancellation at period end', function ():
     $di = container();
     $di['mod_service'] = $di->protect(fn (string $module) => strtolower($module) === 'staff' ? $staffService : $subscriptionService);
     $api->setDi($di);
-    $api->setService($service);
+    $api->setService(Mockery::mock(Service::class));
 
     expect($api->can_cancel_at_period_end(['id' => 1]))->toBeTrue();
 });
@@ -465,7 +463,7 @@ test('throws exception when uncanceling non-canceled order', function (): void {
 
     $data = [];
 
-    expect(fn () => $apiMock->uncancel($data))->toThrow(FOSSBilling\Exception::class);
+    expect(fn () => $apiMock->uncancel($data))->toThrow(FOSSBilling\Core\Exception\BaseException::class);
 });
 
 test('deletes an order', function (): void {
@@ -543,6 +541,20 @@ test('batch cancels suspended orders', function (): void {
     expect($result)->toBeTrue();
 });
 
+test('batch cancels unpaid orders', function (): void {
+    $api = apiEndpoint(new Admin());
+
+    $serviceMock = Mockery::mock(Service::class);
+    $serviceMock->shouldReceive('batchCancelUnpaid')->atLeast()->once()->andReturn(true);
+
+    $api->setService($serviceMock);
+
+    $data = [];
+    $result = $api->batch_cancel_unpaid($data);
+
+    expect($result)->toBeTrue();
+});
+
 test('updates order config', function (): void {
     $order = createEntity(Box\Mod\Order\Entity\Order::class);
 
@@ -575,7 +587,7 @@ test('throws exception when config is not set', function (): void {
 
     $data = [];
 
-    expect(fn () => $apiMock->update_config($data))->toThrow(FOSSBilling\Exception::class);
+    expect(fn () => $apiMock->update_config($data))->toThrow(FOSSBilling\Core\Exception\BaseException::class);
 });
 
 test('gets order service', function (): void {
@@ -588,8 +600,7 @@ test('gets order service', function (): void {
     $serviceMock = Mockery::mock(Service::class);
     $serviceMock->shouldReceive('getOrderServiceData')->atLeast()->once()->andReturn([]);
 
-    $admin = new Model_Admin();
-    $admin->loadBean(new Tests\Helpers\DummyBean(['id' => 1]));
+    $admin = \Tests\Helpers\admin(['id' => 1]);
 
     $apiMock->setService($serviceMock);
     $apiMock->setIdentity($admin);
@@ -610,7 +621,7 @@ test('gets order status history', function (): void {
     $serviceMock = Mockery::mock(Service::class);
     $serviceMock->shouldReceive('getOrderStatusSearchQuery')->atLeast()->once()->andReturn(['query', []]);
 
-    $paginatorMock = Mockery::mock(FOSSBilling\Pagination::class);
+    $paginatorMock = Mockery::mock(FOSSBilling\Core\Pagination\Service::class);
     $paginatorMock->shouldReceive('getPaginatedResultSet')->atLeast()->once()->andReturn([]);
 
     $di = container();
@@ -739,3 +750,171 @@ test('batch deletes orders', function (): void {
 
     expect($result)->toBeTrue();
 });
+
+test('export_csv requires both view and export permissions', function (): void {
+    $api = apiEndpoint(new Admin());
+
+    $serviceMock = Mockery::mock(Service::class);
+    $serviceMock->shouldReceive('exportCSV')->never();
+
+    $di = container();
+    $staffServiceMock = $di['mod_service']('staff');
+    $staffServiceMock->shouldReceive('checkPermissionsAndThrowException')->byDefault()->andReturn(true);
+    $staffServiceMock->shouldReceive('checkPermissionsAndThrowException')
+        ->once()
+        ->with('order', 'view', null, Mockery::any())
+        ->andThrow(new FOSSBilling\Core\Exception\InformationException('You need the "order.view" permission to perform this action', [], 403));
+
+    $api->setDi($di);
+    $api->setService($serviceMock);
+
+    expect(fn () => $api->export_csv(['headers' => ['id']]))
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class);
+});
+
+test('export_csv delegates to service when permissions granted', function (): void {
+    $api = apiEndpoint(new Admin());
+
+    $response = new Symfony\Component\HttpFoundation\Response('id,status', 200, ['Content-Type' => 'text/csv']);
+    $serviceMock = Mockery::mock(Service::class);
+    $serviceMock->shouldReceive('exportCSV')
+        ->once()
+        ->with(['id'])
+        ->andReturn($response);
+
+    $di = container();
+    $staffServiceMock = $di['mod_service']('staff');
+    $staffServiceMock->shouldReceive('checkPermissionsAndThrowException')
+        ->once()
+        ->with('order', 'view', null, Mockery::any())
+        ->andReturn(true)
+        ->ordered();
+    $staffServiceMock->shouldReceive('checkPermissionsAndThrowException')
+        ->once()
+        ->with('order', 'export', null, Mockery::any())
+        ->andReturn(true)
+        ->ordered();
+
+    $api->setDi($di);
+    $api->setService($serviceMock);
+
+    $result = $api->export_csv(['headers' => ['id']]);
+
+    expect($result)->toBeInstanceOf(Symfony\Component\HttpFoundation\Response::class);
+});
+
+test('rejects order create with promo when product promo permission is missing', function (): void {
+    $api = apiEndpoint(new Admin());
+
+    $serviceMock = Mockery::mock(Service::class);
+    $serviceMock->shouldReceive('createOrder')->never();
+
+    $staffServiceMock = Mockery::mock(Box\Mod\Staff\Service::class);
+    $staffServiceMock->shouldReceive('hasPermission')->byDefault()->andReturn(true);
+    $staffServiceMock->shouldReceive('checkPermissionsAndThrowException')
+        ->byDefault()
+        ->andReturn(true);
+    $staffServiceMock->shouldReceive('checkPermissionsAndThrowException')
+        ->once()
+        ->with('product', 'manage_promos', null, Mockery::any())
+        ->andThrow(new FOSSBilling\Core\Exception\InformationException('Denied', [], 403));
+
+    $di = container();
+    $di['mod_service'] = $di->protect(fn (string $name): Mockery\MockInterface => match (strtolower($name)) {
+        'staff' => $staffServiceMock,
+        default => Mockery::mock()->shouldIgnoreMissing(),
+    });
+
+    $api->setDi($di);
+    $api->setService($serviceMock);
+
+    expect(fn () => $api->create([
+        'client_id' => 1,
+        'product_id' => 1,
+        'promo_code' => 'ADMIN10',
+    ]))->toThrow(FOSSBilling\Core\Exception\InformationException::class);
+});
+
+test('batch processes cancellation requests', function (): void {
+    $api = apiEndpoint(new Admin());
+
+    $cancelService = Mockery::mock(Box\Mod\Order\ServiceCancelRequest::class);
+    $cancelService->shouldReceive('runAutoProcess')->once()->andReturn(true);
+
+    $di = container();
+    $di['mod_service'] = $di->protect(Tests\Helpers\moduleService(['order:cancelrequest' => $cancelService]));
+    $api->setDi($di);
+
+    expect($api->batch_process_cancel_requests([]))->toBeTrue();
+});
+
+test('lists waiting cancellation requests', function (): void {
+    $api = apiEndpoint(new Admin());
+
+    $cancelService = Mockery::mock(Box\Mod\Order\ServiceCancelRequest::class);
+    $cancelService->shouldReceive('pendingList')->once()->andReturn([['id' => 1]]);
+
+    $di = container();
+    $di['mod_service'] = $di->protect(Tests\Helpers\moduleService(['order:cancelrequest' => $cancelService]));
+    $api->setDi($di);
+
+    expect($api->cancel_request_list([]))->toBe([['id' => 1]]);
+});
+
+test('gets a waiting cancellation request', function (): void {
+    $order = createEntity(Box\Mod\Order\Entity\Order::class);
+    $request = createEntity(Box\Mod\Order\Entity\ClientOrderCancelRequest::class, ['id' => 3]);
+
+    $apiMock = apiEndpoint(Mockery::mock(Admin::class)->makePartial());
+    $apiMock->shouldAllowMockingProtectedMethods();
+    $apiMock->shouldReceive('_getOrder')->once()->andReturn($order);
+
+    $cancelService = Mockery::mock(Box\Mod\Order\ServiceCancelRequest::class);
+    $cancelService->shouldReceive('pending')->once()->with($order)->andReturn($request);
+    $cancelService->shouldReceive('toApiArray')->once()->with($request)->andReturn(['id' => 3]);
+
+    $di = container();
+    $di['mod_service'] = $di->protect(Tests\Helpers\moduleService(['order:cancelrequest' => $cancelService]));
+    $apiMock->setDi($di);
+
+    expect($apiMock->cancel_request_get(['id' => 1]))->toBe(['id' => 3]);
+});
+
+test('accepts and stops a cancellation request', function (): void {
+    $api = apiEndpoint(new Admin());
+
+    $cancelService = Mockery::mock(Box\Mod\Order\ServiceCancelRequest::class);
+    $cancelService->shouldReceive('accept')->once()->with(3)->andReturnNull();
+    $cancelService->shouldReceive('stop')->once()->with(4)->andReturnNull();
+
+    $di = container();
+    $di['mod_service'] = $di->protect(Tests\Helpers\moduleService(['order:cancelrequest' => $cancelService]));
+    $api->setDi($di);
+
+    expect($api->cancel_request_accept(['id' => 3]))->toBeTrue();
+    expect($api->cancel_request_stop(['id' => 4]))->toBeTrue();
+});
+
+test('runs the cancellation request cron batch', function (): void {
+    $api = apiEndpoint(new Admin());
+
+    $cancelService = Mockery::mock(Box\Mod\Order\ServiceCancelRequest::class);
+    $cancelService->shouldReceive('runAutoProcess')->once()->andReturn(true);
+
+    $di = container();
+    $di['mod_service'] = $di->protect(Tests\Helpers\moduleService(['order:cancelrequest' => $cancelService]));
+    $api->setDi($di);
+
+    expect($api->batch_process_cancel_requests([]))->toBeTrue();
+});
+
+test('cancellation actions reject malformed request ids before invoking the service', function (mixed $id): void {
+    $api = apiEndpoint(new Admin());
+    $cancel = Mockery::mock(Box\Mod\Order\ServiceCancelRequest::class);
+    $cancel->shouldNotReceive('accept', 'stop');
+    $di = container();
+    $di['mod_service'] = $di->protect(Tests\Helpers\moduleService(['order:cancelrequest' => $cancel]));
+    $api->setDi($di);
+    expect(fn () => $api->cancel_request_accept(['id' => $id]))->toThrow(FOSSBilling\Core\Exception\InformationException::class, 'A positive cancellation request ID is required.')
+        ->and(fn () => $api->cancel_request_stop(['id' => $id]))->toThrow(FOSSBilling\Core\Exception\InformationException::class, 'A positive cancellation request ID is required.');
+})->with([[true], [false], [0], [-1], [1.5], ['bad'], [[]], [null], ['99999999999999999999999999']]);

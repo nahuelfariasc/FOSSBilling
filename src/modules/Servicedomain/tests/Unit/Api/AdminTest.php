@@ -10,6 +10,8 @@
 
 declare(strict_types=1);
 
+use Box\Mod\Order\Entity\Order;
+use Box\Mod\Order\Repository\OrderRepository;
 use Box\Mod\Order\Service as OrderService;
 use Box\Mod\Servicedomain\Api\Admin;
 use Box\Mod\Servicedomain\Entity\ServiceDomain;
@@ -18,10 +20,12 @@ use Box\Mod\Servicedomain\Entity\TldRegistrar;
 use Box\Mod\Servicedomain\Repository\TldRegistrarRepository;
 use Box\Mod\Servicedomain\Service;
 use Doctrine\ORM\EntityManagerInterface;
-use FOSSBilling\Pagination;
-use FOSSBilling\PaginationOptions;
+use FOSSBilling\Core\Pagination\Options as PaginationOptions;
+use FOSSBilling\Core\Pagination\Service as PaginationService;
 
 use function Tests\Helpers\container;
+use function Tests\Helpers\createEntity;
+use function Tests\Helpers\setEntityId;
 
 test('updates domain', function (): void {
     $adminApi = apiEndpoint(new Admin());
@@ -138,6 +142,54 @@ test('disables privacy protection', function (): void {
     expect($result)->toBeTrue();
 });
 
+test('synchronizes domain with registrar', function (): void {
+    $adminApi = apiEndpoint(new Admin());
+    $api = apiEndpoint(new Admin());
+    $model = new ServiceDomain();
+
+    $adminApiMock = apiEndpoint(Mockery::mock(Admin::class)->makePartial()->shouldAllowMockingProtectedMethods());
+    $adminApiMock->shouldReceive('_getService')
+        ->atLeast()->once()
+        ->andReturn($model);
+
+    $serviceMock = Mockery::mock(Service::class);
+    $serviceMock->shouldReceive('synchronizeDomain')
+        ->atLeast()->once()
+        ->with($model);
+
+    $adminApiMock->setService($serviceMock);
+
+    $data = [];
+    $result = $adminApiMock->sync($data);
+
+    expect($result)->toBeTrue();
+});
+
+test('throws exception when synchronizing domain without order_id', function (): void {
+    $adminApi = apiEndpoint(new Admin());
+    $api = apiEndpoint(new Admin());
+    $dispatcher = new FOSSBilling\Core\Api\Dispatcher();
+
+    expect(fn () => $dispatcher->validateRequiredParams($adminApi, 'sync', []))
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class);
+});
+
+test('requires order_id on domain management endpoints', function ($method): void {
+    $adminApi = apiEndpoint(new Admin());
+    $dispatcher = new FOSSBilling\Core\Api\Dispatcher();
+
+    expect(fn () => $dispatcher->validateRequiredParams($adminApi, $method, []))
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class, 'Order ID is missing');
+})->with([
+    'update_nameservers',
+    'update_contacts',
+    'enable_privacy_protection',
+    'disable_privacy_protection',
+    'get_transfer_code',
+    'lock',
+    'unlock',
+]);
+
 test('gets transfer code', function (): void {
     $adminApi = apiEndpoint(new Admin());
     $api = apiEndpoint(new Admin());
@@ -211,7 +263,7 @@ test('gets tld list', function (): void {
     $adminApi = apiEndpoint(new Admin());
     $api = apiEndpoint(new Admin());
     $query = Mockery::mock(Doctrine\ORM\QueryBuilder::class);
-    $paginatorMock = Mockery::mock(Pagination::class);
+    $paginatorMock = Mockery::mock(PaginationService::class);
     $paginatorMock->shouldReceive('paginateMappedQuery')
         ->atLeast()->once()
         ->with($query, Mockery::type(PaginationOptions::class), Mockery::type('callable'))
@@ -276,7 +328,7 @@ test('throws exception when getting tld not found', function (): void {
     ];
 
     expect(fn () => $adminApi->tld_get($data))
-        ->toThrow(FOSSBilling\InformationException::class);
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class);
 });
 
 test('deletes tld', function (): void {
@@ -347,7 +399,7 @@ test('prevents deleting a tld used by a legacy uppercase domain row', function (
     $adminApi->setService($serviceMock);
 
     expect(fn () => $adminApi->tld_delete(['tld' => '.COM.']))
-        ->toThrow(FOSSBilling\InformationException::class, 'TLD is used by 1 domains');
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class, 'TLD is used by 1 domains');
 });
 
 test('throws exception when deleting tld not found', function (): void {
@@ -373,7 +425,7 @@ test('throws exception when deleting tld not found', function (): void {
     ];
 
     expect(fn () => $adminApi->tld_delete($data))
-        ->toThrow(FOSSBilling\InformationException::class);
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class);
 });
 
 test('creates tld', function (): void {
@@ -420,7 +472,7 @@ test('throws exception when creating already registered tld', function (): void 
     ];
 
     expect(fn () => $adminApi->tld_create($data))
-        ->toThrow(FOSSBilling\InformationException::class);
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class);
 });
 
 test('updates tld', function (): void {
@@ -465,14 +517,14 @@ test('throws exception when updating tld not found', function (): void {
     ];
 
     expect(fn () => $adminApi->tld_update($data))
-        ->toThrow(FOSSBilling\Exception::class);
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class);
 });
 
 test('gets registrar list', function (): void {
     $adminApi = apiEndpoint(new Admin());
     $api = apiEndpoint(new Admin());
     $query = Mockery::mock(Doctrine\ORM\QueryBuilder::class);
-    $paginatorMock = Mockery::mock(Pagination::class);
+    $paginatorMock = Mockery::mock(PaginationService::class);
     $paginatorMock->shouldReceive('paginateMappedQuery')
         ->atLeast()->once()
         ->with($query, Mockery::type(PaginationOptions::class), Mockery::type('callable'))
@@ -575,23 +627,23 @@ test('throws exception when installing unavailable registrar', function (): void
     ];
 
     expect(fn () => $adminApi->registrar_install($data))
-        ->toThrow(FOSSBilling\Exception::class);
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class);
 });
 
 test('throws exception when deleting registrar without id', function (): void {
     $adminApi = apiEndpoint(new Admin());
     $api = apiEndpoint(new Admin());
-    $dispatcher = new FOSSBilling\Api\Dispatcher();
+    $dispatcher = new FOSSBilling\Core\Api\Dispatcher();
 
     expect(fn () => $dispatcher->validateRequiredParams($adminApi, 'registrar_delete', []))
-        ->toThrow(FOSSBilling\InformationException::class);
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class);
 });
 
 test('copies registrar', function (): void {
     $adminApi = apiEndpoint(new Admin());
     $api = apiEndpoint(new Admin());
     $registrar = new TldRegistrar();
-    $registrar->setId(1);
+    setEntityId($registrar, 1);
 
     $trRepo = Mockery::mock(TldRegistrarRepository::class);
     $trRepo->shouldReceive('find')
@@ -612,7 +664,7 @@ test('copies registrar', function (): void {
         ->andReturn(1);
 
     $di = container();
-    $di['validator'] = new FOSSBilling\Validate();
+    $di['validator'] = new FOSSBilling\Core\Validation\Validator();
     $di['em'] = $emMock;
 
     $adminApi->setDi($di);
@@ -629,17 +681,17 @@ test('copies registrar', function (): void {
 test('throws exception when copying registrar without id', function (): void {
     $adminApi = apiEndpoint(new Admin());
     $api = apiEndpoint(new Admin());
-    $dispatcher = new FOSSBilling\Api\Dispatcher();
+    $dispatcher = new FOSSBilling\Core\Api\Dispatcher();
 
     expect(fn () => $dispatcher->validateRequiredParams($adminApi, 'registrar_copy', []))
-        ->toThrow(FOSSBilling\InformationException::class);
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class);
 });
 
 test('gets registrar', function (): void {
     $adminApi = apiEndpoint(new Admin());
     $api = apiEndpoint(new Admin());
     $registrar = new TldRegistrar();
-    $registrar->setId(1);
+    setEntityId($registrar, 1);
 
     $trRepo = Mockery::mock(TldRegistrarRepository::class);
     $trRepo->shouldReceive('find')
@@ -661,7 +713,7 @@ test('gets registrar', function (): void {
 
     $di = container();
     $di['em'] = $emMock;
-    $di['validator'] = new FOSSBilling\Validate();
+    $di['validator'] = new FOSSBilling\Core\Validation\Validator();
 
     $adminApi->setDi($di);
     $adminApi->setService($serviceMock);
@@ -684,17 +736,17 @@ test('throws exception when getting registrar without id', function (): void {
         ->never();
 
     $di = container();
-    $di['validator'] = new FOSSBilling\Validate();
+    $di['validator'] = new FOSSBilling\Core\Validation\Validator();
 
     $adminApi->setDi($di);
     $adminApi->setService($serviceMock);
 
     $data = [];
 
-    $dispatcher = new FOSSBilling\Api\Dispatcher();
+    $dispatcher = new FOSSBilling\Core\Api\Dispatcher();
 
     expect(fn () => $dispatcher->validateRequiredParams($adminApi, 'registrar_get', []))
-        ->toThrow(FOSSBilling\InformationException::class);
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class);
 });
 
 test('batch syncs expiration dates', function (): void {
@@ -716,7 +768,7 @@ test('updates registrar', function (): void {
     $adminApi = apiEndpoint(new Admin());
     $api = apiEndpoint(new Admin());
     $registrar = new TldRegistrar();
-    $registrar->setId(1);
+    setEntityId($registrar, 1);
 
     $trRepo = Mockery::mock(TldRegistrarRepository::class);
     $trRepo->shouldReceive('find')
@@ -738,7 +790,7 @@ test('updates registrar', function (): void {
 
     $di = container();
     $di['em'] = $emMock;
-    $di['validator'] = new FOSSBilling\Validate();
+    $di['validator'] = new FOSSBilling\Core\Validation\Validator();
 
     $adminApi->setDi($di);
     $adminApi->setService($serviceMock);
@@ -761,17 +813,17 @@ test('throws exception when updating registrar without id', function (): void {
         ->never();
 
     $di = container();
-    $di['validator'] = new FOSSBilling\Validate();
+    $di['validator'] = new FOSSBilling\Core\Validation\Validator();
 
     $adminApi->setDi($di);
     $adminApi->setService($serviceMock);
 
     $data = [];
 
-    $dispatcher = new FOSSBilling\Api\Dispatcher();
+    $dispatcher = new FOSSBilling\Core\Api\Dispatcher();
 
     expect(fn () => $dispatcher->validateRequiredParams($adminApi, 'registrar_update', []))
-        ->toThrow(FOSSBilling\InformationException::class);
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class);
 });
 
 test('gets service', function (): void {
@@ -784,10 +836,10 @@ test('gets service', function (): void {
 
     $adminApi->setService($serviceMock);
 
-    $dbMock = Mockery::mock('\Box_Database');
-    $dbMock->shouldReceive('getExistingModelById')
+    $orderRepoMock = Mockery::mock(OrderRepository::class);
+    $orderRepoMock->shouldReceive('find')
         ->atLeast()->once()
-        ->andReturn(new Model_ClientOrder());
+        ->andReturn(createEntity(Order::class));
 
     $orderServiceMock = Mockery::mock(OrderService::class);
     $orderServiceMock->shouldReceive('getOrderService')
@@ -799,9 +851,9 @@ test('gets service', function (): void {
         ->with('servicedomain', 'manage_domains', Mockery::any(), Mockery::any());
 
     $di = container();
-    $di['db'] = $dbMock;
+    $di['em']->shouldReceive('getRepository')->with(Order::class)->andReturn($orderRepoMock);
     $di['mod_service'] = $di->protect(fn (string $name = ''): Mockery\MockInterface => strtolower($name) === 'staff' ? $staffServiceMock : $orderServiceMock);
-    $di['validator'] = new FOSSBilling\Validate();
+    $di['validator'] = new FOSSBilling\Core\Validation\Validator();
 
     $adminApi->setDi($di);
 
@@ -822,10 +874,6 @@ test('throws exception when getting service without order_id', function (): void
 
     $adminApi->setService($serviceMock);
 
-    $dbMock = Mockery::mock('\Box_Database');
-    $dbMock->shouldReceive('load')
-        ->never();
-
     $orderServiceMock = Mockery::mock(OrderService::class);
     $orderServiceMock->shouldReceive('getOrderService')
         ->never();
@@ -834,18 +882,18 @@ test('throws exception when getting service without order_id', function (): void
         ->never();
 
     $di = container();
-    $di['db'] = $dbMock;
+    $di['em']->shouldReceive('getConnection')->never();
     $di['mod_service'] = $di->protect(fn (string $name = ''): Mockery\MockInterface => strtolower($name) === 'staff' ? $staffServiceMock : $orderServiceMock);
-    $di['validator'] = new FOSSBilling\Validate();
+    $di['validator'] = new FOSSBilling\Core\Validation\Validator();
 
     $adminApi->setDi($di);
 
     $data = [];
 
-    $dispatcher = new FOSSBilling\Api\Dispatcher();
+    $dispatcher = new FOSSBilling\Core\Api\Dispatcher();
 
     expect(fn () => $dispatcher->validateRequiredParams($adminApi, 'update', []))
-        ->toThrow(FOSSBilling\InformationException::class);
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class);
 });
 
 test('throws exception when getting service for not activated order', function (): void {
@@ -857,10 +905,10 @@ test('throws exception when getting service for not activated order', function (
 
     $adminApi->setService($serviceMock);
 
-    $dbMock = Mockery::mock('\Box_Database');
-    $dbMock->shouldReceive('getExistingModelById')
+    $orderRepoMock = Mockery::mock(OrderRepository::class);
+    $orderRepoMock->shouldReceive('find')
         ->atLeast()->once()
-        ->andReturn(new Model_ClientOrder());
+        ->andReturn(createEntity(Order::class));
 
     $orderServiceMock = Mockery::mock(OrderService::class);
     $orderServiceMock->shouldReceive('getOrderService')
@@ -872,9 +920,9 @@ test('throws exception when getting service for not activated order', function (
         ->with('servicedomain', 'manage_domains', Mockery::any(), Mockery::any());
 
     $di = container();
-    $di['db'] = $dbMock;
+    $di['em']->shouldReceive('getRepository')->with(Order::class)->andReturn($orderRepoMock);
     $di['mod_service'] = $di->protect(fn (string $name = ''): Mockery\MockInterface => strtolower($name) === 'staff' ? $staffServiceMock : $orderServiceMock);
-    $di['validator'] = new FOSSBilling\Validate();
+    $di['validator'] = new FOSSBilling\Core\Validation\Validator();
 
     $adminApi->setDi($di);
 
@@ -883,5 +931,5 @@ test('throws exception when getting service for not activated order', function (
     ];
 
     expect(fn () => $adminApi->update($data))
-        ->toThrow(FOSSBilling\Exception::class);
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class);
 });

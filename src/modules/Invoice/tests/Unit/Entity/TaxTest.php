@@ -15,10 +15,12 @@ use Doctrine\DBAL\DriverManager;
 use Doctrine\ORM\EntityManager;
 use Doctrine\ORM\ORMSetup;
 
+use function Tests\Helpers\setEntityId;
+
 test('maps tax table without changing columns', function (): void {
     $config = ORMSetup::createAttributeMetadataConfig([dirname(__DIR__, 3) . '/Entity'], true);
     $config->setProxyDir(sys_get_temp_dir());
-    $config->setProxyNamespace('FOSSBilling\\Tests\\DoctrineProxies');
+    $config->setProxyNamespace('FOSSBilling\\Core\\Tests\\DoctrineProxies');
     $entityManager = new EntityManager(DriverManager::getConnection(['driver' => 'pdo_sqlite', 'memory' => true]), $config);
 
     $meta = $entityManager->getClassMetadata(Tax::class);
@@ -55,14 +57,14 @@ test('tax getters and setters round-trip values', function (): void {
 
 test('tax toApiArray matches the legacy RedBeanPHP toArray keys', function (): void {
     $entity = new Tax();
-    $entity->setId(5);
+    setEntityId($entity, 5);
     $entity->setLevel(1);
     $entity->setName('VAT');
     $entity->setCountry('US');
     $entity->setState('CA');
     $entity->setTaxrate('8.25');
-    $entity->setCreatedAt(new DateTime('2026-01-02 03:04:05'));
-    $entity->setUpdatedAt(new DateTime('2026-01-02 03:04:05'));
+    $entity->setCreatedAt(new DateTimeImmutable('2026-01-02 03:04:05'));
+    $entity->setUpdatedAt(new DateTimeImmutable('2026-01-02 03:04:05'));
 
     expect($entity->toApiArray())->toBe([
         'id' => 5,

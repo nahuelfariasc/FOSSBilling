@@ -14,6 +14,21 @@ use function Tests\Helpers\container;
 use function Tests\Helpers\createEntity;
 use function Tests\Helpers\moduleService;
 
+function staffGuestTestEventDispatcher(): object
+{
+    return new class {
+        /** @var list<FOSSBilling\Core\Events\Event> */
+        public array $dispatched = [];
+
+        public function dispatch(FOSSBilling\Core\Events\Event $event): FOSSBilling\Core\Events\Event
+        {
+            $this->dispatched[] = $event;
+
+            return $event;
+        }
+    };
+}
+
 test('get di', function (): void {
     $api = apiEndpoint(new Box\Mod\Staff\Api\Guest());
     $di = container();
@@ -26,10 +41,10 @@ test('login without email', function (): void {
     $api = apiEndpoint(new Box\Mod\Staff\Api\Guest());
     $guestApi = apiEndpoint(new Box\Mod\Staff\Api\Guest());
 
-    $dispatcher = new FOSSBilling\Api\Dispatcher();
+    $dispatcher = new FOSSBilling\Core\Api\Dispatcher();
 
     expect(fn () => $dispatcher->validateRequiredParams($guestApi, 'login', ['email' => null, 'password' => 'pass']))
-        ->toThrow(FOSSBilling\InformationException::class);
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class);
 });
 
 test('login without password', function (): void {
@@ -37,15 +52,96 @@ test('login without password', function (): void {
     $guestApi = apiEndpoint(new Box\Mod\Staff\Api\Guest());
 
     $di = container();
-    $di['validator'] = new FOSSBilling\Validate();
+    $di['validator'] = new FOSSBilling\Core\Validation\Validator();
 
     $guestApi->setDi($di);
-    expect(fn () => $guestApi->login(['email' => 'email@domain.com']))->toThrow(FOSSBilling\Exception::class);
+    expect(fn () => $guestApi->login(['email' => 'email@domain.com']))->toThrow(FOSSBilling\Core\Exception\BaseException::class);
+});
+
+test('password reset requires an email', function (): void {
+    $dispatcher = new FOSSBilling\Core\Api\Dispatcher();
+    $guestApi = new Box\Mod\Staff\Api\Guest();
+
+    expect(fn () => $dispatcher->validateRequiredParams($guestApi, 'passwordreset', []))
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class, 'Email required');
+});
+
+test('password reset request dispatches only IP metadata before email validation', function (): void {
+    $guestApi = apiEndpoint(new Box\Mod\Staff\Api\Guest());
+    $modMock = Mockery::mock('\\' . FOSSBilling\Core\Module::class);
+    $modMock->shouldReceive('getConfig')->once()->andReturn([]);
+
+    $eventDispatcher = staffGuestTestEventDispatcher();
+
+    $rateLimiter = Mockery::mock(FOSSBilling\Core\Security\RateLimiter::class);
+    $rateLimiter->shouldReceive('consume')
+        ->once()
+        ->with('staff_password_reset_ip', '192.0.2.11')
+        ->andReturnUsing(function () use ($eventDispatcher): FOSSBilling\Core\Security\RateLimitResult {
+            expect($eventDispatcher->dispatched)->toHaveCount(1);
+
+            return new FOSSBilling\Core\Security\RateLimitResult('staff_password_reset_ip', true, 5, 0);
+        });
+
+    $di = container();
+    $di['event_dispatcher'] = $eventDispatcher;
+    $di['rate_limiter'] = $rateLimiter;
+    $di['logger'] = new Tests\Helpers\TestLogger();
+
+    $guestApi->setModule($modMock);
+    $guestApi->setDi($di);
+    $guestApi->setIp('192.0.2.11');
+
+    expect($guestApi->passwordreset(['email' => 'private@example.com']))->toBeTrue();
+    expect($eventDispatcher->dispatched)->toHaveCount(1);
+    expect($eventDispatcher->dispatched[0])->toEqual(new Box\Mod\Staff\Event\BeforeStaffPasswordResetRequestEvent('192.0.2.11'));
+    expect(get_object_vars($eventDispatcher->dispatched[0]))->toBe(['ip' => '192.0.2.11']);
+});
+
+test('password reset confirmation dispatches before required-field validation', function (): void {
+    $guestApi = apiEndpoint(new Box\Mod\Staff\Api\Guest());
+    $modMock = Mockery::mock('\\' . FOSSBilling\Core\Module::class);
+    $modMock->shouldReceive('getConfig')->once()->andReturn([]);
+
+    $eventDispatcher = staffGuestTestEventDispatcher();
+    $rateLimiter = Mockery::mock(FOSSBilling\Core\Security\RateLimiter::class);
+    $rateLimiter->shouldReceive('consumeOrThrow')
+        ->once()
+        ->with('staff_password_reset_confirm_post_ip', '192.0.2.12')
+        ->andReturn(new FOSSBilling\Core\Security\RateLimitResult('staff_password_reset_confirm_post_ip', false, 5, 4));
+
+    $validator = Mockery::mock(FOSSBilling\Core\Validation\Validator::class);
+    $validator->shouldReceive('checkRequiredParamsForArray')->once()->andReturnUsing(function () use ($eventDispatcher): void {
+        expect($eventDispatcher->dispatched)->toHaveCount(1);
+        expect($eventDispatcher->dispatched[0])->toBeInstanceOf(Box\Mod\Staff\Event\BeforeStaffPasswordResetConfirmationEvent::class);
+
+        throw new FOSSBilling\Core\Exception\InformationException('Code required');
+    });
+
+    $di = container();
+    $di['event_dispatcher'] = $eventDispatcher;
+    $di['rate_limiter'] = $rateLimiter;
+    $di['validator'] = $validator;
+    $di['logger'] = new Tests\Helpers\TestLogger();
+
+    $guestApi->setModule($modMock);
+    $guestApi->setDi($di);
+    $guestApi->setIp('192.0.2.12');
+
+    expect(fn () => $guestApi->update_password([
+        'code' => 'private-reset-code',
+        'password' => 'private-password',
+        'password_confirm' => 'private-password',
+    ]))->toThrow(FOSSBilling\Core\Exception\InformationException::class, 'Code required');
+
+    expect($eventDispatcher->dispatched)->toHaveCount(1);
+    expect($eventDispatcher->dispatched[0])->toEqual(new Box\Mod\Staff\Event\BeforeStaffPasswordResetConfirmationEvent('192.0.2.12'));
+    expect(get_object_vars($eventDispatcher->dispatched[0]))->toBe(['ip' => '192.0.2.12']);
 });
 
 test('successful login', function (): void {
     $api = apiEndpoint(new Box\Mod\Staff\Api\Guest());
-    $modMock = Mockery::mock('\\' . FOSSBilling\Module::class);
+    $modMock = Mockery::mock('\\' . FOSSBilling\Core\Module::class);
     $modMock
     ->shouldReceive('getConfig')
     ->atLeast()->once()
@@ -57,19 +153,16 @@ test('successful login', function (): void {
     ->atLeast()->once()
     ->andReturn([]);
 
-    $sessionMock = Mockery::mock(FOSSBilling\Session::class);
+    $sessionMock = Mockery::mock(FOSSBilling\Core\Security\Session::class);
     $sessionMock->shouldReceive('delete')->atLeast()->once();
 
     $di = container();
 
-    $toolsMock = Mockery::mock(FOSSBilling\Tools::class);
-    $toolsMock->shouldReceive('validateAndSanitizeEmail')->atLeast()->once();
-    $di['tools'] = $toolsMock;
     $di['session'] = $sessionMock;
-    $di['validator'] = new FOSSBilling\Validate();
+    $di['validator'] = new FOSSBilling\Core\Validation\Validator();
 
     $guestApi = apiEndpoint(new Box\Mod\Staff\Api\Guest());
-    $guestApi->setMod($modMock);
+    $guestApi->setModule($modMock);
     $guestApi->setService($serviceMock);
     $guestApi->setDi($di);
     $result = $guestApi->login(['email' => 'email@domain.com', 'password' => 'pass']);
@@ -78,7 +171,7 @@ test('successful login', function (): void {
 
 test('login check ip exception', function (): void {
     $api = apiEndpoint(new Box\Mod\Staff\Api\Guest());
-    $modMock = Mockery::mock('\\' . FOSSBilling\Module::class);
+    $modMock = Mockery::mock('\\' . FOSSBilling\Core\Module::class);
     $configArr = [
         'allowed_ips' => '1.1.1.1' . PHP_EOL . '2.2.2.2',
         'check_ip' => true,
@@ -90,13 +183,10 @@ test('login check ip exception', function (): void {
 
     $di = container();
 
-    $toolsMock = Mockery::mock(FOSSBilling\Tools::class);
-    $toolsMock->shouldReceive('validateAndSanitizeEmail')->atLeast()->once();
-    $di['tools'] = $toolsMock;
-    $di['validator'] = new FOSSBilling\Validate();
+    $di['validator'] = new FOSSBilling\Core\Validation\Validator();
 
     $guestApi = apiEndpoint(new Box\Mod\Staff\Api\Guest());
-    $guestApi->setMod($modMock);
+    $guestApi->setModule($modMock);
     $guestApi->setDi($di);
     $ip = '192.168.0.1';
     $guestApi->setIp($ip);
@@ -106,57 +196,57 @@ test('login check ip exception', function (): void {
         'password' => 'pass',
     ];
     expect(fn () => $guestApi->login($data))
-        ->toThrow(FOSSBilling\Exception::class, 'You are not allowed to login to admin area from this IP address.');
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class, 'You are not allowed to login to admin area from this IP address.');
 });
 
 test('updatePassword invalidates existing sessions', function (): void {
     $guestApi = apiEndpoint(new Box\Mod\Staff\Api\Guest());
 
-    $modMock = Mockery::mock('\\' . FOSSBilling\Module::class);
+    $modMock = Mockery::mock('\\' . FOSSBilling\Core\Module::class);
     $modMock->shouldReceive('getConfig')->atLeast()->once()->andReturn([]);
 
-    $passwordReset = createEntity(Box\Mod\Staff\Entity\AdminPasswordReset::class, ['id' => 1, 'admin_id' => 1, 'created_at' => new DateTime('-300 seconds')]);
+    $admin = \Tests\Helpers\admin(['id' => 1, 'status' => Box\Mod\Staff\Entity\Admin::STATUS_ACTIVE]);
 
-    $admin = new Model_Admin();
-    $admin->loadBean(new Tests\Helpers\DummyBean());
-    $admin->id = 1;
-    $admin->status = Model_Admin::STATUS_ACTIVE;
+    $passwordReset = createEntity(Box\Mod\Staff\Entity\AdminPasswordReset::class, ['id' => 1, 'admin' => $admin, 'created_at' => new DateTimeImmutable('-300 seconds')]);
 
     $passwordResetRepository = Mockery::mock(Box\Mod\Staff\Repository\AdminPasswordResetRepository::class);
     $passwordResetRepository->shouldReceive('findOneByHash')->once()->with('hashedString')->andReturn($passwordReset);
 
-    $dbMock = Mockery::mock('\Box_Database');
-    $dbMock->shouldReceive('getExistingModelById')->atLeast()->once()->andReturn($admin);
-    $dbMock->shouldReceive('store')->atLeast()->once();
+    $eventDispatcher = staffGuestTestEventDispatcher();
 
-    $eventMock = Mockery::mock('\Box_EventManager');
-    $eventMock->shouldReceive('fire')->times(2);
-
-    $passwordMock = Mockery::mock(FOSSBilling\PasswordManager::class);
-    $passwordMock->shouldReceive('hashIt')->atLeast()->once();
+    $passwordMock = Mockery::mock(FOSSBilling\Core\Security\PasswordManager::class);
+    $passwordMock->shouldReceive('hashIt')->atLeast()->once()->andReturn('new-hash');
 
     $emailServiceMock = Mockery::mock(Box\Mod\Email\Service::class);
-    $emailServiceMock->shouldReceive('sendTemplate')->atLeast()->once();
+    $emailServiceMock->shouldReceive('sendTemplate')->once()->andReturnUsing(function () use ($eventDispatcher): void {
+        expect($eventDispatcher->dispatched)->toHaveCount(2);
+        expect($eventDispatcher->dispatched[1])->toBeInstanceOf(Box\Mod\Staff\Event\AfterStaffPasswordResetEvent::class);
+    });
 
     $profileServiceMock = Mockery::mock(Box\Mod\Profile\Service::class);
     $profileServiceMock->shouldReceive('invalidateSessions')->atLeast()->once();
 
     $di = container();
-    $di['db'] = $dbMock;
     $di['em']->shouldReceive('getRepository')->with(Box\Mod\Staff\Entity\AdminPasswordReset::class)->andReturn($passwordResetRepository);
-    $di['em']->shouldReceive('remove')->once()->with($passwordReset);
-    $di['em']->shouldReceive('flush')->atLeast()->once();
-    $di['events_manager'] = $eventMock;
+    $passwordResetRepository->shouldReceive('changePassword')->once()->with($admin, 'new-hash', 'hashedString');
+    $di['event_dispatcher'] = $eventDispatcher;
     $di['logger'] = new Tests\Helpers\TestLogger();
     $di['password'] = $passwordMock;
     $di['mod_service'] = $di->protect(moduleService(['email' => $emailServiceMock, 'profile' => $profileServiceMock]));
 
-    $guestApi->setMod($modMock);
+    $guestApi->setModule($modMock);
     $guestApi->setDi($di);
+    $guestApi->setIp('192.0.2.10');
 
     $guestApi->update_password([
         'code' => 'hashedString',
         'password' => 'NewPassword1',
         'password_confirm' => 'NewPassword1',
     ]);
+
+    expect($eventDispatcher->dispatched)->toHaveCount(2);
+    expect($eventDispatcher->dispatched[0])->toEqual(new Box\Mod\Staff\Event\BeforeStaffPasswordResetConfirmationEvent('192.0.2.10'));
+    expect(get_object_vars($eventDispatcher->dispatched[0]))->toBe(['ip' => '192.0.2.10']);
+    expect($eventDispatcher->dispatched[1])->toEqual(new Box\Mod\Staff\Event\AfterStaffPasswordResetEvent(1));
+    expect(get_object_vars($eventDispatcher->dispatched[1]))->toBe(['adminId' => 1]);
 });

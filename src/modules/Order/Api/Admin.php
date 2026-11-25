@@ -18,21 +18,18 @@ namespace Box\Mod\Order\Api;
 use Box\Mod\Client\Entity\Client as ClientEntity;
 use Box\Mod\Order\Entity\Order;
 use Box\Mod\Order\Repository\OrderRepository;
-use FOSSBilling\InformationException;
-use FOSSBilling\PaginationOptions;
-use FOSSBilling\Tools;
-use FOSSBilling\Validation\Api\RequiredParams;
+use FOSSBilling\Core\Exception\InformationException;
+use FOSSBilling\Core\Pagination\Options;
+use FOSSBilling\Core\Validation\Api\RequiredParams;
 use Symfony\Component\HttpFoundation\Response;
 
-class Admin extends \FOSSBilling\Api\AbstractApi
+class Admin extends \FOSSBilling\Core\Api\AbstractApi
 {
     private ?OrderRepository $orderRepository = null;
 
     protected function getOrderRepository(): OrderRepository
     {
-        if ($this->orderRepository === null) {
-            $this->orderRepository = $this->getDi()['em']->getRepository(Order::class);
-        }
+        $this->orderRepository ??= $this->getDi()['em']->getRepository(Order::class);
 
         return $this->orderRepository;
     }
@@ -57,6 +54,8 @@ class Admin extends \FOSSBilling\Api\AbstractApi
      *
      * @optional string $date_from - show only order places after this date
      * @optional string $date_to - show only order places till this date
+     * @optional string $sort - sort by one of: id, status, title, created_at, updated_at
+     * @optional string $direction - sort direction: ASC or DESC
      *
      * @return array
      */
@@ -68,7 +67,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
         $data['hide_addons'] = (isset($orderConfig['show_addons']) && $orderConfig['show_addons']) ? 0 : 1;
 
         [$sql, $params] = $this->getService()->getSearchQuery($data);
-        $resultSet = $this->getDi()['pager']->getPaginatedResultSet($sql, $params, PaginationOptions::fromArray($data));
+        $resultSet = $this->getDi()['pager']->getPaginatedResultSet($sql, $params, Options::fromArray($data));
 
         $resultSet['list'] = $this->getService()->getBatchForApi(
             array_column($resultSet['list'], 'id'),
@@ -94,6 +93,8 @@ class Admin extends \FOSSBilling\Api\AbstractApi
      * @optional string $transactionId - Custom transaction ID to use when the selected gateway is Custom
      * @optional string $created_at - date when order was created. Default: now
      * @optional string $updated_at - date when order was updated. Default: now
+     * @optional string $promo_code - promo code to apply to the order (takes precedence over promo_id)
+     * @optional int $promo_id - promo ID to apply to the order
      *
      * @return int
      */
@@ -105,7 +106,11 @@ class Admin extends \FOSSBilling\Api\AbstractApi
     {
         $this->checkPermissions('order', 'manage');
 
-        $markInvoicePaid = Tools::normalizeBoolean($data['mark_invoice_paid'] ?? false);
+        if ((isset($data['promo_code']) && trim((string) $data['promo_code']) !== '') || !empty($data['promo_id'])) {
+            $this->checkPermissions('product', 'manage_promos');
+        }
+
+        $markInvoicePaid = \FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($data['mark_invoice_paid'] ?? false);
         $data['mark_invoice_paid'] = $markInvoicePaid;
 
         if ($markInvoicePaid) {
@@ -138,6 +143,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
      * @optional string $notes - order notes
      * @optional array  $meta - list of meta properties
      * @optional int $suspension_grace_days - per-order grace period override; empty inherits the product setting
+     * @optional bool $merge_renewals - per-order renewal merge override: 1 to always merge, 0 to never merge, absent inherits the client preference then the global setting
      *
      * @return bool
      */
@@ -188,7 +194,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
      * Suspend order.
      *
      * @optional string $reason - Suspension reason message
-     * @optional bool $skip_event - Skip calling event hooks
+     * @optional bool $skip_event - Skip dispatching lifecycle events
      *
      * @return bool
      */
@@ -197,7 +203,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
         $this->checkPermissions('order', 'manage');
 
         $order = $this->_getOrder($data);
-        $skip_event = Tools::normalizeBoolean($data['skip_event'] ?? false);
+        $skip_event = \FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($data['skip_event'] ?? false);
 
         $reason = $data['reason'] ?? null;
 
@@ -224,7 +230,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
     /**
      * Cancel order.
      *
-     * @optional bool $skip_event - Skip calling event hooks
+     * @optional bool $skip_event - Skip dispatching lifecycle events
      * @optional bool $cancel_at_period_end - Keep the order active until its gateway subscription ends
      *
      * @return bool
@@ -234,8 +240,8 @@ class Admin extends \FOSSBilling\Api\AbstractApi
         $this->checkPermissions('order', 'manage');
 
         $order = $this->_getOrder($data);
-        $skip_event = Tools::normalizeBoolean($data['skip_event'] ?? false);
-        $cancelAtPeriodEnd = Tools::normalizeBoolean($data['cancel_at_period_end'] ?? false);
+        $skip_event = \FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($data['skip_event'] ?? false);
+        $cancelAtPeriodEnd = \FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($data['cancel_at_period_end'] ?? false);
 
         $reason = $data['reason'] ?? null;
 
@@ -244,6 +250,15 @@ class Admin extends \FOSSBilling\Api\AbstractApi
         }
 
         return $this->getService()->cancelFromOrder($order, $reason, $skip_event);
+    }
+
+    /** Resolve an interrupted scheduled cancellation after checking the service provider. */
+    #[RequiredParams(['id' => 'Order ID is missing', 'decision' => 'Review decision is missing'])]
+    public function review_scheduled_cancellation($data): bool
+    {
+        $this->checkPermissions('order', 'manage');
+
+        return $this->getService()->reviewScheduledCancellation($this->_getOrder($data), (string) $data['decision']);
     }
 
     /**
@@ -256,7 +271,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
         $order = $this->_getOrder($data);
         $subscriptionService = $this->getDi()['mod_service']('Invoice', 'Subscription');
 
-        return $subscriptionService->canCancelAtPeriodEndForOrder($this->getService()->getLegacyOrder($order));
+        return $subscriptionService->canCancelAtPeriodEndForOrder($order);
     }
 
     /**
@@ -280,6 +295,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
      * Delete order.
      *
      * @optional bool $delete_addons - Remove addons also. Default false.
+     * @optional bool $force_delete - remove the local service even if remote cancellation fails. Default false.
      *
      * @return bool
      */
@@ -288,8 +304,8 @@ class Admin extends \FOSSBilling\Api\AbstractApi
         $this->checkPermissions('order', 'manage');
 
         $order = $this->_getOrder($data);
-        $delete_addons = Tools::normalizeBoolean($data['delete_addons'] ?? false);
-        $forceDelete = Tools::normalizeBoolean($data['force_delete'] ?? false);
+        $delete_addons = \FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($data['delete_addons'] ?? false);
+        $forceDelete = \FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($data['force_delete'] ?? false);
 
         if ($delete_addons) {
             $list = $this->getService()->getOrderAddonsList($order);
@@ -339,6 +355,91 @@ class Admin extends \FOSSBilling\Api\AbstractApi
     }
 
     /**
+     * Remove pending-setup orders whose linked invoice has been unpaid past its due date for too long.
+     * Configure how many days an unpaid order should be kept before it is removed.
+     *
+     * @return bool
+     */
+    public function batch_cancel_unpaid($data)
+    {
+        $this->checkPermissions('order', 'manage');
+
+        return $this->getService()->batchCancelUnpaid();
+    }
+
+    /**
+     * Accept waiting cancellation requests when automatic processing is on.
+     *
+     * @return bool
+     */
+    public function batch_process_cancel_requests($data)
+    {
+        $this->checkPermissions('order', 'manage');
+
+        return $this->di['mod_service']('Order', 'CancelRequest')->runAutoProcess();
+    }
+
+    /**
+     * The waiting cancellation requests, oldest first.
+     *
+     * @return array
+     */
+    public function cancel_request_list($data)
+    {
+        $this->checkPermissions('order', 'view');
+
+        return $this->di['mod_service']('Order', 'CancelRequest')->pendingList();
+    }
+
+    /**
+     * The waiting cancellation request of an order, or null.
+     *
+     * @return array|null
+     */
+    public function cancel_request_get($data)
+    {
+        $this->checkPermissions('order', 'view');
+
+        $request = $this->di['mod_service']('Order', 'CancelRequest')->pending($this->_getOrder($data));
+
+        return $request === null ? null : $this->di['mod_service']('Order', 'CancelRequest')->toApiArray($request);
+    }
+
+    /**
+     * Accepts a cancellation request: the service is cancelled now or at the
+     * end of its period.
+     */
+    #[RequiredParams(['id' => 'Request ID was not passed'])]
+    public function cancel_request_accept($data): bool
+    {
+        $this->checkPermissions('order', 'manage');
+        $this->di['mod_service']('Order', 'CancelRequest')->accept($this->cancelRequestId($data['id'] ?? null));
+
+        return true;
+    }
+
+    /**
+     * Stops a cancellation request; the service is not cancelled.
+     */
+    #[RequiredParams(['id' => 'Request ID was not passed'])]
+    public function cancel_request_stop($data): bool
+    {
+        $this->checkPermissions('order', 'manage');
+        $this->di['mod_service']('Order', 'CancelRequest')->stop($this->cancelRequestId($data['id'] ?? null));
+
+        return true;
+    }
+
+    private function cancelRequestId(mixed $id): int
+    {
+        if ((!is_int($id) && !is_string($id)) || filter_var($id, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]) === false) {
+            throw new InformationException('A positive cancellation request ID is required.');
+        }
+
+        return (int) $id;
+    }
+
+    /**
      * Update order config.
      *
      * @return bool
@@ -352,7 +453,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
 
         $config = $data['config'] ?? null;
         if (!is_array($config)) {
-            throw new \FOSSBilling\Exception('Order config not passed');
+            throw new \FOSSBilling\Core\Exception\BaseException('Order config not passed');
         }
 
         return $this->getService()->updateOrderConfig($order, $config);
@@ -375,6 +476,9 @@ class Admin extends \FOSSBilling\Api\AbstractApi
     /**
      * Get paginated order statuses history list.
      *
+     * @optional string $sort - sort by one of: id, status, created_at
+     * @optional string $direction - sort direction: ASC or DESC
+     *
      * @return array
      */
     public function status_history_get_list($data)
@@ -387,7 +491,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
 
         [$sql, $bindings] = $this->getService()->getOrderStatusSearchQuery($data);
 
-        return $this->getDi()['pager']->getPaginatedResultSet($sql, $bindings, PaginationOptions::fromArray($data));
+        return $this->getDi()['pager']->getPaginatedResultSet($sql, $bindings, Options::fromArray($data));
     }
 
     /**
@@ -503,7 +607,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
     {
         $this->checkPermissions('order', 'manage');
 
-        $delete_addons = Tools::normalizeBoolean($data['delete_addons'] ?? false);
+        $delete_addons = \FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($data['delete_addons'] ?? false);
 
         foreach ($data['ids'] as $id) {
             $this->delete(['id' => $id, 'delete_addons' => $delete_addons]);
@@ -514,6 +618,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
 
     public function export_csv($data): Response
     {
+        $this->checkPermissions('order', 'view');
         $this->checkPermissions('order', 'export');
 
         $data['headers'] ??= [];

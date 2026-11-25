@@ -17,13 +17,16 @@ namespace Box\Mod\Client\Api;
 
 use Box\Mod\Client\Entity\Client as ClientEntity;
 use Box\Mod\Client\Entity\ClientBalance;
-use FOSSBilling\InformationException;
-use FOSSBilling\PaginationOptions;
+use FOSSBilling\Core\Exception\InformationException;
+use FOSSBilling\Core\Pagination\Options;
 
-class Client extends \FOSSBilling\Api\AbstractApi
+class Client extends \FOSSBilling\Core\Api\AbstractApi
 {
     /**
      * Get payments information.
+     *
+     * @optional string $sort - sort column: 'id', 'amount', 'description', 'created_at' or 'updated_at'
+     * @optional string $direction - sort direction: 'ASC' or 'DESC'
      *
      * @return array
      */
@@ -35,7 +38,7 @@ class Client extends \FOSSBilling\Api\AbstractApi
 
         return $this->getDi()['pager']->paginateMappedQuery(
             $service->getSearchQueryBuilder($data),
-            PaginationOptions::fromArray($data),
+            Options::fromArray($data),
             fn (ClientBalance $balance): array => $service->toApiArray($balance, $client),
         );
     }
@@ -47,9 +50,8 @@ class Client extends \FOSSBilling\Api\AbstractApi
      */
     public function balance_get_total()
     {
-        $service = $this->getDi()['mod_service']('Client', 'Balance');
-
-        return $service->getClientBalance($this->getClientEntity($this->getIdentity()));
+        // The spendable credit, without what is set aside for unpaid invoices.
+        return $this->getDi()['mod_service']('Invoice')->getFreeCredit((int) $this->getClientEntity($this->getIdentity())->getId());
     }
 
     public function is_taxable()
@@ -67,24 +69,19 @@ class Client extends \FOSSBilling\Api\AbstractApi
             return true;
         }
 
-        $this->getDi()['rate_limiter']->consumeOrThrow('client_email_verification_resend_ip', (string) $this->getIp());
+        $this->getDi()['rate_limiter']->consumeOrThrow('client_email_verification_resend_ip', $this->getIp());
         $clientId = $client->getId();
         $this->getDi()['rate_limiter']->consumeOrThrow('client_email_verification_resend_account', 'client:' . $clientId);
 
         return $this->getService()->sendEmailConfirmationForClient($client);
     }
 
-    private function getClientEntity(ClientEntity|\Model_Admin|\Model_Client|\Model_Guest $identity): ClientEntity
+    private function getClientEntity(object $identity): ClientEntity
     {
-        if ($identity instanceof ClientEntity) {
-            return $identity;
+        if (!$identity instanceof ClientEntity) {
+            throw new InformationException('Client identity not found');
         }
 
-        $client = $this->getDi()['em']->getRepository(ClientEntity::class)->find((int) $identity->id);
-        if (!$client instanceof ClientEntity) {
-            throw new InformationException('Client not found');
-        }
-
-        return $client;
+        return $identity;
     }
 }

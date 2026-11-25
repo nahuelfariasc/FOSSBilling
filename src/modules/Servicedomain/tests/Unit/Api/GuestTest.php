@@ -83,7 +83,7 @@ test('throws exception when getting pricing for tld not found', function (): voi
     $serviceMock->shouldReceive('tldToApiArray')
         ->never();
 
-    $validatorMock = Mockery::mock(FOSSBilling\Validate::class);
+    $validatorMock = Mockery::mock(FOSSBilling\Core\Validation\Validator::class);
 
     $di = container();
     $di['validator'] = $validatorMock;
@@ -95,7 +95,7 @@ test('throws exception when getting pricing for tld not found', function (): voi
     ];
 
     expect(fn () => $guestApi->pricing($data))
-        ->toThrow(FOSSBilling\InformationException::class);
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class);
 });
 
 test('checks domain availability', function (): void {
@@ -113,7 +113,7 @@ test('checks domain availability', function (): void {
 
     $guestApi->setService($serviceMock);
 
-    $validatorMock = Mockery::mock(FOSSBilling\Validate::class);
+    $validatorMock = Mockery::mock(FOSSBilling\Core\Validation\Validator::class);
     $validatorMock->shouldReceive('isSldValid')
         ->atLeast()->once()
         ->andReturn(true);
@@ -134,7 +134,7 @@ test('checks domain availability', function (): void {
 test('throws exception when checking sld not valid', function (): void {
     $guestApi = apiEndpoint(new Guest());
     $api = apiEndpoint(new Guest());
-    $validatorMock = Mockery::mock(FOSSBilling\Validate::class);
+    $validatorMock = Mockery::mock(FOSSBilling\Core\Validation\Validator::class);
     $validatorMock->shouldReceive('isSldValid')
         ->atLeast()->once()
         ->andReturn(false);
@@ -149,7 +149,22 @@ test('throws exception when checking sld not valid', function (): void {
     ];
 
     expect(fn (): bool => $guestApi->check($data))
-        ->toThrow(FOSSBilling\Exception::class);
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class);
+});
+
+test('invalid sld error carries the raw domain value', function (): void {
+    $guestApi = apiEndpoint(new Guest());
+    $validatorMock = Mockery::mock(FOSSBilling\Core\Validation\Validator::class);
+    $validatorMock->shouldReceive('isSldValid')
+        ->atLeast()->once()
+        ->andReturn(false);
+
+    $di = container();
+    $di['validator'] = $validatorMock;
+    $guestApi->setDi($di);
+
+    expect(fn (): bool => $guestApi->check(['tld' => '.com', 'sld' => 'ex&ample']))
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class, 'Domain ex&ample is invalid');
 });
 
 test('throws exception when checking tld not found', function (): void {
@@ -164,7 +179,7 @@ test('throws exception when checking tld not found', function (): void {
 
     $guestApi->setService($serviceMock);
 
-    $validatorMock = Mockery::mock(FOSSBilling\Validate::class);
+    $validatorMock = Mockery::mock(FOSSBilling\Core\Validation\Validator::class);
     $validatorMock->shouldReceive('isSldValid')
         ->atLeast()->once()
         ->andReturn(true);
@@ -179,7 +194,7 @@ test('throws exception when checking tld not found', function (): void {
     ];
 
     expect(fn (): bool => $guestApi->check($data))
-        ->toThrow(FOSSBilling\Exception::class);
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class);
 });
 
 test('throws exception when checking domain not available', function (): void {
@@ -197,7 +212,7 @@ test('throws exception when checking domain not available', function (): void {
 
     $guestApi->setService($serviceMock);
 
-    $validatorMock = Mockery::mock(FOSSBilling\Validate::class);
+    $validatorMock = Mockery::mock(FOSSBilling\Core\Validation\Validator::class);
     $validatorMock->shouldReceive('isSldValid')
         ->atLeast()->once()
         ->andReturn(true);
@@ -212,7 +227,7 @@ test('throws exception when checking domain not available', function (): void {
     ];
 
     expect(fn (): bool => $guestApi->check($data))
-        ->toThrow(FOSSBilling\Exception::class);
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class);
 });
 
 test('throws exception when checking an inactive tld', function (): void {
@@ -227,7 +242,7 @@ test('throws exception when checking an inactive tld', function (): void {
     $serviceMock->shouldReceive('isDomainAvailable')
         ->never();
 
-    $validatorMock = Mockery::mock(FOSSBilling\Validate::class);
+    $validatorMock = Mockery::mock(FOSSBilling\Core\Validation\Validator::class);
     $validatorMock->shouldReceive('isSldValid')
         ->once()
         ->andReturn(true);
@@ -238,7 +253,7 @@ test('throws exception when checking an inactive tld', function (): void {
     $guestApi->setService($serviceMock);
 
     expect(fn (): bool => $guestApi->check(['tld' => '.com', 'sld' => 'example']))
-        ->toThrow(FOSSBilling\InformationException::class, 'TLD is not active');
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class, 'TLD is not active');
 });
 
 test('checks if domain can be transferred', function (): void {
@@ -254,7 +269,7 @@ test('checks if domain can be transferred', function (): void {
         ->atLeast()->once()
         ->andReturn(true);
 
-    $validatorMock = Mockery::mock(FOSSBilling\Validate::class);
+    $validatorMock = Mockery::mock(FOSSBilling\Core\Validation\Validator::class);
 
     $di = container();
     $di['validator'] = $validatorMock;
@@ -281,7 +296,7 @@ test('throws exception when checking transfer for tld not found', function (): v
     $serviceMock->shouldReceive('canBeTransferred')
         ->never();
 
-    $validatorMock = Mockery::mock(FOSSBilling\Validate::class);
+    $validatorMock = Mockery::mock(FOSSBilling\Core\Validation\Validator::class);
 
     $di = container();
     $di['validator'] = $validatorMock;
@@ -294,7 +309,7 @@ test('throws exception when checking transfer for tld not found', function (): v
     ];
 
     expect(fn (): bool => $guestApi->can_be_transferred($data))
-        ->toThrow(FOSSBilling\Exception::class);
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class);
 });
 
 test('throws exception when checking domain cannot be transferred', function (): void {
@@ -310,7 +325,7 @@ test('throws exception when checking domain cannot be transferred', function ():
         ->atLeast()->once()
         ->andReturn(false);
 
-    $validatorMock = Mockery::mock(FOSSBilling\Validate::class);
+    $validatorMock = Mockery::mock(FOSSBilling\Core\Validation\Validator::class);
 
     $di = container();
     $di['validator'] = $validatorMock;
@@ -323,5 +338,5 @@ test('throws exception when checking domain cannot be transferred', function ():
     ];
 
     expect(fn (): bool => $guestApi->can_be_transferred($data))
-        ->toThrow(FOSSBilling\Exception::class);
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class);
 });

@@ -11,12 +11,13 @@ declare(strict_types=1);
 
 namespace Box\Mod\Extension\Api;
 
-use FOSSBilling\Validation\Api\RequiredParams;
+use FOSSBilling\Core\Enums\ExtensionType;
+use FOSSBilling\Core\Validation\Api\RequiredParams;
 
 /**
  * Extensions.
  */
-class Guest extends \FOSSBilling\Api\AbstractApi
+class Guest extends \FOSSBilling\Core\Api\AbstractApi
 {
     /**
      * Checks if extensions is available.
@@ -26,8 +27,16 @@ class Guest extends \FOSSBilling\Api\AbstractApi
     public function is_on($data)
     {
         $service = $this->getService();
+
+        // The 'module' key is canonical since manifest v1; 'mod' is accepted
+        // for pre-migration templates and third-party callers.
+        $module = $data['module'] ?? null;
+        if (!empty($module)) {
+            return $service->isExtensionActive(ExtensionType::Module->value, $module);
+        }
+
         if (isset($data['mod']) && !empty($data['mod'])) {
-            return $service->isExtensionActive('mod', $data['mod']);
+            return $service->isExtensionActive(ExtensionType::Module->value, $data['mod']);
         }
 
         if (isset($data['id']) && !empty($data['type'])) {
@@ -40,13 +49,19 @@ class Guest extends \FOSSBilling\Api\AbstractApi
     /**
      * Retrieve extension public settings.
      *
-     * @throws \FOSSBilling\Exception
+     * @throws \FOSSBilling\Core\Exception\BaseException
      */
     #[RequiredParams(['ext' => 'Parameter ext is missing'])]
     public function settings($data): array
     {
         $service = $this->getService();
-        $config = $service->getConfig($data['ext']);
+        $ext = $data['ext'];
+        $module = str_starts_with($ext, 'mod_') ? substr($ext, 4) : $ext;
+        if (!in_array($module, $service->getCoreAndActiveModules(), true)) {
+            return [];
+        }
+
+        $config = $service->getConfig($ext);
 
         return (isset($config['public']) && is_array($config['public'])) ? $config['public'] : [];
     }
@@ -58,6 +73,6 @@ class Guest extends \FOSSBilling\Api\AbstractApi
      */
     public function languages($deep = false)
     {
-        return \FOSSBilling\i18n::getLocales($deep);
+        return \FOSSBilling\Core\I18n\I18n::getLocales($deep);
     }
 }

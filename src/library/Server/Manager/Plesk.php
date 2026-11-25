@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 use PleskX\Api\Client;
+use Symfony\Component\HttpFoundation\Request;
 
 /**
  * Copyright 2022-2025 FOSSBilling
@@ -10,9 +11,10 @@ use PleskX\Api\Client;
  * @copyright FOSSBilling (https://www.fossbilling.org)
  * @license   http://www.apache.org/licenses/LICENSE-2.0 Apache-2.0
  */
-class Server_Manager_Plesk extends Server_Manager
+class Server_Manager_Plesk extends Server_Manager implements Server_SsoClientIpInterface
 {
     private ?Client $_client = null;
+    private ?string $_clientIp = null;
 
     /**
      * Returns an array with a single key-value pair, where the key is 'label' and the value is 'Plesk'.
@@ -38,7 +40,7 @@ class Server_Manager_Plesk extends Server_Manager
      */
     public function init(): void
     {
-        $this->_config['port'] = FOSSBilling\Tools::normalizePort($this->_config['port'] ?? null, 8443);
+        $this->_config['port'] = FOSSBilling\Core\Utils\Normalizer::normalizePort($this->_config['port'] ?? null, 8443);
         $this->_client = new Client($this->_config['host'], $this->_config['port']);
         $this->_client->setCredentials($this->_config['username'], $this->_config['password']);
     }
@@ -57,8 +59,21 @@ class Server_Manager_Plesk extends Server_Manager
     }
 
     /**
+     * Sets the visitor IP address the SSO session should be bound to.
+     *
+     * @param string|null $value the visitor IP address
+     */
+    public function setSsoClientIp(?string $value): static
+    {
+        $this->_clientIp = $value;
+
+        return $this;
+    }
+
+    /**
      * Returns the login URL for a given account.
      * If an account is provided, a session is created for the account and the session ID is appended to the URL.
+     * The session is bound to the visitor IP set via setSsoClientIp() when available.
      *
      * @param Server_Account|null $account the account for which the login URL should be retrieved
      *
@@ -69,7 +84,8 @@ class Server_Manager_Plesk extends Server_Manager
         $protocol = $this->_config['secure'] ? 'https' : 'http';
         $url = $protocol . '://' . $this->_config['host'] . ':' . $this->_config['port'];
         if ($account) {
-            $sessionId = $this->_client->session()->create($account->getUsername(), $_SERVER['REMOTE_ADDR']);
+            $clientIp = $this->_clientIp ?? Request::createFromGlobals()->getClientIp() ?? '';
+            $sessionId = $this->_client->session()->create($account->getUsername(), $clientIp);
             $url .= '/enterprise/rsession_init.php?PHPSESSID=' . $sessionId;
         }
 
@@ -100,11 +116,11 @@ class Server_Manager_Plesk extends Server_Manager
      *
      * @param Server_Account $account the account to be synchronized
      *
-     * @throws Server_Exception always throws an exception
+     * @throws Server_UnsupportedOperationException always throws an exception
      */
     public function synchronizeAccount(Server_Account $account): never
     {
-        throw new Server_Exception(':type: does not support :action:', [':type:' => 'Plesk', ':action:' => __trans('account synchronization')]);
+        throw new Server_UnsupportedOperationException(':type: does not support :action:', [':type:' => 'Plesk', ':action:' => __trans('account synchronization')]);
     }
 
     /**
@@ -136,7 +152,7 @@ class Server_Manager_Plesk extends Server_Manager
                 // throw new Server_Exception('Out of free IP addresses');
             }
             */
-            if (FOSSBilling\Tools::safeCount($ips['exclusive']) > 0) {
+            if (FOSSBilling\Core\Utils\Arr::safeCount($ips['exclusive']) > 0) {
                 $ips['exclusive'] = array_values($ips['exclusive']);
                 $rand = array_rand($ips['exclusive']);
                 $account->setIp($ips['exclusive'][$rand]['ip']);
@@ -293,12 +309,17 @@ class Server_Manager_Plesk extends Server_Manager
     {
         $this->getLog()->info('Updating domain for account ' . $account->getUsername());
 
+        // Filtering by 'owner-login' would match every webspace owned by this customer, renaming
+        // all of them; 'name' (like deleteSubscription() already uses) scopes this to the one
+        // subscription being changed. Capture it before setDomain() overwrites it below.
+        $currentDomain = $account->getDomain();
+
         $account->setDomain($newDomain);
 
         $params = [
             'set' => [
                 'filter' => [
-                    'owner-login' => $account->getUsername(),
+                    'name' => $currentDomain,
                 ],
                 'values' => [
                     'gen_setup' => [
@@ -399,16 +420,27 @@ class Server_Manager_Plesk extends Server_Manager
 
     /**
      * Creates an array of properties for a subscription.
-     * The properties include the domain name, owner login, hosting type, IP address, FTP login, FTP password, PHP, SSL, CGI, limits, and permissions.
+     * The properties include the domain name, owner login, hosting type, IP address, the hosting plan name, FTP login, FTP password, PHP, SSL, CGI, limits, and permissions.
+     *
+     * For the 'add' action, the properties are sent as the direct children of the <add> node, per the
+     * webspace add operation's schema. For the 'set' action, Plesk requires the <set> node to contain only
+     * a <filter> (identifying which subscription to update) and a <values> node wrapping the actual
+     * settings; its gen_setup element also does not accept 'htype', which only applies at creation time,
+     * and its schema has no plan-related node at all, so 'plan-name' is only ever sent on 'add'.
+     *
+     * @see https://docs.plesk.com/en-US/obsidian/api-rpc/reference/managing-subscriptions-webspaces/creating-a-subscription-webspace.33892/
+     * @see https://docs.plesk.com/en-US/obsidian/api-rpc/reference/managing-subscriptions-webspaces/setting-subscription-parameters.33907/
      *
      * @param Server_Account $account the account for which the properties should be created
-     * @param string         $action  the action to be performed on the subscription
+     * @param string         $action  the action to be performed on the subscription ('add' or 'set')
      *
      * @return array the array of subscription properties
      */
     private function createSubscriptionProps(Server_Account $account, string $action): array
     {
         $package = $account->getPackage();
+        $maxMailLists = $package->getCustomValue('nemailml');
+        $manageMailLists = is_numeric($maxMailLists) && (int) $maxMailLists > 0;
 
         // check if bandwidth quota is set as an integer. If so, convert it to bytes
         $bandwidth = 0;
@@ -422,134 +454,168 @@ class Server_Manager_Plesk extends Server_Manager
             $quota = intval($package->getQuota()) * 1024 * 1024;
         }
 
-        return [
-            $action => [
-                'gen_setup' => [
-                    'name' => $account->getDomain(),
-                    'owner-login' => $account->getUsername(),
-                    'htype' => 'vrt_hst',
+        $genSetup = [
+            'name' => $account->getDomain(),
+            'owner-login' => $account->getUsername(),
+        ];
+
+        if ($action === 'add') {
+            // 'htype' is only valid on subscription creation; the update schema (SetGenSetupType) doesn't have it.
+            $genSetup['htype'] = 'vrt_hst';
+        }
+
+        $genSetup['ip_address'] = $account->getIp();
+
+        $values = [
+            'gen_setup' => $genSetup,
+            'hosting' => [
+                'vrt_hst' => [
+                    'property' => [
+                        [
+                            'name' => 'ftp_login',
+                            'value' => $account->getUsername(),
+                        ],
+                        [
+                            'name' => 'ftp_password',
+                            'value' => $account->getPassword(),
+                        ],
+                        [
+                            'name' => 'php',
+                            'value' => 'true',
+                        ],
+                        [
+                            'name' => 'ssl',
+                            'value' => 'true',
+                        ],
+                        [
+                            'name' => 'cgi',
+                            'value' => 'true',
+                        ],
+                    ],
                     'ip_address' => $account->getIp(),
                 ],
-                'hosting' => [
-                    'vrt_hst' => [
-                        'property' => [
-                            [
-                                'name' => 'ftp_login',
-                                'value' => $account->getUsername(),
-                            ],
-                            [
-                                'name' => 'ftp_password',
-                                'value' => $account->getPassword(),
-                            ],
-                            [
-                                'name' => 'php',
-                                'value' => 'true',
-                            ],
-                            [
-                                'name' => 'ssl',
-                                'value' => 'true',
-                            ],
-                            [
-                                'name' => 'cgi',
-                                'value' => 'true',
-                            ],
-                        ],
-                        'ip_address' => $account->getIp(),
+            ],
+            'limits' => [
+                'limit' => [
+                    [
+                        'name' => 'max_db',
+                        'value' => $package->getMaxSql() ?: 0,
                     ],
-                ],
-                'limits' => [
-                    'limit' => [
-                        [
-                            'name' => 'max_db',
-                            'value' => $package->getMaxSql() ?: 0,
-                        ],
-                        [
-                            'name' => 'max_maillists',
-                            'value' => $package->getMaxEmailLists() ?: 0,
-                        ],
-                        [
-                            'name' => 'max_box',
-                            'value' => $package->getMaxPop() ?: 0,
-                        ],
-                        [
-                            'name' => 'max_traffic',
-                            'value' => $bandwidth,
-                        ],
-                        [
-                            'name' => 'disk_space',
-                            'value' => $quota,
-                        ],
-                        [
-                            'name' => 'max_subdom',
-                            'value' => $package->getMaxSubdomains() ?: 0,
-                        ],
-                        [
-                            'name' => 'max_subftp_users',
-                            'value' => $package->getMaxFtp() ?: 0,
-                        ],
-                        [
-                            'name' => 'max_site',
-                            'value' => $package->getMaxDomains() ?: 0,
-                        ],
+                    [
+                        'name' => 'max_maillists',
+                        'value' => $maxMailLists ?: 0,
                     ],
-                ],
-                'permissions' => [
-                    'permission' => [
-                        [
-                            'name' => 'manage_subdomains',
-                            'value' => $package->getMaxSubdomains() ? 'true' : 'false',
-                        ],
-                        [
-                            'name' => 'manage_dns',
-                            'value' => 'true',
-                        ],
-                        [
-                            'name' => 'manage_crontab',
-                            'value' => $package->getHasCron() ? 'true' : 'false',
-                        ],
-                        [
-                            'name' => 'manage_anonftp',
-                            'value' => $package->getHasAnonymousFtp() ? 'true' : 'false',
-                        ],
-                        [
-                            'name' => 'manage_sh_access',
-                            'value' => $package->getHasShell() ? 'true' : 'false',
-                        ],
-                        [
-                            'name' => 'manage_maillists',
-                            'value' => $package->getMaxEmailLists() ? 'true' : 'false',
-                        ],
-                        [
-                            'name' => 'create_domains',
-                            'value' => 'true',
-                        ],
-                        [
-                            'name' => 'manage_phosting',
-                            'value' => 'true',
-                        ],
-                        [
-                            'name' => 'manage_quota',
-                            'value' => $account->getReseller() ? 'true' : 'false',
-                        ],
-                        [
-                            'name' => 'manage_not_chroot_shell',
-                            'value' => $package->getHasShell() ? 'true' : 'false',
-                        ],
-                        [
-                            'name' => 'manage_domain_aliases',
-                            'value' => 'true',
-                        ],
-                        [
-                            'name' => 'manage_subftp',
-                            'value' => $package->getMaxFtp() ? 'true' : 'false',
-                        ],
-                        [
-                            'name' => 'manage_spamfilter',
-                            'value' => $package->getHasSpamFilter() ? 'true' : 'false',
-                        ],
+                    [
+                        'name' => 'max_box',
+                        'value' => $package->getMaxPop() ?: 0,
+                    ],
+                    [
+                        'name' => 'max_traffic',
+                        'value' => $bandwidth,
+                    ],
+                    [
+                        'name' => 'disk_space',
+                        'value' => $quota,
+                    ],
+                    [
+                        'name' => 'max_subdom',
+                        'value' => $package->getMaxSubdomains() ?: 0,
+                    ],
+                    [
+                        'name' => 'max_subftp_users',
+                        'value' => $package->getMaxFtp() ?: 0,
+                    ],
+                    [
+                        'name' => 'max_site',
+                        'value' => $package->getMaxDomains() ?: 0,
                     ],
                 ],
             ],
+            'permissions' => [
+                'permission' => [
+                    [
+                        'name' => 'manage_subdomains',
+                        'value' => $package->getMaxSubdomains() ? 'true' : 'false',
+                    ],
+                    [
+                        'name' => 'manage_dns',
+                        'value' => 'true',
+                    ],
+                    [
+                        'name' => 'manage_crontab',
+                        'value' => FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($package->getCustomValue('cron')) ? 'true' : 'false',
+                    ],
+                    [
+                        'name' => 'manage_anonftp',
+                        'value' => FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($package->getCustomValue('aftp')) ? 'true' : 'false',
+                    ],
+                    [
+                        'name' => 'manage_sh_access',
+                        'value' => FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($package->getCustomValue('ssh')) ? 'true' : 'false',
+                    ],
+                    [
+                        'name' => 'manage_maillists',
+                        'value' => $manageMailLists ? 'true' : 'false',
+                    ],
+                    [
+                        'name' => 'create_domains',
+                        'value' => 'true',
+                    ],
+                    [
+                        'name' => 'manage_phosting',
+                        'value' => 'true',
+                    ],
+                    [
+                        'name' => 'manage_quota',
+                        'value' => $account->getReseller() ? 'true' : 'false',
+                    ],
+                    [
+                        'name' => 'manage_not_chroot_shell',
+                        'value' => FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($package->getCustomValue('ssh')) ? 'true' : 'false',
+                    ],
+                    [
+                        'name' => 'manage_domain_aliases',
+                        'value' => 'true',
+                    ],
+                    [
+                        'name' => 'manage_subftp',
+                        'value' => $package->getMaxFtp() ? 'true' : 'false',
+                    ],
+                    [
+                        'name' => 'manage_spamfilter',
+                        'value' => FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($package->getCustomValue('spam')) ? 'true' : 'false',
+                    ],
+                ],
+            ],
+        ];
+
+        if ($action === 'set') {
+            $values['hosting']['vrt_hst']['property'] = array_values(array_filter(
+                $values['hosting']['vrt_hst']['property'],
+                fn (array $property): bool => $property['name'] !== 'ftp_password',
+            ));
+
+            // Filtering by 'owner-login' would match every webspace this customer owns, applying
+            // $values to all of them; 'name' (like deleteSubscription() already uses) scopes the
+            // update to this one subscription.
+            return [
+                'set' => [
+                    'filter' => [
+                        'name' => $account->getDomain(),
+                    ],
+                    'values' => $values,
+                ],
+            ];
+        }
+
+        // 'plan-name' must come after 'permissions', per the add schema's element order -- Plesk's
+        // XML-RPC API validates requests against an XSD sequence, and plesk/api-php-lib serializes
+        // this array's key order verbatim into the XML it sends. It's add-only: 'set' has no
+        // plan-related node, so changing an existing subscription's plan isn't supported here.
+        $values['plan-name'] = $package->getName();
+
+        return [
+            $action => $values,
         ];
     }
 

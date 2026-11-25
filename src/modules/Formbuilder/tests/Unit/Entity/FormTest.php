@@ -11,7 +11,7 @@ use Doctrine\ORM\ORMSetup;
 test('maps the existing form tables without changing their columns', function (): void {
     $config = ORMSetup::createAttributeMetadataConfig([dirname(__DIR__, 3) . '/Entity'], true);
     $config->setProxyDir(sys_get_temp_dir());
-    $config->setProxyNamespace('FOSSBilling\\Tests\\DoctrineProxies');
+    $config->setProxyNamespace('FOSSBilling\\Core\\Tests\\DoctrineProxies');
     $entityManager = new EntityManager(DriverManager::getConnection(['driver' => 'pdo_sqlite', 'memory' => true]), $config);
     $form = $entityManager->getClassMetadata(Form::class);
     $field = $entityManager->getClassMetadata(FormField::class);
@@ -22,7 +22,7 @@ test('maps the existing form tables without changing their columns', function ()
         ])
         ->and($field->getTableName())->toBe('form_field')
         ->and($field->getColumnNames())->toBe([
-            'id', 'form_id', 'name', 'label', 'hide_label', 'description', 'type',
+            'id', 'name', 'label', 'hide_label', 'description', 'type',
             'default_value', 'required', 'hidden', 'readonly', 'is_unique', 'prefix',
             'suffix', 'options', 'show_initial', 'show_middle', 'show_prefix',
             'show_suffix', 'text_size', 'created_at', 'updated_at',
@@ -30,16 +30,16 @@ test('maps the existing form tables without changing their columns', function ()
 });
 
 test('stores form values and manages timestamps', function (): void {
-    $createdAt = new DateTime('2026-01-01 12:00:00');
+    $createdAt = new DateTimeImmutable('2026-01-01 12:00:00');
     $form = (new Form())
         ->setName('Hosting details')
-        ->setStyle('{"type":"horizontal"}');
+        ->setStyle(['type' => 'horizontal']);
     $form->setCreatedAt($createdAt);
 
     $form->onPrePersist();
 
     expect($form->getName())->toBe('Hosting details')
-        ->and($form->getStyle())->toBe('{"type":"horizontal"}')
+        ->and($form->getStyle())->toBe(['type' => 'horizontal'])
         ->and($form->getCreatedAt())->toBe($createdAt)
-        ->and($form->getUpdatedAt())->toBeInstanceOf(DateTime::class);
+        ->and($form->getUpdatedAt())->toBeInstanceOf(DateTimeImmutable::class);
 });

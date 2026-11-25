@@ -23,7 +23,7 @@ class SupportTicketNoteRepository extends EntityRepository
     {
         $note = $this->find($id);
         if (!$note instanceof SupportTicketNote) {
-            throw new \FOSSBilling\InformationException('Note not found');
+            throw new \FOSSBilling\Core\Exception\InformationException('Note not found');
         }
 
         return $note;
@@ -37,7 +37,7 @@ class SupportTicketNoteRepository extends EntityRepository
         return $this->createQueryBuilder('n')
             ->andWhere('n.ticket = :tid')
             ->setParameter('tid', $ticketId)
-            ->orderBy('n.id', 'ASC')
+            ->orderBy('n.id', \SortDirection::Ascending)
             ->getQuery()
             ->getResult();
     }

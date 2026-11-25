@@ -24,7 +24,7 @@ test('company returns company data when public display is enabled', function ():
     $api = apiEndpoint(new Box\Mod\System\Api\Guest());
     $companyData = ['companyName' => 'TestCo'];
 
-    $authMock = Mockery::mock('\Box_Authorization');
+    $authMock = Mockery::mock(FOSSBilling\Core\Security\Authorization::class);
     $authMock->shouldReceive('isAdminLoggedIn')
         ->atLeast()->once()
         ->andReturn(false);
@@ -66,7 +66,7 @@ test('company filters sensitive data when public display is disabled', function 
         'address_3' => 'Test Address 3',
     ];
 
-    $authMock = Mockery::mock('\Box_Authorization');
+    $authMock = Mockery::mock(FOSSBilling\Core\Security\Authorization::class);
     $authMock->shouldReceive('isAdminLoggedIn')
         ->atLeast()->once()
         ->andReturn(false);
@@ -178,4 +178,46 @@ test('locale returns the active locale string', function (): void {
     $result = $api->locale();
 
     expect($result)->toBeString()->not->toBeEmpty();
+});
+
+test('countries returns full list when none are configured', function (): void {
+    $api = apiEndpoint(new Box\Mod\System\Api\Guest());
+
+    $modMock = Mockery::mock(FOSSBilling\Core\Module::class);
+    $modMock->shouldReceive('getConfig')->atLeast()->once()->andReturn([]);
+
+    $di = container();
+    $di['mod'] = $di->protect(fn (): Mockery\MockInterface => $modMock);
+    $api->setDi($di);
+
+    $result = $api->countries();
+
+    expect($result)->toBeArray()->not->toBeEmpty();
+    expect($result)->toHaveKey('US');
+});
+
+test('countries correctly splits multi-byte UTF-8 country names', function (): void {
+    // Regression test for a bug where preg_split('/\R/', ...) (without the
+    // 'u' modifier) matched \R against raw bytes, splitting mid-character on
+    // the 0x85 continuation byte present in multi-byte UTF-8 sequences (e.g.
+    // "Å" = 0xC3 0x85), corrupting the entry and breaking json_encode() for
+    // the entire returned array.
+    $api = apiEndpoint(new Box\Mod\System\Api\Guest());
+
+    $configuredCountries = "AX=Åland Islands\nUS=United States";
+
+    $modMock = Mockery::mock(FOSSBilling\Core\Module::class);
+    $modMock->shouldReceive('getConfig')->atLeast()->once()->andReturn(['countries' => $configuredCountries]);
+
+    $di = container();
+    $di['mod'] = $di->protect(fn (): Mockery\MockInterface => $modMock);
+    $api->setDi($di);
+
+    $result = $api->countries();
+
+    expect($result)->toBe([
+        'AX' => 'Åland Islands',
+        'US' => 'United States',
+    ]);
+    expect(json_encode($result))->not->toBeFalse();
 });

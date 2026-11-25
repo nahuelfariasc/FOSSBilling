@@ -106,7 +106,7 @@
                                         <div class="col-lg-6" id="recaptcha_v3_threshold_wrap">
                                             <label class="form-label" for="captcha_recaptcha_v3_threshold">{{ 'reCAPTCHA v3 Minimum Score'|trans }}</label>
                                             <input class="form-control" type="number" id="captcha_recaptcha_v3_threshold" name="captcha_recaptcha_v3_threshold" value="{{ params.captcha_recaptcha_v3_threshold|default(0.5) }}" min="0" max="1" step="0.1">
-                                            <small class="form-hint">{{ 'Google returns a score from 0.0 to 1.0. Higher thresholds are stricter.'|trans }}</small>
+                                            <small class="form-text">{{ 'Google returns a score from 0.0 to 1.0. Higher thresholds are stricter.'|trans }}</small>
                                         </div>
                                     </div>
                                 </div>
@@ -162,6 +162,38 @@
                             <div class="card-body">
                                 <div class="d-flex flex-column gap-3 h-100">
                                     <div>
+                                        <h4 class="card-title mb-2">{{ 'AbuseIPDB'|trans }}</h4>
+                                        <p class="text-secondary mb-0">{{ 'Check client IP addresses against the <a href="https://www.abuseipdb.com/" target="_blank">AbuseIPDB</a> database. Requires a free API key and blocks IPs at or above the confidence threshold.'|trans|raw }}</p>
+                                    </div>
+                                    <label class="form-check form-switch form-switch-2 mt-auto">
+                                        <input id="abuseipdb_enabled" class="form-check-input" name="abuseipdb_enabled" type="checkbox" {% if params.abuseipdb_enabled|default(false) %}checked="checked"{% endif %}>
+                                        <span class="form-check-label">{{ 'Enable AbuseIPDB'|trans }}</span>
+                                    </label>
+                                    <div>
+                                        <label class="form-label" for="abuseipdb_api_key">{{ 'AbuseIPDB API Key'|trans }}</label>
+                                        <input class="form-control" type="text" id="abuseipdb_api_key" name="abuseipdb_api_key" value="{{ params.abuseipdb_api_key|default('') }}" autocomplete="off">
+                                    </div>
+                                    <div class="row g-3">
+                                        <div class="col-6">
+                                            <label class="form-label" for="abuseipdb_threshold">{{ 'Block Threshold'|trans }}</label>
+                                            <input class="form-control" type="number" id="abuseipdb_threshold" name="abuseipdb_threshold" value="{{ params.abuseipdb_threshold|default(75) }}" min="0" max="100" step="1">
+                                            <small class="form-text">{{ '0-100. Lower is stricter.'|trans }}</small>
+                                        </div>
+                                        <div class="col-6">
+                                            <label class="form-label" for="abuseipdb_max_age">{{ 'Max Age (days)'|trans }}</label>
+                                            <input class="form-control" type="number" id="abuseipdb_max_age" name="abuseipdb_max_age" value="{{ params.abuseipdb_max_age|default(30) }}" min="1" max="365" step="1">
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </section>
+                    </div>
+
+                    <div class="col-xl-4 col-md-6">
+                        <section class="card card-sm h-100">
+                            <div class="card-body">
+                                <div class="d-flex flex-column gap-3 h-100">
+                                    <div>
                                         <h4 class="card-title mb-2">{{ 'Disposable Email Protection'|trans }}</h4>
                                         <p class="text-secondary mb-2">{{ 'Check email addresses against a database of temporary and disposable email domains.'|trans }}</p>
                                         <p class="text-secondary mb-0">{{ 'This database is updated daily and provided free of charge by the FakeFilter project under the BSD 3-Clause License.'|trans }}</p>
@@ -175,7 +207,7 @@
                         </section>
                     </div>
 
-                    <div class="col-xl-4 col-md-12">
+                    <div class="col-xl-4 col-md-6">
                         <section class="card card-sm h-100">
                             <div class="card-body">
                                 <div class="d-flex flex-column gap-3 h-100">
@@ -190,7 +222,7 @@
                                     <div>
                                         <label class="form-label" for="honeypot_field">{{ 'Honeypot Field Name'|trans }}</label>
                                         <input class="form-control" type="text" id="honeypot_field" name="honeypot_field" value="{{ params.honeypot_field|default('bio') }}">
-                                        <small class="form-hint">{{ 'Change this if you suspect bots are bypassing the honeypot field.'|trans }}</small>
+                                        <small class="form-text">{{ 'Change this if you suspect bots are bypassing the honeypot field.'|trans }}</small>
                                     </div>
                                 </div>
                             </div>

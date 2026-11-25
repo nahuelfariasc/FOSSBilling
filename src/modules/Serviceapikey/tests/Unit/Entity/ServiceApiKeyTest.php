@@ -18,7 +18,7 @@ use Doctrine\ORM\ORMSetup;
 test('maps service_apikey table without changing columns', function (): void {
     $config = ORMSetup::createAttributeMetadataConfig([dirname(__DIR__, 3) . '/Entity'], true);
     $config->setProxyDir(sys_get_temp_dir());
-    $config->setProxyNamespace('FOSSBilling\\Tests\\DoctrineProxies');
+    $config->setProxyNamespace('FOSSBilling\\Core\\Tests\\DoctrineProxies');
     $entityManager = new EntityManager(DriverManager::getConnection(['driver' => 'pdo_sqlite', 'memory' => true]), $config);
 
     $meta = $entityManager->getClassMetadata(ServiceApiKey::class);
@@ -37,11 +37,11 @@ test('service api key getters and setters round-trip values', function (): void 
 
     $entity->setClientId(42)
         ->setApiKey('TEST-KEY-123')
-        ->setConfig('{"length":32}');
+        ->setConfig(['length' => 32]);
 
     expect($entity->getClientId())->toBe(42)
         ->and($entity->getApiKey())->toBe('TEST-KEY-123')
-        ->and($entity->getConfig())->toBe('{"length":32}')
+        ->and($entity->getConfig())->toBe(['length' => 32])
         ->and($entity->getId())->toBeNull();
 });
 

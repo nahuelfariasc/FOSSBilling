@@ -2,11 +2,14 @@
 
 declare(strict_types=1);
 
+use Box\Mod\Formbuilder\Entity\Form;
 use Box\Mod\Formbuilder\Entity\FormField;
 
 test('stores all form field values', function (): void {
+    $form = new Form();
+
     $field = (new FormField())
-        ->setFormId(7)
+        ->setForm($form)
         ->setName('domain_name')
         ->setLabel('Domain name')
         ->setHideLabel(false)
@@ -19,14 +22,14 @@ test('stores all form field values', function (): void {
         ->setIsUnique(true)
         ->setPrefix('https://')
         ->setSuffix('.test')
-        ->setOptions('{"width":300}')
+        ->setOptions(['width' => 300])
         ->setShowInitial('1')
         ->setShowMiddle('0')
         ->setShowPrefix('1')
         ->setShowSuffix('1')
         ->setTextSize(40);
 
-    expect($field->getFormId())->toBe(7)
+    expect($field->getForm())->toBe($form)
         ->and($field->getName())->toBe('domain_name')
         ->and($field->getLabel())->toBe('Domain name')
         ->and($field->isHideLabel())->toBeFalse()
@@ -39,7 +42,7 @@ test('stores all form field values', function (): void {
         ->and($field->isUnique())->toBeTrue()
         ->and($field->getPrefix())->toBe('https://')
         ->and($field->getSuffix())->toBe('.test')
-        ->and($field->getOptions())->toBe('{"width":300}')
+        ->and($field->getOptions())->toBe(['width' => 300])
         ->and($field->getShowInitial())->toBe('1')
         ->and($field->getShowMiddle())->toBe('0')
         ->and($field->getShowPrefix())->toBe('1')
@@ -58,12 +61,12 @@ test('treats nullable boolean flags as false by default', function (): void {
 });
 
 test('manages form field timestamps', function (): void {
-    $createdAt = new DateTime('2026-01-01 12:00:00');
+    $createdAt = new DateTimeImmutable('2026-01-01 12:00:00');
     $field = new FormField();
     $field->setCreatedAt($createdAt);
 
     $field->onPrePersist();
 
     expect($field->getCreatedAt())->toBe($createdAt)
-        ->and($field->getUpdatedAt())->toBeInstanceOf(DateTime::class);
+        ->and($field->getUpdatedAt())->toBeInstanceOf(DateTimeImmutable::class);
 });

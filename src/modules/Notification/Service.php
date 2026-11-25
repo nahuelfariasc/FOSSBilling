@@ -13,7 +13,9 @@ namespace Box\Mod\Notification;
 
 use Box\Mod\Extension\Entity\ExtensionMeta;
 use Box\Mod\Extension\Repository\ExtensionMetaRepository;
-use FOSSBilling\InjectionAwareInterface;
+use Box\Mod\Notification\Event\AfterAdminNotificationAddEvent;
+use FOSSBilling\Core\Container\InjectionAwareInterface;
+use FOSSBilling\Core\SortOptions;
 
 class Service implements InjectionAwareInterface
 {
@@ -53,7 +55,7 @@ class Service implements InjectionAwareInterface
     {
         if ($this->extensionMetaRepository === null) {
             if ($this->di === null) {
-                throw new \FOSSBilling\Exception('The dependency injection container has not been set.');
+                throw new \FOSSBilling\Core\Exception\BaseException('The dependency injection container has not been set.');
             }
 
             $this->extensionMetaRepository = $this->di['em']->getRepository(ExtensionMeta::class);
@@ -67,8 +69,7 @@ class Service implements InjectionAwareInterface
         $qb = $this->getExtensionMetaRepository()
             ->createQueryBuilderForExtension('mod_notification', 'n')
             ->andWhere('n.metaKey = :metaKey')
-            ->setParameter('metaKey', 'message')
-            ->orderBy('n.id', 'DESC');
+            ->setParameter('metaKey', 'message');
 
         if (!empty($filter['id'])) {
             $qb->andWhere('n.id = :id')
@@ -82,12 +83,26 @@ class Service implements InjectionAwareInterface
 
         if (!empty($filter['date_from'])) {
             $qb->andWhere('n.createdAt >= :date_from')
-                ->setParameter('date_from', new \DateTime(date('Y-m-d 00:00:00', strtotime((string) $filter['date_from']))));
+                ->setParameter('date_from', new \DateTimeImmutable(date('Y-m-d 00:00:00', strtotime((string) $filter['date_from']))));
         }
 
         if (!empty($filter['date_to'])) {
             $qb->andWhere('n.createdAt <= :date_to')
-                ->setParameter('date_to', new \DateTime(date('Y-m-d 23:59:59', strtotime((string) $filter['date_to']))));
+                ->setParameter('date_to', new \DateTimeImmutable(date('Y-m-d 23:59:59', strtotime((string) $filter['date_to']))));
+        }
+
+        $sort = SortOptions::fromArray($filter, [
+            'id' => 'n.id',
+            'created_at' => 'n.createdAt',
+            'updated_at' => 'n.updatedAt',
+        ]);
+        if ($sort->isSorted()) {
+            $qb->orderBy($sort->expression, $sort->direction);
+            if ($sort->expression !== 'n.id') {
+                $qb->addOrderBy('n.id', $sort->direction);
+            }
+        } else {
+            $qb->orderBy('n.id', \SortDirection::Descending);
         }
 
         return $qb;
@@ -102,7 +117,7 @@ class Service implements InjectionAwareInterface
     {
         $meta = $this->getExtensionMetaRepository()->findOneByExtensionAndId('mod_notification', $id);
         if (!$meta instanceof ExtensionMeta || $meta->getMetaKey() !== 'message') {
-            throw new \FOSSBilling\InformationException('Notification message was not found');
+            throw new \FOSSBilling\Core\Exception\InformationException('Notification message was not found');
         }
 
         return $meta;
@@ -122,9 +137,9 @@ class Service implements InjectionAwareInterface
 
         $id = $meta->getId();
         if ($id === null) {
-            throw new \FOSSBilling\Exception('Failed to create notification message: missing ID after persistence.');
+            throw new \FOSSBilling\Core\Exception\BaseException('Failed to create notification message: missing ID after persistence.');
         }
-        $this->di['events_manager']->fire(['event' => 'onAfterAdminNotificationAdd', 'params' => ['id' => $id]]);
+        $this->di['event_dispatcher']->dispatch(new AfterAdminNotificationAddEvent($id));
 
         return $id;
     }

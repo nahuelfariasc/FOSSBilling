@@ -26,18 +26,13 @@ class Theme
     public function __construct(private $name)
     {
         if (!self::getFilesystem()->exists($this->getPath())) {
-            throw new \FOSSBilling\Exception("Theme ':name' does not exist.", [':name' => $name]);
+            throw new \FOSSBilling\Core\Exception\BaseException("Theme ':name' does not exist.", [':name' => $name]);
         }
     }
 
     public function getName()
     {
         return $this->name;
-    }
-
-    public function isAdminAreaTheme(): bool
-    {
-        return str_contains((string) $this->name, 'admin_');
     }
 
     public function isAssetsPathWritable(): bool
@@ -97,8 +92,6 @@ class Theme
     {
         $spp = Path::join($this->getPathConfig(), 'settings.html.twig');
         if (!self::getFilesystem()->exists($spp)) {
-            error_log('Theme ' . $this->getName() . ' does not have settings page');
-
             return '';
         }
 
@@ -118,7 +111,12 @@ class Theme
     {
         $cp = $this->getPathSettingsDataFile();
         if (!self::getFilesystem()->exists($cp)) {
-            return [];
+            // Fall back to the shipped template (see install.php) rather than an empty array,
+            // which every template rendering `settings.*` would otherwise crash on.
+            $cp .= '.example';
+            if (!self::getFilesystem()->exists($cp)) {
+                return [];
+            }
         }
 
         $json = self::getFilesystem()->readFile($cp);

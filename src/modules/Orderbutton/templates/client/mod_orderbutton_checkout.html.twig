@@ -7,7 +7,7 @@
         </button>
     </h3>
     {% if cart.items %}
-    {% set cart_currency = guest.cart_get_currency %}
+    {% set cart_currency = cart.currency %}
     <div id="checkout" class="accordion-collapse collapse {% if request.checkout and client %}show{%endif%}" data-bs-parent="#orderManager">
         <div class="accordion-body">
             <div class="accordion-inner" id="checkout-inner">
@@ -51,7 +51,7 @@
                         {% if request.show_custom_form_values %}
                             <tr>
                                 <td>
-                                    {% if item.form_id and guest.extension_is_on({"mod":"formbuilder"}) %}
+                                    {% if item.form_id and guest.extension_is_on({"module":"formbuilder"}) %}
                                         {% set form = guest.formbuilder_get({"id": item.form_id}) %}
                                         {# debug form #}
                                         <div class="well">
@@ -145,6 +145,12 @@
                                     <td><strong>{{ 'Discount:'|trans }}</strong></td>
                                     <td><strong>- {{ (cart.discount * cart_currency.conversion_rate)|format_currency(cart_currency.code) }}</strong></td>
                                 </tr>
+                                {% for auto_promo in cart.auto_promos|default([]) %}
+                                <tr>
+                                    <td class="ps-4"><span class="text-secondary">{{ auto_promo.title }}</span></td>
+                                    <td>{{ (auto_promo.discount * cart_currency.conversion_rate)|format_currency(cart_currency.code) }}</td>
+                                </tr>
+                                {% endfor %}
                             {% endif %}
 
                             {% set tax_amount = 0 %}
@@ -165,7 +171,7 @@
 
                         <form method="post" action="{{ 'cart/checkout'|api_url }}" {{ fb_api_form({callback: 'onOrderCheckout'}) }}>
                             <fieldset>
-                                {% set enough_in_balance = client ? client.client_balance_get_total >= cart.total : false %}
+                                {% set enough_in_balance = client ? (profile.balance ?? client.client_balance_get_total) >= cart.total : false %}
                                 {% if cart.total and not enough_in_balance %}
                                     <div class="control-group">
                                         <p class="small text-muted mb-2">{{ 'Choose a payment method to continue with your order.'|trans }}</p>
@@ -177,10 +183,31 @@
                                                 <div class="invoice-gateway rounded-2 p-2">
                                                     <input type="radio" class="btn-check border-0" name="gateway_id" id="{{ gateway_input_id }}" value="{{ gtw.id }}" autocomplete="off" {{ not gateway_selected ? 'checked' : '' }}/>
                                                     {% if gtw.logo.logo %}
+                                                        {% if gtw.logo.custom|default(false) %}
                                                         <label class="btn" for="{{ gateway_input_id }}"
-                                                            style="background: transparent url('{{ gtw.logo.logo }}') no-repeat center center; background-size: contain; height:{{ gtw.logo.height }}; width:{{ gtw.logo.width }};"
+                                                            style="width:{{ gtw.logo.width }}; padding: 0;"
                                                             data-bs-toggle="tooltip" data-bs-title="{{ gtw.title }}"
-                                                            aria-label="{{ gtw.title }}"></label>
+                                                            aria-label="{{ gtw.title }}">
+                                                            <picture class="d-block w-100">
+                                                                {% if gtw.logo.avif|default(null) %}
+                                                                    <source srcset="{{ gtw.logo.avif }}" type="image/avif">
+                                                                {% endif %}
+                                                                <img src="{{ gtw.logo.logo }}" alt="{{ gtw.title }}" style="max-width: 100%; max-height: 150px; width: auto; height: auto; display: block; margin: 0 auto;">
+                                                            </picture>
+                                                        </label>
+                                                        {% else %}
+                                                        <label class="btn" for="{{ gateway_input_id }}"
+                                                            style="height:{{ gtw.logo.height }}; width:{{ gtw.logo.width }}; padding: 0;"
+                                                            data-bs-toggle="tooltip" data-bs-title="{{ gtw.title }}"
+                                                            aria-label="{{ gtw.title }}">
+                                                            <picture class="d-block h-100">
+                                                                {% if gtw.logo.avif|default(null) %}
+                                                                    <source srcset="{{ gtw.logo.avif }}" type="image/avif">
+                                                                {% endif %}
+                                                                <img src="{{ gtw.logo.logo }}" alt="{{ gtw.title }}" style="width: 100%; height: 100%; object-fit: contain;">
+                                                            </picture>
+                                                        </label>
+                                                        {% endif %}
                                                     {% else %}
                                                         <label class="btn text-nowrap" for="{{ gateway_input_id }}">{{ gtw.title }}</label>
                                                     {% endif %}

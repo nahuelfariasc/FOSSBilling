@@ -11,7 +11,7 @@ use Symfony\Component\Filesystem\Path;
 test('maps the existing system activity table', function (): void {
     $config = ORMSetup::createAttributeMetadataConfig([Path::join(__DIR__, '..', '..', '..', 'Entity')], true);
     $config->setProxyDir(sys_get_temp_dir());
-    $config->setProxyNamespace('FOSSBilling\\Tests\\DoctrineProxies');
+    $config->setProxyNamespace('FOSSBilling\\Core\\Tests\\DoctrineProxies');
     $entityManager = new EntityManager(DriverManager::getConnection(['driver' => 'pdo_sqlite', 'memory' => true]), $config);
     $metadata = $entityManager->getClassMetadata(ActivitySystem::class);
 
@@ -19,8 +19,8 @@ test('maps the existing system activity table', function (): void {
         ->and($metadata->getColumnNames())->toBe([
             'id', 'priority', 'admin_id', 'client_id', 'message', 'ip', 'created_at',
         ])
-        ->and($metadata->table['indexes']['admin_id_idx']['columns'])->toBe(['admin_id'])
-        ->and($metadata->table['indexes']['client_id_idx']['columns'])->toBe(['client_id']);
+        ->and($metadata->table['indexes']['activity_system_admin_id_idx']['columns'])->toBe(['admin_id'])
+        ->and($metadata->table['indexes']['activity_system_client_id_idx']['columns'])->toBe(['client_id']);
 });
 
 test('stores system activity values and initializes its timestamp', function (): void {
@@ -39,5 +39,5 @@ test('stores system activity values and initializes its timestamp', function ():
         ->and($activity->getClientId())->toBe(3)
         ->and($activity->getMessage())->toBe('Test event')
         ->and($activity->getIp())->toBe('192.0.2.3')
-        ->and($activity->getCreatedAt())->toBeInstanceOf(DateTime::class);
+        ->and($activity->getCreatedAt())->toBeInstanceOf(DateTimeImmutable::class);
 });

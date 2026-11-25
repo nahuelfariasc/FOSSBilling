@@ -17,12 +17,35 @@ use Box\Mod\Activity\Entity\ActivitySystem;
 use Box\Mod\Activity\Repository\ActivityClientHistoryRepository;
 use Box\Mod\Activity\Repository\ActivitySystemRepository;
 use Box\Mod\Client\Entity\Client;
+use Box\Mod\Client\Event\AfterClientLoginEvent;
+use Box\Mod\Cron\Event\BeforeAdminCronRunEvent;
+use Box\Mod\Staff\Event\AfterAdminLoginEvent;
+use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\Types\Types;
-use FOSSBilling\InjectionAwareInterface;
+use FOSSBilling\Core\Container\InjectionAwareInterface;
+use FOSSBilling\Core\Enums\ExtensionType;
+use FOSSBilling\Core\SortOptions;
+use Symfony\Component\EventDispatcher\Attribute\AsEventListener;
 
 class Service implements InjectionAwareInterface
 {
+    // Sized to stay within every supported driver's bound-parameter ceiling: the
+    // batched DELETE expands to one placeholder per id, and SQLite before 3.32
+    // allows only 999 host parameters per statement.
+    public const int RETENTION_BATCH_SIZE = 500;
+    private const int RETENTION_TIME_BUDGET_SECONDS = 15;
+
+    /**
+     * @var list<string>
+     */
+    private const array RETENTION_TABLES = [
+        'activity_admin_history',
+        'activity_client_history',
+        'activity_system',
+        'activity_client_email',
+    ];
+
     protected ?\Pimple\Container $di = null;
 
     public function setDi(\Pimple\Container $di): void
@@ -52,20 +75,15 @@ class Service implements InjectionAwareInterface
         ];
     }
 
-    private function getDbal(): Connection
+    private function getConnection(): Connection
     {
-        return $this->di['dbal'];
-    }
-
-    private static function getDbalFromDi(\Pimple\Container $di): Connection
-    {
-        return $di['dbal'];
+        return $this->di['em']->getConnection();
     }
 
     public function logEvent($data): void
     {
         $extensionService = $this->di['mod_service']('extension');
-        $ip = $extensionService->isExtensionActive('mod', 'demo')
+        $ip = $extensionService->isExtensionActive(ExtensionType::Module->value, 'demo')
             ? null
             : $this->di['request']->getClientIp();
 
@@ -80,42 +98,38 @@ class Service implements InjectionAwareInterface
         $this->di['em']->flush();
     }
 
-    public static function onAfterClientLogin(\Box_Event $event): void
+    #[AsEventListener]
+    public function recordClientLogin(AfterClientLoginEvent $event): void
     {
-        $params = $event->getParameters();
-        $di = $event->getDi();
-
-        $extensionService = $di['mod_service']('extension');
-        $ip = $extensionService->isExtensionActive('mod', 'demo') ? null : $params['ip'];
+        $extensionService = $this->di['mod_service']('extension');
+        $ip = $extensionService->isExtensionActive(ExtensionType::Module->value, 'demo') ? null : $event->ip;
 
         $history = (new ActivityClientHistory())
-            ->setClientId((int) $params['id'])
+            ->setClientId($event->clientId)
             ->setIp($ip);
 
-        $di['em']->persist($history);
-        $di['em']->flush();
+        $this->di['em']->persist($history);
+        $this->di['em']->flush();
     }
 
-    public static function onAfterAdminLogin(\Box_Event $event): void
+    #[AsEventListener]
+    public function recordAdminLogin(AfterAdminLoginEvent $event): void
     {
-        $params = $event->getParameters();
-        $di = $event->getDi();
-
-        $extensionService = $di['mod_service']('extension');
-        $ip = $extensionService->isExtensionActive('mod', 'demo') ? null : $params['ip'];
+        $extensionService = $this->di['mod_service']('extension');
+        $ip = $extensionService->isExtensionActive(ExtensionType::Module->value, 'demo') ? null : $event->ip;
 
         $history = (new ActivityAdminHistory())
-            ->setAdminId((int) $params['id'])
+            ->setAdminId($event->adminId)
             ->setIp($ip);
 
-        $di['em']->persist($history);
-        $di['em']->flush();
+        $this->di['em']->persist($history);
+        $this->di['em']->flush();
     }
 
-    public static function onBeforeAdminCronRun(\Box_Event $event): void
+    #[AsEventListener]
+    public function cleanupOldActivity(BeforeAdminCronRunEvent $event): void
     {
-        $di = $event->getDi();
-        $config = $di['mod_service']('extension')->getConfig('mod_activity');
+        $config = $this->di['mod_service']('extension')->getConfig('mod_activity');
 
         $retention = intval($config['max_age'] ?? 90);
         $emailRetention = intval($config['email_max_age'] ?? 0);
@@ -126,24 +140,60 @@ class Service implements InjectionAwareInterface
 
         $ageInSeconds = $retention * 86_400;
         $emailAgeInSeconds = $emailRetention * 86_400;
-        $dbal = self::getDbalFromDi($di);
+        // One budget for the whole sweep: this listener runs before the cron task
+        // loop, so per-table budgets could delay later tasks by up to ~60s.
+        // Anything not purged in time is picked up on the next run.
+        $deadline = microtime(true) + self::RETENTION_TIME_BUDGET_SECONDS;
 
         try {
             if ($retention !== 0) {
                 $createdAt = date('Y-m-d H:i:s', time() - $ageInSeconds);
-                $dbal->executeStatement('DELETE FROM activity_admin_history WHERE created_at <= ?', [$createdAt]);
-                $dbal->executeStatement('DELETE FROM activity_client_history WHERE created_at <= ?', [$createdAt]);
-                $dbal->executeStatement('DELETE FROM activity_system WHERE created_at <= ?', [$createdAt]);
+                $this->purgeOlderThan('activity_admin_history', $createdAt, $deadline);
+                $this->purgeOlderThan('activity_client_history', $createdAt, $deadline);
+                $this->purgeOlderThan('activity_system', $createdAt, $deadline);
             }
 
             if ($emailRetention !== 0) {
-                $dbal->executeStatement('DELETE FROM activity_client_email WHERE created_at <= ?', [
-                    date('Y-m-d H:i:s', time() - $emailAgeInSeconds),
-                ]);
+                $this->purgeOlderThan('activity_client_email', date('Y-m-d H:i:s', time() - $emailAgeInSeconds), $deadline);
             }
         } catch (\Exception $e) {
-            error_log($e->getMessage());
+            $this->di['logger']->error($e->getMessage());
         }
+    }
+
+    /**
+     * Delete rows older than the cutoff in bounded batches, so a large backlog (a long-lived install, or
+     * retention just switched on) is worked off over a few cron runs instead of one huge DELETE that
+     * holds locks and can exceed the time limit. Whatever is left is picked up on the next run.
+     *
+     * The deadline is shared across all tables in one sweep, so the whole purge
+     * stays within a single time budget instead of one budget per table.
+     */
+    private function purgeOlderThan(string $table, string $cutoff, float $deadline): void
+    {
+        if (!in_array($table, self::RETENTION_TABLES, true)) {
+            throw new \InvalidArgumentException('Unsupported activity table: ' . $table);
+        }
+
+        $connection = $this->getConnection();
+
+        do {
+            if (microtime(true) >= $deadline) {
+                return;
+            }
+            $ids = $connection->fetchFirstColumn(
+                sprintf('SELECT id FROM %s WHERE created_at <= ? ORDER BY created_at, id LIMIT %d', $table, self::RETENTION_BATCH_SIZE),
+                [$cutoff],
+            );
+            if ($ids === []) {
+                return;
+            }
+            $connection->executeStatement(
+                sprintf('DELETE FROM %s WHERE id IN (?)', $table),
+                [$ids],
+                [ArrayParameterType::INTEGER],
+            );
+        } while (count($ids) === self::RETENTION_BATCH_SIZE && microtime(true) < $deadline);
     }
 
     public function getSearchQuery($data): array
@@ -167,10 +217,10 @@ class Service implements InjectionAwareInterface
 
         if ($priority !== null && $priority !== '') {
             $where[] = 'm.priority = :priority';
-            $params[':priority'] = $priority;
+            $params['priority'] = $priority;
         } elseif ($min_priority !== null && $min_priority !== '') {
             $where[] = 'm.priority <= :min_priority';
-            $params[':min_priority'] = $min_priority;
+            $params['min_priority'] = $min_priority;
         }
 
         if ($user_filter === 'only_staff') {
@@ -181,46 +231,53 @@ class Service implements InjectionAwareInterface
 
         if ($admin_id) {
             $where[] = 'm.admin_id = :admin_id';
-            $params[':admin_id'] = $admin_id;
+            $params['admin_id'] = $admin_id;
         }
 
         if ($client_id) {
             $where[] = 'm.client_id = :client_id';
-            $params[':client_id'] = $client_id;
+            $params['client_id'] = $client_id;
         }
 
         if ($date_from) {
             $where[] = 'm.created_at >= :date_from';
-            $params[':date_from'] = date('Y-m-d 00:00:00', strtotime((string) $date_from));
+            $params['date_from'] = date('Y-m-d 00:00:00', strtotime((string) $date_from));
         }
 
         if ($date_to) {
             $where[] = 'm.created_at <= :date_to';
-            $params[':date_to'] = date('Y-m-d 23:59:59', strtotime((string) $date_to));
+            $params['date_to'] = date('Y-m-d 23:59:59', strtotime((string) $date_to));
         }
 
         if ($ip) {
             $where[] = 'm.ip = :ip';
-            $params[':ip'] = $ip;
+            $params['ip'] = $ip;
         }
 
         if ($search) {
             $where[] = 'm.message LIKE :search';
-            $params[':search'] = '%' . $search . '%';
+            $params['search'] = '%' . $search . '%';
         }
 
         if ($where !== []) {
             $sql .= ' WHERE ' . implode(' and ', $where);
         }
 
-        $sql .= ' ORDER by m.id desc';
+        $sort = SortOptions::fromArray($data, [
+            'id' => 'm.id',
+            'priority' => 'm.priority',
+            'ip' => 'm.ip',
+            'created_at' => 'm.created_at',
+        ]);
+        $orderBy = $sort->toOrderByClause('m.id') ?? 'm.id desc';
+        $sql .= " ORDER BY {$orderBy}";
 
         return [$sql, $params];
     }
 
     public function logEmail($subject, $clientId = null, $sender = null, $recipients = null, $content_html = null, $content_text = null, ?array $attachment = null): bool
     {
-        $this->getDbal()->insert('activity_client_email', [
+        $this->getConnection()->insert('activity_client_email', [
             'client_id' => $clientId,
             'sender' => $sender,
             'recipients' => $recipients,
@@ -240,13 +297,13 @@ class Service implements InjectionAwareInterface
 
     public function toApiArray(ActivityClientHistory $model): array
     {
-        $client = $this->getDbal()->executeQuery(
+        $client = $this->getConnection()->executeQuery(
             'SELECT id, first_name, last_name, email FROM client WHERE id = ?',
             [$model->getClientId()]
         )->fetchAssociative();
 
         if ($client === false) {
-            throw new \FOSSBilling\Exception('Client not found');
+            throw new \FOSSBilling\Core\Exception\BaseException('Client not found');
         }
 
         return [
@@ -262,19 +319,19 @@ class Service implements InjectionAwareInterface
         ];
     }
 
-    public function rmByClient(\Model_Client|Client $client): void
+    public function rmByClient(Client $client): void
     {
-        $clientId = $client instanceof Client ? $client->getId() : $client->id;
+        $clientId = $client->getId();
         if ($clientId === null) {
             return;
         }
 
         /** @var ActivityClientHistoryRepository $clientHistoryRepository */
         $clientHistoryRepository = $this->di['em']->getRepository(ActivityClientHistory::class);
-        $clientHistoryRepository->deleteByClientId((int) $clientId);
+        $clientHistoryRepository->deleteByClientId($clientId);
 
         /** @var ActivitySystemRepository $activitySystemRepository */
         $activitySystemRepository = $this->di['em']->getRepository(ActivitySystem::class);
-        $activitySystemRepository->deleteByClientId((int) $clientId);
+        $activitySystemRepository->deleteByClientId($clientId);
     }
 }

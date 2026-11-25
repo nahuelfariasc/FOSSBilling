@@ -16,13 +16,17 @@ declare(strict_types=1);
 namespace Box\Mod\Email\Api;
 
 use Box\Mod\Staff\Entity\AdminGroup;
-use FOSSBilling\PaginationOptions;
-use FOSSBilling\Validation\Api\RequiredParams;
+use FOSSBilling\Core\Enums\ExtensionType;
+use FOSSBilling\Core\Pagination\Options;
+use FOSSBilling\Core\Validation\Api\RequiredParams;
 
-class Admin extends \FOSSBilling\Api\AbstractApi
+class Admin extends \FOSSBilling\Core\Api\AbstractApi
 {
     /**
      * Get list of sent emails.
+     *
+     * @optional string $sort - sort column: 'id', 'sender', 'recipient', 'subject', 'created_at' or 'updated_at'
+     * @optional string $direction - sort direction: 'ASC' or 'DESC'
      *
      * @return array
      */
@@ -34,7 +38,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
 
         return $this->getDi()['pager']->paginateDoctrineQuery(
             $repo->getSearchQueryBuilder($data),
-            PaginationOptions::fromArray($data),
+            Options::fromArray($data),
         );
     }
 
@@ -89,7 +93,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
      *
      * @return bool
      *
-     * @throws \FOSSBilling\Exception
+     * @throws \FOSSBilling\Core\Exception\BaseException
      */
     #[RequiredParams(['id' => 'Email ID was not passed'])]
     public function email_resend($data)
@@ -104,7 +108,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
     /**
      * Delete sent email from logs.
      *
-     * @throws \FOSSBilling\Exception
+     * @throws \FOSSBilling\Core\Exception\BaseException
      */
     #[RequiredParams(['id' => 'Email ID was not passed'])]
     public function email_delete($data): bool
@@ -118,13 +122,16 @@ class Admin extends \FOSSBilling\Api\AbstractApi
         $em->remove($model);
         $em->flush();
 
-        $this->getDi()['logger']->info('Deleted email #%s', $id);
+        $this->getDi()['logger']->info('Deleted email #{id}', ['id' => $id]);
 
         return true;
     }
 
     /**
      * Return list of email templates.
+     *
+     * @optional string $sort - sort column: 'code', 'category', 'subject', 'enabled' or 'id'
+     * @optional string $direction - sort direction: 'ASC' or 'DESC'
      *
      * @return array
      */
@@ -158,7 +165,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
      *
      * @return array
      *
-     * @throws \FOSSBilling\Exception
+     * @throws \FOSSBilling\Core\Exception\BaseException
      */
     #[RequiredParams(['id' => 'Email ID was not passed'])]
     public function template_get($data)
@@ -173,7 +180,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
     /**
      * Delete email template.
      *
-     * @throws \FOSSBilling\Exception
+     * @throws \FOSSBilling\Core\Exception\BaseException
      */
     #[RequiredParams(['id' => 'Email ID was not passed'])]
     public function template_delete($data): bool
@@ -183,7 +190,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
         $service = $this->getService();
         $template = $service->getTemplate((int) $data['id']);
         if (!$template->isCustom() && $service->hasDefaultTemplate($template->getActionCode())) {
-            throw new \FOSSBilling\Exception('Only custom email templates can be deleted');
+            throw new \FOSSBilling\Core\Exception\BaseException('Only custom email templates can be deleted');
         }
 
         $id = $template->getId();
@@ -191,18 +198,18 @@ class Admin extends \FOSSBilling\Api\AbstractApi
         $this->getDi()['em']->remove($template);
         $this->getDi()['em']->flush();
 
-        $this->getDi()['logger']->info('Deleted email template #%s', $id);
+        $this->getDi()['logger']->info('Deleted email template #{id}', ['id' => $id]);
 
         return true;
     }
 
     /**
      * Create new email template. Creating new email template can be
-     * combined with custom event hook.
+     * combined with a typed event listener.
      *
      * @return int - newly created template id
      *
-     * @throws \FOSSBilling\Exception
+     * @throws \FOSSBilling\Core\Exception\BaseException
      */
     #[RequiredParams([
         'action_code' => 'Email template code is required',
@@ -226,7 +233,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
      *
      * @return bool
      *
-     * @throws \FOSSBilling\Exception
+     * @throws \FOSSBilling\Core\Exception\BaseException
      */
     #[RequiredParams(['id' => 'Email ID was not passed'])]
     public function template_update($data)
@@ -331,7 +338,9 @@ class Admin extends \FOSSBilling\Api\AbstractApi
         $vars['_tpl'] = $data['_tpl'] ?? $t['content'];
         $systemService = $this->getDi()['mod_service']('System');
 
-        return $systemService->renderEmailTplString($vars['_tpl'], $vars);
+        // Preview-only output, which the modal re-escapes for display: decoded
+        // form keeps subject previews accurate, content previews unchanged.
+        return $systemService->renderEmailSubjectString($vars['_tpl'], $vars);
     }
 
     /**
@@ -392,11 +401,11 @@ class Admin extends \FOSSBilling\Api\AbstractApi
 
         $email = [
             'code' => 'mod_email_test',
-            'to' => $currentUser->email ?? '',
-            'to_name' => $currentUser->name ?? '',
+            'to' => $currentUser?->getEmail() ?? '',
+            'to_name' => $currentUser?->getName() ?? '',
             'send_now' => true,
             'throw_exceptions' => true,
-            'staff_member_name' => $currentUser->name ?? '',
+            'staff_member_name' => $currentUser?->getName() ?? '',
         ];
 
         return $this->getService()->sendTemplate($email);
@@ -407,7 +416,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
         $this->checkPermissions('email', 'send_emails');
 
         $extensionService = $this->getDi()['mod_service']('extension');
-        if ($extensionService->isExtensionActive('mod', 'demo')) {
+        if ($extensionService->isExtensionActive(ExtensionType::Module->value, 'demo')) {
             return false;
         }
 
@@ -419,8 +428,8 @@ class Admin extends \FOSSBilling\Api\AbstractApi
      * it will be created. Default email template file must exist at mod_example/templates/email/mod_example_code.html.twig file.
      *
      * @optional string $to_staff - True to send to all active staff members. Default false
-     * @optional string $to_client - Set client ID to send email to client. Default null
-     * @optional string $to - receivers email
+     * @optional string $to_client - Set client ID to send email to client. Default null. Cannot be combined with `to`.
+     * @optional string $to - receivers email. Only for non-client emails; ignored for client-bound sends.
      * @optional string $from - from email. Default - company email
      * @optional string $from_name - from name. Default - company name
      * @optional string $default_subject - Default email subject if template does not exist
@@ -436,7 +445,15 @@ class Admin extends \FOSSBilling\Api\AbstractApi
         $this->checkPermissions('email', 'send_emails');
 
         if (!isset($data['to']) && !isset($data['to_staff']) && !isset($data['to_client'])) {
-            throw new \FOSSBilling\InformationException('Receiver is not defined. Define to or to_client or to_staff parameter');
+            throw new \FOSSBilling\Core\Exception\InformationException('Receiver is not defined. Define to or to_client or to_staff parameter');
+        }
+
+        if (isset($data['client_billing_email'])) {
+            throw new \FOSSBilling\Core\Exception\InformationException('client_billing_email cannot be set via the API');
+        }
+
+        if (!empty($data['to_client']) && !empty($data['to'])) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Parameters `to` and `to_client` cannot be combined. Client-bound emails are always sent to the client\'s registered email address.');
         }
 
         return $this->getService()->sendTemplate($data);
@@ -477,6 +494,12 @@ class Admin extends \FOSSBilling\Api\AbstractApi
         return true;
     }
 
+    /**
+     * Get paginated email queue list.
+     *
+     * @optional string $sort - sort column: 'subject', 'recipient', 'sender', 'to_name', 'status', 'priority', 'tries', 'created_at', 'updated_at' or 'id'
+     * @optional string $direction - sort direction: 'ASC' or 'DESC'
+     */
     public function get_queue(array $data)
     {
         $this->checkPermissions('email', 'view_email_history');
@@ -485,7 +508,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
 
         return $this->getDi()['pager']->paginateDoctrineQuery(
             $repo->getSearchQueryBuilder($data),
-            PaginationOptions::fromArray($data),
+            Options::fromArray($data),
         );
     }
 }

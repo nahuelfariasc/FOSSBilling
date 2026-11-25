@@ -22,31 +22,58 @@ use Symfony\Component\HttpFoundation\Request;
 function container(): Container
 {
     $di = new Container();
+    $di['crypt'] = fn (): \FOSSBilling\Core\Security\Crypt => new \FOSSBilling\Core\Security\Crypt();
     $di['config'] = [
         'salt' => 'test_salt_' . uniqid(),
         'url' => 'http://localhost/',
     ];
-    $di['validator'] = fn (): \FOSSBilling\Validate => new \FOSSBilling\Validate();
-    $di['tools'] = fn (): \FOSSBilling\Tools => new \FOSSBilling\Tools();
+    $di['url'] = function (): \FOSSBilling\Core\Url {
+        $url = new \FOSSBilling\Core\Url();
+        $url->setBaseUri(defined('SYSTEM_URL') ? SYSTEM_URL : '/');
+
+        return $url;
+    };
+    $di['validator'] = fn (): \FOSSBilling\Core\Validation\Validator => new \FOSSBilling\Core\Validation\Validator();
     $di['filesystem'] = fn (): \Symfony\Component\Filesystem\Filesystem => new \Symfony\Component\Filesystem\Filesystem();
     $di['logger'] = fn (): \Psr\Log\LoggerInterface => new class extends AbstractLogger {
         public array $calls = [];
+        private string $channel = 'application';
+        private array $context = [];
 
         public function log($level, string|\Stringable $message, array $context = []): void
         {
-            $this->calls[] = ['method' => $level, 'params' => [$message, $context]];
+            $effectiveContext = [...$this->context, ...$context];
+            $call = ['method' => $level, 'params' => [$message, $effectiveContext]];
+            if ($this->channel !== 'application') {
+                $call['channel'] = $this->channel;
+            }
+
+            $this->calls[] = $call;
         }
 
-        public function setChannel(string $channel): self
+        public function withChannel(string $channel): static
         {
-            $this->calls[] = ['method' => 'setChannel', 'params' => [$channel]];
+            $this->calls[] = ['method' => 'withChannel', 'params' => [$channel]];
+            $logger = clone $this;
+            $logger->calls = &$this->calls;
+            $logger->channel = $channel;
 
-            return $this;
+            return $logger;
+        }
+
+        public function withContext(array $context): static
+        {
+            $this->calls[] = ['method' => 'withContext', 'params' => [$context]];
+            $logger = clone $this;
+            $logger->calls = &$this->calls;
+            $logger->context = [...$this->context, ...$context];
+
+            return $logger;
         }
     };
     $di['request'] = fn (): Request => Request::create('http://localhost/');
     $di['session'] = static function (): object {
-        $session = \Mockery::mock(\FOSSBilling\Session::class)->shouldIgnoreMissing();
+        $session = \Mockery::mock(\FOSSBilling\Core\Security\Session::class)->shouldIgnoreMissing();
         $session->shouldReceive('regenerateId')->byDefault()->andReturnNull();
         $session->shouldReceive('set')->byDefault()->andReturnNull();
         $session->shouldReceive('get')->byDefault()->andReturnNull();
@@ -54,18 +81,7 @@ function container(): Container
 
         return $session;
     };
-    $di['db'] = static function (): object {
-        $db = \Mockery::mock(\Box_Database::class)->shouldIgnoreMissing();
-        $db->shouldReceive('find')->byDefault()->andReturn([]);
-        $db->shouldReceive('getAll')->byDefault()->andReturn([]);
-        $db->shouldReceive('getAssoc')->byDefault()->andReturn([]);
-        $db->shouldReceive('toArray')->byDefault()->andReturn([]);
-        $db->shouldReceive('exec')->byDefault()->andReturn(1);
-        $db->shouldReceive('transaction')->byDefault()->andReturnUsing(static fn (callable $callback): mixed => $callback());
-
-        return $db;
-    };
-    $di['dbal'] = static function (): object {
+    $defaultConnection = static function (): object {
         $dbal = \Mockery::mock(\Doctrine\DBAL\Connection::class)->shouldIgnoreMissing();
         $result = \Mockery::mock(\Doctrine\DBAL\Result::class)->shouldIgnoreMissing();
         $result->shouldReceive('fetchAssociative')->byDefault()->andReturn(false);
@@ -103,11 +119,13 @@ function container(): Container
         $queryBuilder->shouldReceive('fetchAllAssociative')->byDefault()->andReturn([]);
         $queryBuilder->shouldReceive('fetchOne')->byDefault()->andReturn(false);
 
+        $dbal->shouldReceive('fetchAssociative')->with(\Mockery::pattern('/SELECT client_id, gateway_transaction_id/'), \Mockery::any())->byDefault()->andReturn(false);
         $dbal->shouldReceive('fetchAssociative')->byDefault()->andReturn([]);
         $dbal->shouldReceive('fetchAllAssociative')->byDefault()->andReturn([]);
         $dbal->shouldReceive('fetchOne')->byDefault()->andReturn(null);
         $dbal->shouldReceive('executeQuery')->byDefault()->andReturn($result);
         $dbal->shouldReceive('executeStatement')->byDefault()->andReturn(1);
+        $dbal->shouldReceive('transactional')->byDefault()->andReturnUsing(static fn (callable $operation): mixed => $operation($dbal));
         $dbal->shouldReceive('insert')->byDefault()->andReturn(1);
         $dbal->shouldReceive('update')->byDefault()->andReturn(1);
         $dbal->shouldReceive('lastInsertId')->byDefault()->andReturn(1);
@@ -115,14 +133,10 @@ function container(): Container
 
         return $dbal;
     };
-    $di['events_manager'] = fn (): object => new class {
-        public array $events = [];
-
-        public function fire(array|string $event): void
-        {
-            $this->events[] = $event;
-        }
-    };
+    $di['event_dispatcher'] = fn (): \FOSSBilling\Core\Events\EventDispatcher => new \FOSSBilling\Core\Events\EventDispatcher(
+        static fn (): array => [],
+        static fn (string $module): object => throw new \LogicException('No module listeners are configured in the test container.'),
+    );
     $di['auth'] = fn (): object => \Mockery::mock()->shouldIgnoreMissing();
     $di['pager'] = fn (): object => new class {
         public function getDefaultPerPage(): int
@@ -144,23 +158,29 @@ function container(): Container
         {
             return ['list' => [], 'total' => 0, 'pages' => 0, 'page' => 1, 'per_page' => 20];
         }
+
+        public function paginateDoctrineQuery(\Doctrine\ORM\QueryBuilder $qb, \FOSSBilling\Core\Pagination\Options $pagination, mixed ...$apiArrayArgs): array
+        {
+            return ['list' => [], 'total' => 0, 'pages' => 0, 'page' => $pagination->page, 'per_page' => $pagination->perPage];
+        }
     };
     $di['rate_limiter'] = fn (): object => new class {
-        public function consume(string $policyName, string $subject, int $tokens = 1): \FOSSBilling\Security\RateLimitResult
+        public function consume(string $policyName, string $subject, int $tokens = 1): \FOSSBilling\Core\Security\RateLimitResult
         {
-            return new \FOSSBilling\Security\RateLimitResult($policyName, false, null, null);
+            return new \FOSSBilling\Core\Security\RateLimitResult($policyName, false, null, null);
         }
 
-        public function consumeOrThrow(string $policyName, string $subject, int $tokens = 1): \FOSSBilling\Security\RateLimitResult
+        public function consumeOrThrow(string $policyName, string $subject, int $tokens = 1): \FOSSBilling\Core\Security\RateLimitResult
         {
             return $this->consume($policyName, $subject, $tokens);
         }
     };
     $di['mod_config'] = $di->protect(fn (string $name): array => []);
-    $di['cookie_queue'] = fn (): \FOSSBilling\Http\CookieQueue => new \FOSSBilling\Http\CookieQueue();
-    $di['em'] = static function (): object {
+    $di['cookie_queue'] = fn (): \FOSSBilling\Core\Http\CookieQueue => new \FOSSBilling\Core\Http\CookieQueue();
+    $di['em'] = static function () use ($defaultConnection): object {
         $adminGroupRepository = \Mockery::mock(\Box\Mod\Staff\Repository\AdminGroupRepository::class)->shouldIgnoreMissing();
         $adminGroupMemberRepository = \Mockery::mock(\Box\Mod\Staff\Repository\AdminGroupMemberRepository::class)->shouldIgnoreMissing();
+        $adminPasswordResetRepository = \Mockery::mock(\Box\Mod\Staff\Repository\AdminPasswordResetRepository::class)->shouldIgnoreMissing();
 
         $clientQueryBuilder = \Mockery::mock(\Doctrine\ORM\QueryBuilder::class)->shouldIgnoreMissing();
         foreach (['andWhere', 'orWhere', 'setParameter', 'orderBy', 'setFirstResult', 'setMaxResults', 'delete', 'where'] as $method) {
@@ -189,6 +209,10 @@ function container(): Container
         $clientGroupRepository = \Mockery::mock(\Box\Mod\Client\Repository\ClientGroupRepository::class)->shouldIgnoreMissing();
         $clientGroupRepository->shouldReceive('find')->byDefault()->andReturnUsing(static fn (int $id): ?object => createEntity(\Box\Mod\Client\Entity\ClientGroup::class, ['id' => $id]));
         $clientGroupRepository->shouldReceive('getIdTitlePairs')->byDefault()->andReturn([]);
+
+        $clientGroupMembershipRepository = \Mockery::mock(\Box\Mod\Client\Repository\ClientGroupMembershipRepository::class)->shouldIgnoreMissing();
+        $clientGroupMembershipRepository->shouldReceive('findOneBy')->byDefault()->andReturn(null);
+        $clientGroupMembershipRepository->shouldReceive('findBy')->byDefault()->andReturn([]);
 
         $clientPasswordResetRepository = \Mockery::mock(\Box\Mod\Client\Repository\ClientPasswordResetRepository::class)->shouldIgnoreMissing();
         $clientPasswordResetRepository->shouldReceive('find')->byDefault()->andReturn(null);
@@ -241,7 +265,6 @@ function container(): Container
         $transactionRepository->shouldReceive('findOneBy')->byDefault()->andReturn(null);
         $transactionRepository->shouldReceive('findOneByTxnIdAndGatewayId')->byDefault()->andReturn(null);
         $transactionRepository->shouldReceive('findOneByGatewayIdAndIpnHash')->byDefault()->andReturn(null);
-        $transactionRepository->shouldReceive('findOneProcessedByTxnId')->byDefault()->andReturn(null);
         $transactionRepository->shouldReceive('findActiveByTxnIdAndGatewayId')->byDefault()->andReturn(null);
         $transactionRepository->shouldReceive('findProcessingOrProcessedByTxnId')->byDefault()->andReturn(null);
         $transactionRepository->shouldReceive('competingTransactionQuery')->byDefault()->andReturn($payGatewayQueryBuilder);
@@ -251,14 +274,49 @@ function container(): Container
         $subscriptionRepository->shouldReceive('findOneBy')->byDefault()->andReturn(null);
         $subscriptionRepository->shouldReceive('findOneBySid')->byDefault()->andReturn(null);
 
+        $invoiceRepository = \Mockery::mock(\Box\Mod\Invoice\Repository\InvoiceRepository::class)->shouldIgnoreMissing();
+        $invoiceRepository->shouldReceive('find')->byDefault()->andReturn(null);
+        $invoiceRepository->shouldReceive('findByHash')->byDefault()->andReturn(null);
+        $invoiceRepository->shouldReceive('findLatestWithNr')->byDefault()->andReturn(null);
+        $invoiceRepository->shouldReceive('findPaid')->byDefault()->andReturn([]);
+        $invoiceRepository->shouldReceive('findByClientId')->byDefault()->andReturn([]);
+        $invoiceRepository->shouldReceive('findUnpaidIssuedNotRemindedBefore')->byDefault()->andReturn([]);
+        $invoiceRepository->shouldReceive('findUnpaidOlderThan')->byDefault()->andReturn([]);
+        $invoiceRepository->shouldReceive('findPaidByRelId')->byDefault()->andReturn([]);
+
+        $invoiceItemRepository = \Mockery::mock(\Box\Mod\Invoice\Repository\InvoiceItemRepository::class)->shouldIgnoreMissing();
+        $invoiceItemRepository->shouldReceive('find')->byDefault()->andReturn(null);
+        $invoiceItemRepository->shouldReceive('findByInvoiceId')->byDefault()->andReturn([]);
+
+        $customPageRepository = \Mockery::mock(\Box\Mod\Custompages\Repository\CustomPageRepository::class)->shouldIgnoreMissing();
+        $customPageRepository->shouldReceive('find')->byDefault()->andReturn(null);
+        $customPageRepository->shouldReceive('findOneBySlug')->byDefault()->andReturn(null);
+        $customPageRepository->shouldReceive('findOneBySlugExcludingId')->byDefault()->andReturn(null);
+        $customPageRepository->shouldReceive('deleteByIds')->byDefault()->andReturn(0);
+        $customPageQueryBuilder = \Mockery::mock(\Doctrine\ORM\QueryBuilder::class)->shouldIgnoreMissing();
+        foreach (['andWhere', 'orWhere', 'setParameter', 'orderBy', 'setFirstResult', 'setMaxResults', 'where'] as $method) {
+            $customPageQueryBuilder->shouldReceive($method)->byDefault()->andReturn($customPageQueryBuilder);
+        }
+        $customPageRepository->shouldReceive('getSearchQueryBuilder')->byDefault()->andReturn($customPageQueryBuilder);
+
+        $settingRepository = \Mockery::mock(\Box\Mod\System\Repository\SettingRepository::class)->shouldIgnoreMissing();
+        $settingRepository->shouldReceive('findOneByParam')->byDefault()->andReturn(null);
+        $settingRepository->shouldReceive('findOnePublicByParam')->byDefault()->andReturn(null);
+        $settingRepository->shouldReceive('findByParams')->byDefault()->andReturn([]);
+        $settingRepository->shouldReceive('findAll')->byDefault()->andReturn([]);
+
         $em = \Mockery::mock(\Doctrine\ORM\EntityManagerInterface::class)->shouldIgnoreMissing();
+        $em->shouldReceive('wrapInTransaction')->byDefault()->andReturnUsing(static fn (callable $callback): mixed => $callback());
+        $em->shouldReceive('getConnection')->byDefault()->andReturn($defaultConnection());
         $em->shouldReceive('getRepository')->byDefault()->andReturnUsing(static fn (string $class): object => match ($class) {
             \Box\Mod\Client\Entity\Client::class => $clientRepository,
             \Box\Mod\Client\Entity\ClientBalance::class => $clientBalanceRepository,
             \Box\Mod\Client\Entity\ClientGroup::class => $clientGroupRepository,
+            \Box\Mod\Client\Entity\ClientGroupMembership::class => $clientGroupMembershipRepository,
             \Box\Mod\Client\Entity\ClientPasswordReset::class => $clientPasswordResetRepository,
             \Box\Mod\Staff\Entity\AdminGroup::class => $adminGroupRepository,
             \Box\Mod\Staff\Entity\AdminGroupMember::class => $adminGroupMemberRepository,
+            \Box\Mod\Staff\Entity\AdminPasswordReset::class => $adminPasswordResetRepository,
             \Box\Mod\Email\Entity\EmailTemplate::class => $emailTemplateRepository,
             \Box\Mod\Email\Entity\EmailTemplateGroup::class => $emailTemplateGroupRepository,
             \Box\Mod\Email\Entity\ActivityClientEmail::class => $activityClientEmailRepository,
@@ -275,6 +333,10 @@ function container(): Container
             \Box\Mod\Invoice\Entity\PayGateway::class => $payGatewayRepository,
             \Box\Mod\Invoice\Entity\Transaction::class => $transactionRepository,
             \Box\Mod\Invoice\Entity\Subscription::class => $subscriptionRepository,
+            \Box\Mod\Invoice\Entity\Invoice::class => $invoiceRepository,
+            \Box\Mod\Invoice\Entity\InvoiceItem::class => $invoiceItemRepository,
+            \Box\Mod\Custompages\Entity\CustomPage::class => $customPageRepository,
+            \Box\Mod\System\Entity\Setting::class => $settingRepository,
             \Box\Mod\Extension\Entity\Extension::class => \Mockery::mock(\Box\Mod\Extension\Repository\ExtensionRepository::class)->shouldIgnoreMissing(),
             default => $extensionMetaRepository,
         });
@@ -371,6 +433,31 @@ function accessPrivate(object $instance, string $property, mixed $value = null):
 }
 
 /**
+ * Create a Crypt double that emulates the real encrypt/decrypt contract
+ * (v2:-prefixed ciphertext, false for legacy plaintext) without depending
+ * on the application config passphrase.
+ */
+function cryptMock(): object
+{
+    $crypt = \Mockery::mock(\FOSSBilling\Core\Security\Crypt::class);
+    $crypt->shouldReceive('encrypt')
+        ->byDefault()
+        ->andReturnUsing(static fn (string $text, ?string $pass = null): string => \FOSSBilling\Core\Security\Crypt::CURRENT_FORMAT_PREFIX . base64_encode($text));
+    $crypt->shouldReceive('decrypt')
+        ->byDefault()
+        ->andReturnUsing(static function (?string $text, ?string $pass = null): string|false {
+            if (!is_string($text) || !str_starts_with($text, \FOSSBilling\Core\Security\Crypt::CURRENT_FORMAT_PREFIX)) {
+                return false;
+            }
+            $decoded = base64_decode(substr($text, strlen(\FOSSBilling\Core\Security\Crypt::CURRENT_FORMAT_PREFIX)), true);
+
+            return $decoded === false ? false : $decoded;
+        });
+
+    return $crypt;
+}
+
+/**
  * Create a Doctrine entity proxy that accepts snake_case and camelCase properties.
  *
  * The helper keeps focused unit tests concise while leaving production entities
@@ -409,8 +496,8 @@ function createEntity(string $class, array $properties = []): object
                                 $parameter = (new \ReflectionMethod($this, $method))->getParameters()[0] ?? null;
                                 $type = $parameter?->getType();
                                 if ($type instanceof \ReflectionNamedType) {
-                                    if ($type->getName() === \DateTime::class && is_string($value)) {
-                                        $value = new \DateTime($value);
+                                    if ($type->getName() === \DateTimeImmutable::class && is_string($value)) {
+                                        $value = new \DateTimeImmutable($value);
                                     } elseif ($type->getName() === 'int' && is_string($value) && ctype_digit($value)) {
                                         $value = (int) $value;
                                     } elseif ($type->getName() === 'float' && is_numeric($value)) {
@@ -434,8 +521,8 @@ function createEntity(string $class, array $properties = []): object
                                 $property = $reflection->getProperty($propertyName);
                                 $type = $property->getType();
                                 if ($type instanceof \ReflectionNamedType) {
-                                    if ($type->getName() === \DateTime::class && is_string($value)) {
-                                        $value = new \DateTime($value);
+                                    if ($type->getName() === \DateTimeImmutable::class && is_string($value)) {
+                                        $value = new \DateTimeImmutable($value);
                                     } elseif ($type->getName() === 'int' && is_numeric($value)) {
                                         $value = (int) $value;
                                     } elseif ($type->getName() === 'bool' && is_int($value)) {

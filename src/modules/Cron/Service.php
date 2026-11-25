@@ -11,8 +11,11 @@ declare(strict_types=1);
 
 namespace Box\Mod\Cron;
 
-use FOSSBilling\Config;
-use FOSSBilling\Environment;
+use Box\Mod\Cron\Event\AfterAdminCronRunEvent;
+use Box\Mod\Cron\Event\BeforeAdminCronRunEvent;
+use Box\Mod\System\Entity\Setting;
+use FOSSBilling\Core\System\Config;
+use FOSSBilling\Core\System\Environment;
 use Symfony\Component\Filesystem\Path;
 
 class Service
@@ -58,33 +61,55 @@ class Service
 
     public function runCrons(): bool
     {
+        return $this->di['update_finalization']->withRuntimeLock(fn (): bool => $this->runCronsLocked());
+    }
+
+    private function runCronsLocked(): bool
+    {
         $hadCronFlag = isset($this->di['is_cron']);
         $previousCronFlag = $hadCronFlag ? $this->di['is_cron'] : null;
         $this->di['is_cron'] = true;
 
         try {
             if ($this->di['update_finalization']->isRequired()) {
-                $this->di['logger']->setChannel('cron')->warning('Skipped cron execution because update finalization is pending.');
+                $this->di['logger']->withChannel('cron')->warning('Skipped cron execution because update finalization is pending.');
 
-                throw new \FOSSBilling\InformationException('Update finalization is pending. Cron jobs are paused until finalization is completed.', [], 503);
+                throw new \FOSSBilling\Core\Exception\InformationException('Update finalization is pending. Cron jobs are paused until finalization is completed.', [], 503);
+            }
+
+            // Same-version drift never triggers version-gated finalization, and the
+            // ambient sync is skipped on CLI - heal here before invoice/order tasks
+            // run. Healing failures only log; execution continues as before.
+            // @see https://github.com/FOSSBilling/FOSSBilling/issues/4392
+            try {
+                $this->di['update_finalization']->healSchemaDrift();
+            } catch (\Throwable $exception) {
+                $this->di['logger']->withChannel('cron')->warning(
+                    'Schema drift healing failed before cron execution: {exception_message}',
+                    ['exception_message' => $exception->getMessage()]
+                );
             }
 
             $api = $this->di['api_system'];
-            $this->di['logger']->setChannel('cron')->info('Started executing cron jobs.');
+            $this->di['logger']->withChannel('cron')->info('Started executing cron jobs.');
 
             // @core tasks
-            $this->_exec($api, 'hook_batch_connect');
-            $this->di['events_manager']->fire(['event' => 'onBeforeAdminCronRun']);
+            $this->di['event_dispatcher']->dispatch(new BeforeAdminCronRunEvent());
 
             $this->_exec($api, 'invoice_batch_pay_with_credits');
             $this->_exec($api, 'invoice_batch_activate_paid');
             $isolatedTasks = [
+                'invoice_batch_deliver_issued_notifications',
                 'invoice_batch_generate',
                 'invoice_batch_send_reminders',
                 'invoice_batch_invoke_due_event',
+                'invoice_batch_charge_saved_cards',
                 'order_batch_send_suspension_warnings',
+                'order_batch_process_cancel_requests',
                 'order_batch_suspend_expired',
                 'order_batch_cancel_suspended',
+                'order_batch_cancel_unpaid',
+                'order_batch_process_cancel_requests',
                 'support_batch_ticket_auto_close',
                 'client_batch_expire_password_reminders',
                 'cart_batch_expire',
@@ -96,14 +121,17 @@ class Service
                     $this->_exec($api, $method);
                 } catch (\Throwable $exception) {
                     $failedTasks[] = $method;
-                    $this->di['logger']->setChannel('cron')->error(sprintf(
-                        'Failed to run cron task %s: %s: %s in %s:%d',
-                        $method,
-                        $exception::class,
-                        $exception->getMessage(),
-                        $exception->getFile(),
-                        $exception->getLine()
-                    ));
+                    $this->di['logger']->withChannel('cron')->error(
+                        'Failed to run cron task {task}: {exception_class}: {exception_message} in {file}:{line}',
+                        [
+                            'task' => $method,
+                            'exception_class' => $exception::class,
+                            'exception_message' => $exception->getMessage(),
+                            'file' => $exception->getFile(),
+                            'line' => $exception->getLine(),
+                            'exception' => $exception,
+                        ]
+                    );
                 }
             }
 
@@ -112,17 +140,26 @@ class Service
 
             // Purge old sessions from the DB
             $count = $this->clearOldSessions() ?? 0;
-            $this->di['logger']->setChannel('cron')->info("Cleared {$count} outdated sessions from the database.");
+            $this->di['logger']->withChannel('cron')->info("Cleared {$count} outdated sessions from the database.");
 
-            $this->di['events_manager']->fire(['event' => 'onAfterAdminCronRun']);
+            $this->di['event_dispatcher']->dispatch(new AfterAdminCronRunEvent());
+
+            // Delivery may close Doctrine's manager after a failed flush. Run it
+            // last so that failure cannot prevent unrelated cron tasks.
+            try {
+                $this->_exec($api, 'support_batch_ticket_retry_close_events');
+            } catch (\Throwable $exception) {
+                $failedTasks[] = 'support_batch_ticket_retry_close_events';
+                $this->di['logger']->withChannel('cron')->error('Failed to retry support close events: {exception}', ['exception' => $exception]);
+            }
 
             if ($failedTasks !== []) {
-                $this->di['logger']->setChannel('cron')->warning('Finished executing cron jobs, but the following tasks failed: ' . implode(', ', $failedTasks) . '.');
+                $this->di['logger']->withChannel('cron')->warning('Finished executing cron jobs, but the following tasks failed: ' . implode(', ', $failedTasks) . '.');
 
                 return false;
             }
 
-            $this->di['logger']->setChannel('cron')->info('Finished executing cron jobs.');
+            $this->di['logger']->withChannel('cron')->info('Finished executing cron jobs.');
 
             return true;
         } finally {
@@ -139,6 +176,7 @@ class Service
      */
     protected function _exec($api, $method, array $params = []): void
     {
+        $this->di['em']->getRepository(Setting::class)->clearRequestCache();
         $api->{$method}($params);
 
         if (Environment::isCLI()) {
@@ -158,17 +196,21 @@ class Service
 
     public function isLate(): bool
     {
-        $t1 = new \DateTime($this->getLastExecutionTime());
-        $t2 = new \DateTime('-6min');
+        $t1 = new \DateTimeImmutable($this->getLastExecutionTime());
+        $t2 = new \DateTimeImmutable('-6min');
 
         return $t1 < $t2;
     }
 
     private function clearOldSessions(): ?int
     {
-        $maxAge = time() - Config::getProperty('security.session_lifespan', 7200);
-        $sql = 'DELETE FROM session WHERE created_at <= :age';
+        $now = time();
+        $maxAge = $now - Config::getProperty('security.session_lifespan', 7200);
+        $sql = 'DELETE FROM session WHERE lifetime < :now OR created_at <= :age';
 
-        return $this->di['db']->exec($sql, [':age' => $maxAge]);
+        return $this->di['em']->getConnection()->executeStatement($sql, [
+            'now' => $now,
+            'age' => $maxAge,
+        ]);
     }
 }

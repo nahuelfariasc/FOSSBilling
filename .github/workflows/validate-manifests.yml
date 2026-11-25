@@ -1,0 +1,28 @@
+name: Validate Module Manifests
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  validate:
+    name: 'Validate Manifests'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'Checkout Repository'
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@2.40.0
+        with:
+          php-version: '8.5'
+
+      - name: 'Install PHP Dependencies'
+        run: composer install --no-progress --no-interaction --working-dir=tools
+
+      - name: 'Validate Module Manifests'
+        run: tools/bin/console manifest:validate

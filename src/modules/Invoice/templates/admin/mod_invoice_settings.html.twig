@@ -55,26 +55,52 @@
                 </div>
                 <div class="mt-3">
                     <label class="form-check form-switch form-switch-2">
-                        <input class="form-check-input" name="invoice_auto_approval" type="checkbox" value="1" {% if params.invoice_auto_approval|default('') == '1' %}checked{% endif %}>
-                        <span class="form-check-label">{{ 'Enable Auto Invoice Approval'|trans }}</span>
+                        <input class="form-check-input" name="invoice_auto_issue" type="checkbox" value="1" {% if params.invoice_auto_issue|default('') == '1' %}checked{% endif %}>
+                        <span class="form-check-label">{{ 'Auto-Issue Wallet Top-Up Invoices'|trans }}</span>
                     </label>
+                    <small class="form-text">{{ 'When enabled, client wallet top-up invoices skip the draft stage. All other invoices are always saved as drafts first.'|trans }}</small>
+                </div>
+                <div class="mt-3">
+                    <input type="hidden" name="invoice_merge_renewals" value="0">
+                    <label class="form-check form-switch form-switch-2">
+                        <input class="form-check-input" name="invoice_merge_renewals" type="checkbox" value="1" {% if params.invoice_merge_renewals|default('') == '1' %}checked{% endif %}>
+                        <span class="form-check-label">{{ 'Merge Renewal Invoices'|trans }}</span>
+                    </label>
+                    <small class="form-text">{{ 'When enabled, the renewal batch combines orders from the same client, currency, due date, and billing period onto a single invoice instead of generating one invoice per order. Orders paid through a gateway subscription are always invoiced separately. Can be overridden per client and per order.'|trans }}</small>
+                </div>
+                <div class="mt-3">
+                    <label class="form-label d-block">{{ 'Invoice Immutability'|trans }}</label>
+                    <div class="form-check">
+                        <input class="form-check-input" id="radioImmutabilityStrict" type="radio" name="invoice_immutability" value="strict" {% if params.invoice_immutability|default('strict') == 'strict' %}checked{% endif %}>
+                        <label class="form-check-label" for="radioImmutabilityStrict">{{ 'Strict - Issued invoices cannot be edited or deleted'|trans }}</label>
+                    </div>
+                    <div class="form-check">
+                        <input class="form-check-input" id="radioImmutabilityRelaxed" type="radio" name="invoice_immutability" value="relaxed" {% if params.invoice_immutability|default('strict') == 'relaxed' %}checked{% endif %}>
+                        <label class="form-check-label" for="radioImmutabilityRelaxed">{{ 'Relaxed - Allow editing and deleting unpaid invoices after issue'|trans }}</label>
+                    </div>
+                    <small class="form-text">{{ 'Issued invoices are legal documents: in strict mode they can only be corrected with a payment, credit note, reissue, or cancel (void) — never edited or deleted. This setting is transitional and will be removed in a future release, leaving strict as the only behavior. Learn why:'|trans }} <a href="https://docs.fossbilling.org/admin-guide/invoices/" target="_blank" rel="noopener">{{ 'invoice immutability'|trans }}</a></small>
                 </div>
                 <div class="row g-3 mt-1">
                     <div class="col-lg-6">
                         <label class="form-label" for="invoice_reminder_before_due_days">{{ 'Payment Reminder Days Before Due'|trans }}</label>
                         <input class="form-control" id="invoice_reminder_before_due_days" type="text" name="invoice_reminder_before_due_days" value="{{ params.invoice_reminder_before_due_days|default('') }}" placeholder="14, 7, 1">
-                        <small class="form-hint">{{ 'Comma-separated day intervals. Leave empty to disable automatic reminders before the invoice due date.'|trans }}</small>
+                        <small class="form-text">{{ 'Comma-separated day intervals. Leave empty to disable automatic reminders before the invoice due date.'|trans }}</small>
                     </div>
                     <div class="col-lg-6">
                         <label class="form-label" for="invoice_reminder_after_due_days">{{ 'Payment Reminder Days After Due'|trans }}</label>
                         <input class="form-control" id="invoice_reminder_after_due_days" type="text" name="invoice_reminder_after_due_days" value="{{ params.invoice_reminder_after_due_days is defined ? params.invoice_reminder_after_due_days : '5' }}" placeholder="1, 7">
-                        <small class="form-hint">{{ 'Comma-separated day intervals. Leave empty to disable automatic reminders after the invoice due date.'|trans }}</small>
+                        <small class="form-text">{{ 'Comma-separated day intervals. Leave empty to disable automatic reminders after the invoice due date.'|trans }}</small>
+                    </div>
+                    <div class="col-lg-6">
+                        <label class="form-label" for="invoice_reminder_send_time">{{ 'Send Payment Reminders At'|trans }}</label>
+                        <input class="form-control" id="invoice_reminder_send_time" type="time" name="invoice_reminder_send_time" value="{{ params.invoice_reminder_send_time|default('') }}">
+                        <small class="form-text">{{ 'Time of day automatic reminders are sent, using your configured timezone. Reminders go out on the first cron run at or after this time. Leave empty to send on the first cron run after midnight.'|trans }}</small>
                     </div>
                 </div>
                 <div class="mt-3">
                     <label class="form-label" for="invoice_default_note">{{ 'Default Invoice Note'|trans }}</label>
                     <textarea class="form-control editor-textarea" id="invoice_default_note" name="invoice_default_note" rows="5">{{ params.invoice_default_note|default('') }}</textarea>
-                    <small class="form-hint">{{ 'Supports markdown format.'|trans }}</small>
+                    <small class="form-text">{{ 'Supports markdown format.'|trans }}</small>
                 </div>
             </div>
             <div class="card-body border-top">
@@ -87,23 +113,19 @@
                             <input class="form-control" id="remove_after_days" type="number" min="0" name="remove_after_days" value="{{ params.remove_after_days|default(0) }}">
                             <span class="input-group-text">{{ 'days'|trans }}</span>
                         </div>
-                        <small class="form-hint">{{ 'Set 0 to keep invoices forever.'|trans }}</small>
+                        <small class="form-text">{{ 'Set 0 to keep invoices forever. Applies to invoices past their due date: drafts are deleted, issued invoices are voided but keep their number, and credit or debit notes are never touched.'|trans }}</small>
                     </div>
                     <div class="col-lg-6">
                         <label class="form-label" for="invoice_number_padding">{{ 'Invoice Number Padding Length'|trans }}</label>
                         <input class="form-control" id="invoice_number_padding" type="number" name="invoice_number_padding" value="{{ params.invoice_number_padding|default(5) }}" min="0" max="20">
                     </div>
-                    <div class="col-lg-4">
+                    <div class="col-lg-6">
                         <label class="form-label" for="invoice_series">{{ 'Invoice Prefix / Series'|trans }}</label>
                         <input class="form-control" id="invoice_series" type="text" name="invoice_series" value="{{ params.invoice_series|default('') }}">
                     </div>
-                    <div class="col-lg-4">
-                        <label class="form-label" for="invoice_series_paid">{{ 'Paid Invoice Prefix / Series'|trans }}</label>
-                        <input class="form-control" id="invoice_series_paid" type="text" name="invoice_series_paid" value="{{ params.invoice_series_paid|default('') }}">
-                    </div>
-                    <div class="col-lg-4">
-                        <label class="form-label" for="invoice_starting_number">{{ 'Next Paid Invoice Number'|trans }}</label>
-                        <input class="form-control" id="invoice_starting_number" type="text" name="invoice_starting_number" value="{{ params.invoice_starting_number|default('') }}">
+                    <div class="col-lg-6">
+                        <label class="form-label" for="invoice_starting_number">{{ 'Next Invoice Number'|trans }}</label>
+                        <input class="form-control" id="invoice_starting_number" type="number" min="1" step="1" max="{{ constant('PHP_INT_MAX') - 1 }}" required name="invoice_starting_number" value="{{ params.invoice_starting_number|default('') }}">
                     </div>
                 </div>
             </div>
@@ -127,12 +149,12 @@
                             <input class="form-check-input" type="checkbox" name="invoice_accessible_from_hash" value="1" {% if params.invoice_accessible_from_hash|default('') == '1' %}checked{% endif %}>
                             <span class="form-check-label">{{ 'Allow Access Without Authentication Using Invoice Hash'|trans }}</span>
                         </label>
-                        <small class="form-hint">{{ "If enabled, invoices can be accessed by anyone who knows the invoice hash. The hash is a 30-60 character random hex string and is unfeasible to brute-force, but the link exposes the buyer's name, email, full address, phone, country and company/VAT. Use the lifetime setting below to automatically expire links."|trans }}</small>
+                        <small class="form-text">{{ "If enabled, invoices can be accessed by anyone who knows the invoice hash. The hash is a 30-60 character random hex string and is unfeasible to brute-force, but the link exposes the buyer's name, email, full address, phone, country and company/VAT. Use the lifetime setting below to automatically expire links."|trans }}</small>
 
                         <div class="mt-3">
                             <label class="form-label" for="invoice_hash_lifetime_days">{{ 'Invoice hash lifetime (days)'|trans }}</label>
                             <input class="form-control" type="number" min="0" id="invoice_hash_lifetime_days" name="invoice_hash_lifetime_days" value="{{ params.invoice_hash_lifetime_days|default('90') }}">
-                            <small class="form-hint">{{ 'Number of days an invoice hash link remains valid after issue. Set to 0 to never expire. The lifetime is automatically extended when the invoice email is re-sent.'|trans }}</small>
+                            <small class="form-text">{{ 'Number of days an invoice hash link remains valid after issue. Set to 0 to never expire. The lifetime is automatically extended when the invoice email is re-sent.'|trans }}</small>
                         </div>
 
                         <div class="mt-3">
@@ -141,7 +163,16 @@
                                 <input class="form-check-input" type="checkbox" name="invoice_email_attach_pdf" value="1" {% if params.invoice_email_attach_pdf|default('') == '1' %}checked{% endif %}>
                                 <span class="form-check-label">{{ 'Attach PDF Copy to Invoice Emails'|trans }}</span>
                             </label>
-                            <small class="form-hint">{{ 'Attaches a PDF copy of the invoice to the created, paid, reminder, and overdue emails, so clients who pay by bank transfer can view it without logging in.'|trans }}</small>
+                            <small class="form-text">{{ 'Attaches a PDF copy of the invoice to the created, paid, reminder, and overdue emails, so clients who pay by bank transfer can view it without logging in.'|trans }}</small>
+                        </div>
+
+                        <div class="mt-3">
+                            <input type="hidden" name="invoice_send_cancel_email" value="0">
+                            <label class="form-check form-switch form-switch-2">
+                                <input class="form-check-input" type="checkbox" name="invoice_send_cancel_email" value="1" {% if params.invoice_send_cancel_email|default('0') == '1' %}checked{% endif %}>
+                                <span class="form-check-label">{{ 'Send Email When an Invoice Is Voided'|trans }}</span>
+                            </label>
+                            <small class="form-text">{{ 'Emails the client when an unpaid invoice is voided, manually or automatically. Applies to reissued invoices as well.'|trans }}</small>
                         </div>
                     </div>
                 </div>
@@ -161,13 +192,31 @@
                     </div>
                     <div class="form-check">
                         <input class="form-check-input" id="radioInvoiceRefundLogic" type="radio" name="invoice_refund_logic" value="manual" {% if params.invoice_refund_logic|default('') == 'manual' %}checked{% endif %}>
-                        <label class="form-check-label" for="radioInvoiceRefundLogic">{{ 'Manual - No actions performed'|trans }}</label>
+                        <label class="form-check-label" for="radioInvoiceRefundLogic">{{ 'Manual - Record an offline refund document (money moves outside FOSSBilling)'|trans }}</label>
+                    </div>
+                </div>
+                <div class="row g-3 mt-1">
+                    <div class="col-lg-6">
+                        <label class="form-label" for="invoice_cn_series">{{ 'Credit Note Prefix / Series'|trans }}</label>
+                        <input class="form-control" id="invoice_cn_series" type="text" name="invoice_cn_series" value="{{ params.invoice_cn_series|default('CN-') }}">
+                    </div>
+                    <div class="col-lg-6">
+                        <label class="form-label" for="invoice_cn_starting_number">{{ 'Next Credit Note Number'|trans }}</label>
+                        <input class="form-control" id="invoice_cn_starting_number" type="number" min="1" name="invoice_cn_starting_number" value="{{ params.invoice_cn_starting_number|default('1') }}">
                     </div>
                 </div>
             </div>
             <div class="card-body border-top">
                 <h4 class="card-title mb-2">{{ 'Add Funds Settings'|trans }}</h4>
-                <p class="text-secondary mb-3">{{ 'Set optional minimum and maximum invoice amounts for client add-funds requests.'|trans }}</p>
+                <p class="text-secondary mb-3">{{ 'Control whether clients can request to add funds to their account balance, and set optional minimum and maximum invoice amounts for those requests.'|trans }}</p>
+                <div class="mb-3">
+                    <input type="hidden" name="funds_enabled" value="0">
+                    <label class="form-check form-switch form-switch-2">
+                        <input class="form-check-input" type="checkbox" name="funds_enabled" value="1" {% if params.funds_enabled|default('1') != '0' %}checked{% endif %}>
+                        <span class="form-check-label">{{ 'Enable Add Funds Feature'|trans }}</span>
+                    </label>
+                    <small class="form-text">{{ 'When disabled, clients cannot add funds and the Wallet link is hidden from client menus.'|trans }}</small>
+                </div>
                 <div class="row g-3">
                     <div class="col-lg-6">
                         <label class="form-label" for="funds_min_amount">{{ 'Minimum Amount for Add Funds Invoice'|trans }}</label>
@@ -184,4 +233,85 @@
             </div>
         </form>
     </div>
+
+    {% set cards = admin.extension_config_get({ 'ext': 'mod_invoice' }) %}
+    <div class="card mt-3" id="saved-cards">
+        <div class="card-header">
+            <div>
+                <h3 class="card-title">{{ 'Automatic payments'|trans }}</h3>
+                <p class="card-subtitle">{{ 'Clients can save a card with Stripe when they pay or on their Payment methods page. The method they saved or chose last is charged automatically for unpaid invoices that have no payment method or one of these.'|trans }}</p>
+            </div>
+        </div>
+        <form method="post" action="{{ 'invoice/card_settings_update'|api_url }}" {{ fb_api_form({ message: 'Settings Updated'|trans, reload: true }) }}>
+            <div class="card-body">
+                <div class="row g-3">
+                    <div class="col-lg-4">
+                        <label class="form-label" for="card_days_before">{{ 'Charge days before the due date'|trans }}</label>
+                        <input class="form-control" type="number" min="0" max="30" id="card_days_before" name="card_days_before" value="{{ cards.card_days_before|default(0) }}">
+                        <small class="form-text">{{ '0 charges the card on the due date.'|trans }}</small>
+                    </div>
+                    <div class="col-lg-4">
+                        <label class="form-label" for="card_retry_count">{{ 'Retries after a failed charge'|trans }}</label>
+                        <input class="form-control" type="number" min="0" max="5" id="card_retry_count" name="card_retry_count" value="{{ cards.card_retry_count|default((cards.card_retries|default('1') == '0' ? 0 : 2)) }}">
+                        <small class="form-text">{{ '0 tries once. The client gets an email after each failed charge.'|trans }}</small>
+                    </div>
+                    <div class="col-lg-4">
+                        <label class="form-label" for="card_retry_every">{{ 'Days between retries'|trans }}</label>
+                        <input class="form-control" type="number" min="1" max="30" id="card_retry_every" name="card_retry_every" value="{{ cards.card_retry_every|default(7) }}">
+                    </div>
+                </div>
+            </div>
+            <div class="card-footer text-end">
+                <button class="btn btn-primary" type="submit">{{ 'Update Settings'|trans }}</button>
+            </div>
+        </form>
+        <div class="card-body border-top" data-card-find data-done-text="{{ 'Checked :checked clients, found :found saved cards.'|trans }}">
+            <label class="form-label">{{ 'Find saved cards in Stripe'|trans }}</label>
+            <p class="text-secondary">{{ 'Checks for available cards on Stripe customer records already linked to clients. Clients choose a card on their Payment methods page to enable automatic payments.'|trans }}</p>
+            <button class="btn btn-outline-primary" type="button">{{ 'Find saved cards'|trans }}</button>
+            <div class="form-text" role="status" data-card-find-status></div>
+        </div>
+    </div>
+    <script>
+        document.addEventListener('DOMContentLoaded', function () {
+            const finder = document.querySelector('[data-card-find]');
+            if (!finder) {
+                return;
+            }
+            const button = finder.querySelector('button[type="button"]');
+            const status = finder.querySelector('[data-card-find-status]');
+            const doneText = finder.dataset.doneText;
+            let afterId = 0;
+            let running = false;
+            button.addEventListener('click', function () {
+                if (running) {
+                    return;
+                }
+                running = true;
+                button.disabled = true;
+                status.textContent = '';
+                const page = function () {
+                    FOSSBilling.api.admin.post('invoice/card_find', { after_id: afterId },
+                        function (result) {
+                            if (status) {
+                                status.textContent = doneText.replace(':checked', result.checked).replace(':found', result.found);
+                            }
+                            if (result.next === null || result.next === undefined) {
+                                running = false;
+                                button.disabled = false;
+                            } else {
+                                afterId = result.next;
+                                page();
+                            }
+                        },
+                        function (error) {
+                            running = false;
+                            button.disabled = false;
+                            FOSSBilling.message(error.message || error, 'error');
+                        });
+                };
+                page();
+            });
+        });
+    </script>
 {% endblock %}

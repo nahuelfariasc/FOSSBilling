@@ -11,7 +11,7 @@ use Doctrine\ORM\ORMSetup;
 test('maps the existing cart tables without changing their columns', function (): void {
     $config = ORMSetup::createAttributeMetadataConfig([dirname(__DIR__, 3) . '/Entity'], true);
     $config->setProxyDir(sys_get_temp_dir());
-    $config->setProxyNamespace('FOSSBilling\\Tests\\DoctrineProxies');
+    $config->setProxyNamespace('FOSSBilling\\Core\\Tests\\DoctrineProxies');
     $entityManager = new EntityManager(DriverManager::getConnection(['driver' => 'pdo_sqlite', 'memory' => true]), $config);
 
     $cart = $entityManager->getClassMetadata(Cart::class);
@@ -22,13 +22,14 @@ test('maps the existing cart tables without changing their columns', function ()
         ->and($cart->getFieldMapping('sessionId')['nullable'])->toBeTrue()
         ->and($cart->table['uniqueConstraints']['session_id_idx']['columns'])->toBe(['session_id'])
         ->and($cartProduct->getTableName())->toBe('cart_product')
-        ->and($cartProduct->getColumnNames())->toBe(['id', 'cart_id', 'product_id', 'config'])
+        ->and($cartProduct->getColumnNames())->toBe(['id', 'product_id', 'config'])
+        ->and($cartProduct->getAssociationMapping('cart')['joinColumns'][0]['name'])->toBe('cart_id')
         ->and($cartProduct->getFieldMapping('config')['nullable'])->toBeTrue();
 });
 
 test('preserves explicitly supplied cart timestamps on persist', function (): void {
-    $createdAt = new DateTime('2026-01-01 12:00:00');
-    $updatedAt = new DateTime('2026-01-02 12:00:00');
+    $createdAt = new DateTimeImmutable('2026-01-01 12:00:00');
+    $updatedAt = new DateTimeImmutable('2026-01-02 12:00:00');
     $cart = new Cart();
     $cart->setCreatedAt($createdAt);
     $cart->setUpdatedAt($updatedAt);

@@ -1,9 +1,13 @@
-# syntax=docker/dockerfile:1.26@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
+# syntax=docker/dockerfile:1.29@sha256:572cebbc2b15e6f84c077742952674889cb63cd5e9b80abdffcbe587b6f19183
 
-ARG PHP_VERSION=8.5
-ARG NODE_VERSION=24
+# Renovate needs the complete image reference to update both the tag and digest.
+ARG PHP_IMAGE=php:8.5-apache@sha256:0a785eab8b7eb4836f9c6093771c8ea15ff8ba7269444f3da70a1d33d15fe664
+# Keep PHP_VERSION overrides working without applying the default image's digest.
+ARG PHP_VERSION
+ARG PHP_VERSION_IMAGE=${PHP_VERSION:+php:${PHP_VERSION}-apache}
+ARG NODE_VERSION=26
 
-FROM php:${PHP_VERSION}-apache AS php-base
+FROM ${PHP_VERSION_IMAGE:-${PHP_IMAGE}} AS php-base
 
 RUN set -eux; \
   savedAptMark="$(apt-mark showmanual)"; \
@@ -47,7 +51,7 @@ FROM php-base AS composer-base
 
 WORKDIR /app
 
-COPY --from=composer:2@sha256:4d71c3c2109c61d5415544264b59ad4087e4c5b7244481723664138fd36d5040 /usr/bin/composer /usr/bin/composer
+COPY --from=composer:2@sha256:919efe8e62179c71dfd31fad035fd671fe7454211c6b2aa30a10af0ab4acedba /usr/bin/composer /usr/bin/composer
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends git \
@@ -57,15 +61,19 @@ RUN apt-get update \
 FROM composer-base AS php-vendor
 
 COPY composer.json composer.lock ./
+COPY src/core ./src/core
 COPY src/library ./src/library
 COPY src/modules ./src/modules
 
 RUN --mount=type=cache,target=/tmp/composer-cache,id=composer-prod \
+  set -eux; \
+  find ./src/modules -type d -name tests -prune -exec rm -rf {} +; \
   COMPOSER_CACHE_DIR=/tmp/composer-cache \
   composer install --prefer-dist --no-dev --optimize-autoloader --no-interaction --no-progress
 
 FROM composer-base AS php-dev-vendor
 COPY composer.json composer.lock ./
+COPY src/core ./src/core
 COPY src/library ./src/library
 COPY src/modules ./src/modules
 
@@ -78,14 +86,14 @@ FROM node:${NODE_VERSION}-bookworm-slim AS frontend-assets
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-COPY src/themes/admin_default/package.json src/themes/admin_default/package.json
-COPY src/themes/huraga/package.json src/themes/huraga/package.json
+COPY src/themes/default/admin/package.json src/themes/default/admin/package.json
+COPY src/themes/default/client/package.json src/themes/default/client/package.json
 
-RUN --mount=type=cache,target=/root/.npm CYPRESS_INSTALL_BINARY=0 npm ci
+RUN --mount=type=cache,target=/root/.npm npm ci
 
 COPY tsconfig.json ./
-COPY src/themes/admin_default ./src/themes/admin_default
-COPY src/themes/huraga ./src/themes/huraga
+COPY src/themes/default/admin ./src/themes/default/admin
+COPY src/themes/default/client ./src/themes/default/client
 COPY src/modules ./src/modules
 COPY frontend ./frontend
 
@@ -102,16 +110,17 @@ ARG INSTALL_TRANSLATIONS=true
 ARG TRANSLATIONS_URL=https://github.com/FOSSBilling/locale/releases/latest/download/translations.zip
 ARG TRANSLATIONS_SHA256=
 
-COPY --from=composer:2@sha256:4d71c3c2109c61d5415544264b59ad4087e4c5b7244481723664138fd36d5040 /usr/bin/composer /usr/bin/composer
+COPY --from=composer:2@sha256:919efe8e62179c71dfd31fad035fd671fe7454211c6b2aa30a10af0ab4acedba /usr/bin/composer /usr/bin/composer
 COPY composer.json ./composer.json
 COPY src ./src
 COPY README.md LICENSE ./src/
 COPY --from=php-vendor /app/src/vendor ./src/vendor
 COPY --from=frontend-assets /app/src/public/assets ./src/public/assets
-COPY --from=frontend-assets /app/src/themes/admin_default/assets/build ./src/themes/admin_default/assets/build
-COPY --from=frontend-assets /app/src/themes/huraga/assets/build ./src/themes/huraga/assets/build
+COPY --from=frontend-assets /app/src/themes/default/admin/assets/build ./src/themes/default/admin/assets/build
+COPY --from=frontend-assets /app/src/themes/default/client/assets/build ./src/themes/default/client/assets/build
 
 RUN set -eux; \
+  find ./src/modules -type d -name tests -prune -exec rm -rf {} +; \
   mkdir -p ./src/locale; \
   if [ "${INSTALL_TRANSLATIONS}" = "true" ]; then \
     curl -fsSL "${TRANSLATIONS_URL}" -o /tmp/translations.zip; \
@@ -124,9 +133,11 @@ RUN set -eux; \
   FOSSBILLING_VERSION="${FOSSBILLING_VERSION}" \
   FOSSBILLING_VERSION_TRUNCATE="${FOSSBILLING_VERSION_TRUNCATE}" \
   SENTRY_DSN="${SENTRY_DSN}" \
-  php -r '$version = getenv("FOSSBILLING_VERSION") ?: "0.0.1"; $truncate = (int) (getenv("FOSSBILLING_VERSION_TRUNCATE") ?: 0); if ($truncate > 0) { $version = substr($version, 0, $truncate); } $versionFile = "./src/library/FOSSBilling/Version.php"; $contents = file_get_contents($versionFile); $quote = chr(39); $pattern = "/public const string VERSION = " . $quote . "[^" . $quote . "]+" . $quote . ";/"; $replacement = "public const string VERSION = " . var_export($version, true) . ";"; $contents = preg_replace($pattern, $replacement, $contents, 1, $count); if ($contents === null || $count !== 1) { fwrite(STDERR, "Failed to replace FOSSBilling version.\n"); exit(1); } file_put_contents($versionFile, $contents); $dsn = getenv("SENTRY_DSN"); if ($dsn !== false && $dsn !== "") { $sentryFile = "./src/library/FOSSBilling/SentryHelper.php"; file_put_contents($sentryFile, str_replace("--replace--this--during--release--process--", $dsn, file_get_contents($sentryFile))); }'; \
-  php -r '$composer = json_decode(file_get_contents("./composer.json"), true, 512, JSON_THROW_ON_ERROR); $composer["autoload"]["psr-4"]["Box\\Mod\\"] = "modules/"; $composer["autoload"]["classmap"] = ["library/"]; $composer["config"]["vendor-dir"] = "vendor"; file_put_contents("./src/composer.json", json_encode($composer, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . PHP_EOL);'; \
+  php -r '$version = getenv("FOSSBILLING_VERSION") ?: "0.0.1"; $truncate = (int) (getenv("FOSSBILLING_VERSION_TRUNCATE") ?: 0); if ($truncate > 0) { $version = substr($version, 0, $truncate); } $versionFile = "./src/core/System/Version.php"; $contents = file_get_contents($versionFile); $quote = chr(39); $pattern = "/public const string VERSION = " . $quote . "[^" . $quote . "]+" . $quote . ";/"; $replacement = "public const string VERSION = " . var_export($version, true) . ";"; $contents = preg_replace($pattern, $replacement, $contents, 1, $count); if ($contents === null || $count !== 1) { fwrite(STDERR, "Failed to replace FOSSBilling version.\n"); exit(1); } file_put_contents($versionFile, $contents); $dsn = getenv("SENTRY_DSN"); if ($dsn !== false && $dsn !== "") { $sentryFile = "./src/core/SentryHelper.php"; file_put_contents($sentryFile, str_replace("--replace--this--during--release--process--", $dsn, file_get_contents($sentryFile))); }'; \
+  php -r '$version = getenv("FOSSBILLING_VERSION") ?: "0.0.1"; if (!preg_match("/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/", $version)) { exit(0); } foreach (glob("./src/modules/*/manifest.json") as $file) { $new = preg_replace("/\"version\": \"[^\"]+\"/", "\"version\": \"{$version}\"", file_get_contents($file), 1, $count); if ($new === null || $count !== 1) { fwrite(STDERR, "Failed to stamp the version in {$file}.\n"); exit(1); } file_put_contents($file, $new); }'; \
+  php -r '$composer = json_decode(file_get_contents("./composer.json"), true, 512, JSON_THROW_ON_ERROR); $composer["autoload"]["psr-4"]["FOSSBilling\\Core\\"] = "core/"; $composer["autoload"]["psr-4"]["Box\\Mod\\"] = "modules/"; $composer["autoload"]["classmap"] = ["library/"]; $composer["config"]["vendor-dir"] = "vendor"; file_put_contents("./src/composer.json", json_encode($composer, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . PHP_EOL);'; \
   composer --no-plugins dump-autoload --working-dir=./src --no-dev --optimize --no-interaction; \
+  php -r '$class = "FOSSBilling\\Core\\Cache\\CacheFactory"; require "./src/vendor/autoload.php"; if (!class_exists($class)) { fwrite(STDERR, "Release Composer autoloader is missing {$class}.\n"); exit(1); }'; \
   rm ./composer.json ./src/composer.json; \
   chmod -R u=rwX,go=rX ./src
 
@@ -152,12 +163,19 @@ CMD ["sh", "-c", "cron & exec apache2-foreground"]
 
 FROM runtime AS test
 
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends git \
+  && apt-get clean \
+  && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
+
 WORKDIR /workspace
 
 COPY --from=release-tree /app/src ./src
+COPY src/modules ./src/modules
 COPY --from=php-dev-vendor /app/src/vendor ./src/vendor
-COPY composer.json composer.lock phpstan.neon phpstan-baseline.neon phpunit.xml.dist ./
+COPY composer.json composer.lock phpstan.neon phpunit.xml.dist ./
 COPY tests ./tests
+COPY tools ./tools
 
 RUN set -eux; \
   php -r '$config = require "./src/config-sample.php"; file_put_contents("./src/config.php", "<?php\nreturn " . var_export($config, true) . ";\n");'; \

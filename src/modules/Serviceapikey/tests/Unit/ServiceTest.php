@@ -27,7 +27,7 @@ test('toApiArray serializes service api key entity', function (): void {
     $entity = createEntity(ServiceApiKey::class);
     $entity->id = 1;
     $entity->setApiKey('KEY-123');
-    $entity->setConfig('{"length":32}');
+    $entity->setConfig(['length' => 32]);
     $entity->onPrePersist();
 
     $result = $service->toApiArray($entity);
@@ -72,7 +72,7 @@ test('isActive returns true for active order with future expires_at', function (
 
     $order = new Order();
     $order->setStatus(Order::STATUS_ACTIVE);
-    $order->setExpiresAt(new DateTime(date('Y-m-d H:i:s', time() + 86400)));
+    $order->setExpiresAt(new DateTimeImmutable(date('Y-m-d H:i:s', time() + 86400)));
 
     $orderRepo = Mockery::mock(EntityRepository::class);
     $orderRepo->shouldReceive('findOneBy')
@@ -99,7 +99,7 @@ test('isActive returns false for expired order', function (): void {
 
     $order = new Order();
     $order->setStatus(Order::STATUS_ACTIVE);
-    $order->setExpiresAt(new DateTime(date('Y-m-d H:i:s', time() - 3600)));
+    $order->setExpiresAt(new DateTimeImmutable(date('Y-m-d H:i:s', time() - 3600)));
 
     $orderRepo = Mockery::mock(EntityRepository::class);
     $orderRepo->shouldReceive('findOneBy')->once()->andReturn($order);
@@ -196,4 +196,25 @@ test('clientSettableConfigKeys returns the apikey allowlist', function (): void 
     expect($allowed)->not->toContain('split');
     expect($allowed)->not->toContain('split_interval');
     expect($allowed)->not->toContain('case');
+});
+
+test('install creates the service_apikey table portably instead of via raw MySQL DDL', function (): void {
+    // Regression test: install() used to run raw MySQL-only DDL (backticks, ENGINE=InnoDB)
+    // directly, which fails outright on PostgreSQL/SQLite - confirmed here against a real
+    // SQLite connection. On MySQL, UpdatePatcher::patch111() already creates service_apikey
+    // unconditionally, so this hook was already redundant there; it's only load-bearing on
+    // PG/SQLite fresh installs, where nothing else creates the table.
+    $connection = Doctrine\DBAL\DriverManager::getConnection(['driver' => 'pdo_sqlite', 'memory' => true]);
+    $em = FOSSBilling\Core\Doctrine\EntityManagerFactory::create($connection);
+
+    expect($connection->createSchemaManager()->tablesExist(['service_apikey']))->toBeFalse();
+
+    $di = new Pimple\Container();
+    $di['em'] = $em;
+
+    $service = new Service();
+    $service->setDi($di);
+
+    expect($service->install())->toBeTrue();
+    expect($connection->createSchemaManager()->tablesExist(['service_apikey']))->toBeTrue();
 });

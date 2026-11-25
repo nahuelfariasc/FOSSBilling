@@ -11,9 +11,10 @@ declare(strict_types=1);
 
 namespace Box\Mod\Invoice\Controller;
 
+use Symfony\Component\HttpFoundation\HeaderUtils;
 use Symfony\Component\HttpFoundation\Response;
 
-class Admin implements \FOSSBilling\InjectionAwareInterface
+class Admin implements \FOSSBilling\Core\Container\InjectionAwareInterface
 {
     protected ?\Pimple\Container $di = null;
 
@@ -84,15 +85,17 @@ class Admin implements \FOSSBilling\InjectionAwareInterface
         ];
     }
 
-    public function register(\Box_App &$app): void
+    public function register(\FOSSBilling\Core\Http\App &$app): void
     {
         $app->get('/invoice', 'get_index', [], static::class);
         $app->get('/invoice/subscriptions', 'get_subscriptions', [], static::class);
+        $app->get('/invoice/payment-recovery', 'get_payment_recovery', [], static::class);
         $app->get('/invoice/transactions', 'get_transactions', [], static::class);
         $app->get('/invoice/failed-items', 'get_failed_items', [], static::class);
         $app->get('/invoice/gateways', 'get_gateways', [], static::class);
         $app->get('/invoice/gateway/:id', 'get_gateway', ['id' => '[0-9]+'], static::class);
         $app->get('/invoice/manage/:id', 'get_invoice', ['id' => '[0-9]+'], static::class);
+        $app->get('/invoice/manage/:id/journal-download', 'get_journal_download', ['id' => '[0-9]+'], static::class);
         $app->get('/invoice/transaction/:id', 'get_transaction', ['id' => '[0-9]+'], static::class);
         $app->get('/invoice/subscription/:id', 'get_subscription', ['id' => '[0-9]+'], static::class);
         $app->get('/invoice/tax', 'get_taxes', [], static::class);
@@ -100,14 +103,14 @@ class Admin implements \FOSSBilling\InjectionAwareInterface
         $app->get('/invoice/pdf/:hash', 'get_pdf', ['hash' => '[a-z0-9]+'], static::class);
     }
 
-    public function get_taxes(\Box_App $app): string
+    public function get_taxes(\FOSSBilling\Core\Http\App $app): string
     {
         $this->di['is_admin_logged'];
 
         return $app->render('mod_invoice_tax');
     }
 
-    public function get_tax(\Box_App $app, $id): string
+    public function get_tax(\FOSSBilling\Core\Http\App $app, $id): string
     {
         $api = $this->di['api_admin'];
         $tax = $api->invoice_tax_get(['id' => $id]);
@@ -115,22 +118,34 @@ class Admin implements \FOSSBilling\InjectionAwareInterface
         return $app->render('mod_invoice_taxupdate', ['tax' => $tax]);
     }
 
-    public function get_index(\Box_App $app): string
+    public function get_index(\FOSSBilling\Core\Http\App $app): string
     {
         $this->di['is_admin_logged'];
 
         return $app->render('mod_invoice_index');
     }
 
-    public function get_invoice(\Box_App $app, $id): string
+    public function get_invoice(\FOSSBilling\Core\Http\App $app, $id): string
     {
         $api = $this->di['api_admin'];
         $invoice = $api->invoice_get(['id' => $id]);
 
-        return $app->render('mod_invoice_invoice', ['invoice' => $invoice]);
+        // Loaded here rather than in Twig so an unknown id degrades to no
+        // selection instead of breaking the whole invoice page.
+        $attachProduct = null;
+        $attachProductId = $app->getRequest()->query->get('attach_product_id');
+        if ($attachProductId !== null && (string) $attachProductId !== '') {
+            try {
+                $attachProduct = $api->product_get(['id' => (int) $attachProductId]);
+            } catch (\Exception) {
+                $attachProduct = null;
+            }
+        }
+
+        return $app->render('mod_invoice_invoice', ['invoice' => $invoice, 'attach_product' => $attachProduct]);
     }
 
-    public function get_transaction(\Box_App $app, $id): string
+    public function get_transaction(\FOSSBilling\Core\Http\App $app, $id): string
     {
         $api = $this->di['api_admin'];
         $tx = $api->invoice_transaction_get(['id' => $id]);
@@ -138,28 +153,35 @@ class Admin implements \FOSSBilling\InjectionAwareInterface
         return $app->render('mod_invoice_transaction', ['transaction' => $tx]);
     }
 
-    public function get_transactions(\Box_App $app): string
+    public function get_payment_recovery(\FOSSBilling\Core\Http\App $app): string
+    {
+        $this->di['is_admin_logged'];
+
+        return $app->render('mod_invoice_payment_recovery');
+    }
+
+    public function get_transactions(\FOSSBilling\Core\Http\App $app): string
     {
         $this->di['is_admin_logged'];
 
         return $app->render('mod_invoice_transactions');
     }
 
-    public function get_failed_items(\Box_App $app): string
+    public function get_failed_items(\FOSSBilling\Core\Http\App $app): string
     {
         $this->di['is_admin_logged'];
 
         return $app->render('mod_invoice_failed_items');
     }
 
-    public function get_subscriptions(\Box_App $app): string
+    public function get_subscriptions(\FOSSBilling\Core\Http\App $app): string
     {
         $this->di['is_admin_logged'];
 
         return $app->render('mod_invoice_subscriptions');
     }
 
-    public function get_subscription(\Box_App $app, $id): string
+    public function get_subscription(\FOSSBilling\Core\Http\App $app, $id): string
     {
         $api = $this->di['api_admin'];
         $tx = $api->invoice_subscription_get(['id' => $id]);
@@ -167,14 +189,14 @@ class Admin implements \FOSSBilling\InjectionAwareInterface
         return $app->render('mod_invoice_subscription', ['subscription' => $tx]);
     }
 
-    public function get_gateways(\Box_App $app): string
+    public function get_gateways(\FOSSBilling\Core\Http\App $app): string
     {
         $this->di['is_admin_logged'];
 
         return $app->render('mod_invoice_gateways');
     }
 
-    public function get_gateway(\Box_App $app, $id): string
+    public function get_gateway(\FOSSBilling\Core\Http\App $app, $id): string
     {
         $api = $this->di['api_admin'];
         $gateway = $api->invoice_gateway_get(['id' => $id]);
@@ -182,8 +204,11 @@ class Admin implements \FOSSBilling\InjectionAwareInterface
         return $app->render('mod_invoice_gateway', ['gateway' => $gateway]);
     }
 
-    public function get_pdf(\Box_App $app, $hash): Response
+    public function get_pdf(\FOSSBilling\Core\Http\App $app, $hash): Response
     {
+        // Staff without invoice view must not open invoices/PDFs through direct links.
+        $this->di['mod_service']('Staff')->checkPermissionsAndThrowException('invoice', 'view');
+
         $api = $this->di['api_guest'];
         $data = [
             'hash' => $hash,
@@ -191,8 +216,33 @@ class Admin implements \FOSSBilling\InjectionAwareInterface
         $response = $api->invoice_pdf($data);
 
         if (!$response instanceof Response) {
-            throw new \FOSSBilling\Exception('Invoice PDF response could not be generated');
+            throw new \FOSSBilling\Core\Exception\BaseException('Invoice PDF response could not be generated');
         }
+
+        return $response;
+    }
+
+    public function get_journal_download(\FOSSBilling\Core\Http\App $app, $id): Response
+    {
+        $this->di['is_admin_logged'];
+
+        $api = $this->di['api_admin'];
+        $journal = $api->invoice_journal(['id' => $id]);
+
+        $eventId = $app->getRequest()->query->getInt('event', 0);
+        if ($eventId > 0) {
+            $journal = array_values(array_filter(
+                $journal,
+                static fn (array $entry): bool => (int) ($entry['id'] ?? 0) === $eventId
+            ));
+        }
+
+        $response = new Response(
+            json_encode($journal, JSON_THROW_ON_ERROR | JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES),
+            Response::HTTP_OK,
+            ['Content-Type' => 'application/json']
+        );
+        $response->headers->set('Content-Disposition', HeaderUtils::makeDisposition(HeaderUtils::DISPOSITION_ATTACHMENT, 'invoice-' . ((int) $id) . '-journal.json'));
 
         return $response;
     }

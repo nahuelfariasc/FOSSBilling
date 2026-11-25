@@ -11,24 +11,39 @@
 declare(strict_types=1);
 
 use Box\Mod\Client\Entity\ClientBalance;
+use Box\Mod\Client\Repository\ClientBalanceRepository;
+use Box\Mod\Invoice\Entity\Invoice;
 use Box\Mod\Invoice\Entity\PayGateway;
-use Box\Mod\Invoice\Entity\Subscription;
 use Box\Mod\Invoice\Entity\Transaction;
+use Box\Mod\Invoice\Event\AfterAdminTransactionCreateEvent;
+use Box\Mod\Invoice\Event\AfterAdminTransactionProcessEvent;
+use Box\Mod\Invoice\Event\AfterAdminTransactionUpdateEvent;
+use Box\Mod\Invoice\Event\BeforeAdminTransactionCreateEvent;
+use Box\Mod\Invoice\Event\BeforeAdminTransactionUpdateEvent;
+use Box\Mod\Invoice\Repository\InvoiceRepository;
 use Box\Mod\Invoice\Repository\PayGatewayRepository;
-use Box\Mod\Invoice\Repository\SubscriptionRepository;
 use Box\Mod\Invoice\Repository\TransactionRepository;
-use Box\Mod\Invoice\ServiceSubscription;
+use Box\Mod\Invoice\ServicePayGateway;
 use Box\Mod\Invoice\ServiceTransaction;
 use Doctrine\ORM\EntityManagerInterface;
+use Symfony\Component\EventDispatcher\EventDispatcher as SymfonyEventDispatcher;
 
 use function Tests\Helpers\container;
 use function Tests\Helpers\createEntity;
+use function Tests\Helpers\setEntityId;
+
+require_once dirname(__DIR__) . '/Fixtures/GatewayReceiptContext.php';
 
 function transactionService(?TransactionRepository $transactionRepo = null, ?PayGatewayRepository $payGatewayRepo = null, ?EntityManagerInterface $em = null): ServiceTransaction
 {
     $service = new ServiceTransaction();
     $di = container();
     $em ??= Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('refresh')->byDefault();
+    $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+    $em->shouldReceive('close')->byDefault();
+    $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+    $em->shouldReceive('contains')->byDefault()->andReturnTrue();
     $transactionRepo ??= Mockery::mock(TransactionRepository::class);
     $payGatewayRepo ??= Mockery::mock(PayGatewayRepository::class);
     $em->shouldReceive('getRepository')->with(Transaction::class)->andReturn($transactionRepo);
@@ -47,19 +62,55 @@ test('gets dependency injection container', function (): void {
         ->and($service->getTransactionRepository())->toBe($repo);
 });
 
+function prepareTransactionUpdateMock(EntityManagerInterface $em, Transaction $transaction): void
+{
+    $db = Mockery::mock(Doctrine\DBAL\Connection::class);
+    $db->shouldReceive('getConfiguration')->byDefault()->andReturn(Tests\Helpers\fencedConfiguration());
+    $db->shouldReceive('getTransactionNestingLevel')->byDefault()->andReturn(0);
+    $db->shouldReceive('fetchOne')->with('SELECT 1')->zeroOrMoreTimes()->andReturn(1);
+    $db->shouldReceive('quoteSingleIdentifier')->with('transaction')->andReturn('"transaction"');
+    $db->shouldReceive('getDatabasePlatform')->andReturn(new Doctrine\DBAL\Platforms\MySQLPlatform());
+    $db->shouldReceive('fetchOne')->andReturnUsing(fn (): string => $transaction->getStatus());
+    $em->shouldReceive('getConnection')->andReturn($db);
+    $em->shouldReceive('wrapInTransaction')->andReturnUsing(fn (callable $callback): mixed => $callback());
+    $em->shouldReceive('refresh')->zeroOrMoreTimes();
+}
+
 test('updates a transaction', function (): void {
-    $eventsMock = Mockery::mock('\Box_EventManager');
-    $eventsMock->shouldReceive('fire')
-        ->atLeast()->once();
-
     $em = Mockery::mock(EntityManagerInterface::class);
-    $em->shouldReceive('flush')->atLeast()->once();
+    $em->shouldReceive('refresh')->byDefault();
+    $em->shouldReceive('close')->byDefault();
+    $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+    $em->shouldReceive('contains')->byDefault()->andReturnTrue();
+    $flushed = false;
+    $em->shouldReceive('flush')->once()->andReturnUsing(function () use (&$flushed): void {
+        $flushed = true;
+    });
 
-    $service = transactionService(em: $em);
-    $service->getDi()['events_manager'] = $eventsMock;
-    $service->getDi()['logger'] = new Tests\Helpers\TestLogger();
+    $invoice = createEntity(Invoice::class, ['id' => 1]);
+    $gateway = createEntity(PayGateway::class, ['id' => 1]);
+
+    $invoiceRepository = Mockery::mock(InvoiceRepository::class);
+    $invoiceRepository->shouldReceive('find')->with(1)->andReturn($invoice);
+    $payGatewayRepository = Mockery::mock(PayGatewayRepository::class);
+    $payGatewayRepository->shouldReceive('find')->with(1)->andReturn($gateway);
+
+    $em->shouldReceive('getRepository')->with(Invoice::class)->andReturn($invoiceRepository);
 
     $transactionModel = createEntity(Transaction::class, ['id' => 1]);
+    prepareTransactionUpdateMock($em, $transactionModel);
+    $events = [];
+    $dispatcher = new SymfonyEventDispatcher();
+    $dispatcher->addListener(BeforeAdminTransactionUpdateEvent::class, static function (BeforeAdminTransactionUpdateEvent $event) use (&$events, $transactionModel): void {
+        $events[] = [$event, $transactionModel->getTxnId(), false];
+    });
+    $dispatcher->addListener(AfterAdminTransactionUpdateEvent::class, static function (AfterAdminTransactionUpdateEvent $event) use (&$events, $transactionModel, &$flushed): void {
+        $events[] = [$event, $transactionModel->getTxnId(), $flushed];
+    });
+
+    $service = transactionService(payGatewayRepo: $payGatewayRepository, em: $em);
+    $service->getDi()['event_dispatcher'] = $dispatcher;
+    $service->getDi()['logger'] = new Tests\Helpers\TestLogger();
 
     $data = [
         'invoice_id' => 1,
@@ -71,49 +122,360 @@ test('updates a transaction', function (): void {
         'type' => '',
         'note' => '',
         'status' => '',
-        'validate_ipn' => '',
     ];
     $result = $service->update($transactionModel, $data);
-    expect($result)->toBeTrue();
+    expect($result)->toBeTrue()
+        ->and($events)->toHaveCount(2)
+        ->and($events[0][0])->toBeInstanceOf(BeforeAdminTransactionUpdateEvent::class)
+        ->and($events[0][0]->transactionId)->toBe(1)
+        ->and($events[0][1])->toBeNull()
+        ->and($events[0][2])->toBeFalse()
+        ->and($events[1][0])->toBeInstanceOf(AfterAdminTransactionUpdateEvent::class)
+        ->and($events[1][0]->transactionId)->toBe(1)
+        ->and($events[1][1])->toBe('2')
+        ->and($events[1][2])->toBeTrue();
+});
+
+test('updates a transaction subscription link', function (): void {
+    $em = Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('refresh')->byDefault();
+    $em->shouldReceive('close')->byDefault();
+    $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+    $em->shouldReceive('contains')->byDefault()->andReturnTrue();
+    $em->shouldReceive('flush')->atLeast()->once();
+
+    $service = transactionService(em: $em);
+    $service->getDi()['logger'] = new Tests\Helpers\TestLogger();
+
+    $transactionModel = createEntity(Transaction::class, ['id' => 1]);
+    prepareTransactionUpdateMock($em, $transactionModel);
+
+    expect($service->update($transactionModel, ['s_id' => 'I-ABC123', 's_period' => '1M']))->toBeTrue()
+        ->and($transactionModel->getSId())->toBe('I-ABC123')
+        ->and($transactionModel->getSPeriod())->toBe('1M')
+        ->and($service->update($transactionModel, ['s_id' => 'I-NEW']))->toBeTrue()
+        ->and($transactionModel->getSId())->toBe('I-NEW')
+        ->and($transactionModel->getSPeriod())->toBe('1M');
+});
+
+test('processed transaction history fields are frozen', function (): void {
+    $em = Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('refresh')->byDefault();
+    $em->shouldReceive('close')->byDefault();
+    $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+    $em->shouldReceive('contains')->byDefault()->andReturnTrue();
+    $em->shouldReceive('flush')->once();
+
+    $service = transactionService(em: $em);
+    $service->getDi()['logger'] = new Tests\Helpers\TestLogger();
+
+    $transactionModel = createEntity(Transaction::class, ['id' => 1, 'amount' => '42.50', 'currency' => 'USD']);
+    prepareTransactionUpdateMock($em, $transactionModel);
+    $transactionModel->setStatus(Transaction::STATUS_PROCESSED);
+
+    // Money and history fields cannot change once the transaction processed.
+    foreach ([['amount' => '99.99'], ['currency' => 'EUR'], ['txn_id' => 'other'], ['invoice_id' => 2]] as $data) {
+        expect(fn () => $service->update($transactionModel, $data))
+            ->toThrow(FOSSBilling\Core\Exception\InformationException::class, 'record money that already moved');
+    }
+
+    // Operational annotations may still be edited.
+    expect($service->update($transactionModel, ['note' => 'verified with gateway']))->toBeTrue()
+        ->and($transactionModel->getNote())->toBe('verified with gateway');
+});
+
+test('processed transaction accepts re-submitted unchanged values', function (): void {
+    $em = Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('refresh')->byDefault();
+    $em->shouldReceive('close')->byDefault();
+    $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+    $em->shouldReceive('contains')->byDefault()->andReturnTrue();
+    $em->shouldReceive('flush')->once();
+
+    $service = transactionService(em: $em);
+    $service->getDi()['logger'] = new Tests\Helpers\TestLogger();
+
+    $transactionModel = createEntity(Transaction::class, ['id' => 1, 'amount' => '42.50', 'currency' => 'USD']);
+    prepareTransactionUpdateMock($em, $transactionModel);
+    $transactionModel->setStatus(Transaction::STATUS_PROCESSED);
+
+    // The API renders DECIMAL '42.50' as float 42.5 and forms post '' for
+    // nulls: re-submitting those round-tripped values changes nothing.
+    expect($service->update($transactionModel, ['amount' => '42.5', 'currency' => 'USD', 'txn_status' => '', 'note' => 'x']))->toBeTrue();
+});
+
+test('transaction cannot be re-pointed to a canceled invoice', function (): void {
+    $em = Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('refresh')->byDefault();
+    $em->shouldReceive('close')->byDefault();
+    $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+    $em->shouldReceive('contains')->byDefault()->andReturnTrue();
+    $em->shouldNotReceive('flush');
+
+    $canceled = createEntity(Invoice::class, ['id' => 9]);
+    $canceled->setStatus(Invoice::STATUS_CANCELED);
+    $invoiceRepository = Mockery::mock(InvoiceRepository::class);
+    $invoiceRepository->shouldReceive('find')->with(9)->andReturn($canceled);
+    $em->shouldReceive('getRepository')->with(Invoice::class)->andReturn($invoiceRepository);
+
+    $service = transactionService(em: $em);
+    $service->getDi()['logger'] = new Tests\Helpers\TestLogger();
+
+    $transactionModel = createEntity(Transaction::class, ['id' => 1]);
+    prepareTransactionUpdateMock($em, $transactionModel);
+
+    expect(fn () => $service->update($transactionModel, ['invoice_id' => 9]))
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class, 'canceled, refunded, or replaced');
+});
+
+function transactionDeletionConnection(EntityManagerInterface $em, int $id): void
+{
+    $connection = Doctrine\DBAL\DriverManager::getConnection(['driver' => 'pdo_sqlite', 'memory' => true]);
+    $connection->executeStatement('CREATE TABLE "transaction" (id INTEGER PRIMARY KEY, status TEXT)');
+    $connection->executeStatement('CREATE TABLE client_balance (id INTEGER PRIMARY KEY, type TEXT, rel_id TEXT, gateway_transaction_id INTEGER)');
+    $connection->insert($connection->quoteSingleIdentifier('transaction'), ['id' => $id, 'status' => 'received']);
+    $em->shouldReceive('getConnection')->andReturn($connection);
+    $em->shouldReceive('refresh')->once();
+}
+
+test('processed transactions cannot be deleted', function (): void {
+    $em = Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('refresh')->byDefault();
+    $em->shouldReceive('close')->byDefault();
+    $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+    $em->shouldReceive('contains')->byDefault()->andReturnTrue();
+    $em->shouldNotReceive('remove', 'flush');
+
+    $service = transactionService(em: $em);
+    $service->getDi()['logger'] = new Tests\Helpers\TestLogger();
+
+    $transactionModel = createEntity(Transaction::class, ['id' => 1]);
+    $transactionModel->setStatus(Transaction::STATUS_PROCESSED);
+
+    expect(fn () => $service->delete($transactionModel))
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class, 'record money that already moved');
+});
+
+function prepareTransactionDeletionMock(EntityManagerInterface $em, int $id): void
+{
+    $db = Mockery::mock(Doctrine\DBAL\Connection::class);
+    $db->shouldReceive('getConfiguration')->byDefault()->andReturn(Tests\Helpers\fencedConfiguration());
+    $db->shouldReceive('getTransactionNestingLevel')->byDefault()->andReturn(0);
+    $db->shouldReceive('fetchOne')->with('SELECT 1')->zeroOrMoreTimes()->andReturn(1);
+    $db->shouldReceive('quoteSingleIdentifier')->with('transaction')->andReturn('"transaction"');
+    $db->shouldReceive('getDatabasePlatform')->andReturn(new Doctrine\DBAL\Platforms\MySQLPlatform());
+    $db->shouldReceive('fetchOne')->with('SELECT status FROM "transaction" WHERE id = ? FOR UPDATE', [$id])->andReturn(Transaction::STATUS_RECEIVED);
+    $em->shouldReceive('getConnection')->andReturn($db);
+    $em->shouldReceive('wrapInTransaction')->andReturnUsing(fn (callable $callback): mixed => $callback());
+}
+
+test('deleting a transaction removes its orphaned balance rows', function (): void {
+    $balance = createEntity(ClientBalance::class, ['id' => 7]);
+    $balanceRepository = Mockery::mock(ClientBalanceRepository::class);
+    $balanceRepository->shouldReceive('findBy')
+        ->once()
+        ->with(['type' => 'transaction', 'relId' => '1'])
+        ->andReturn([$balance]);
+
+    $em = Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('refresh')->byDefault();
+    $em->shouldReceive('close')->byDefault();
+    $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+    $em->shouldReceive('contains')->byDefault()->andReturnTrue();
+    $em->shouldReceive('getRepository')->with(ClientBalance::class)->andReturn($balanceRepository);
+    $em->shouldReceive('remove')->twice();
+    $em->shouldReceive('flush')->once();
+
+    transactionDeletionConnection($em, 1);
+
+    $service = transactionService(em: $em);
+    $service->getDi()['logger'] = new Tests\Helpers\TestLogger();
+
+    $transactionModel = createEntity(Transaction::class, ['id' => 1]);
+
+    expect($service->delete($transactionModel))->toBeTrue();
 });
 
 test('throws exception when creating transaction with missing invoice id', function (): void {
-    $eventsMock = Mockery::mock('\Box_EventManager');
-    $eventsMock->shouldReceive('fire')
-        ->atLeast()->once();
-
     $service = transactionService();
-    $service->getDi()['events_manager'] = $eventsMock;
+    $events = [];
+    $dispatcher = new SymfonyEventDispatcher();
+    $dispatcher->addListener(BeforeAdminTransactionCreateEvent::class, static function (BeforeAdminTransactionCreateEvent $event) use (&$events): void {
+        $events[] = $event;
+    });
+    $service->getDi()['event_dispatcher'] = $dispatcher;
 
     $data = [
         'skip_validation' => false,
     ];
 
-    expect(fn () => $service->create($data))
-        ->toThrow(FOSSBilling\Exception::class, 'Transaction invoice ID is missing');
+    expect(fn (): ?int => $service->create($data))
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class, 'Transaction invoice ID is missing')
+        ->and($events)->toHaveCount(1)
+        ->and($events[0]->input)->toBe(['skip_validation' => false]);
 });
 
 test('throws exception when creating transaction with missing gateway id', function (): void {
-    $eventsMock = Mockery::mock('\Box_EventManager');
-    $eventsMock->shouldReceive('fire')
-        ->atLeast()->once();
-
     $service = transactionService();
-    $service->getDi()['events_manager'] = $eventsMock;
 
     $data = [
         'skip_validation' => false,
         'invoice_id' => 2,
     ];
 
-    expect(fn () => $service->create($data))
-        ->toThrow(FOSSBilling\Exception::class, 'Payment gateway ID is missing');
+    expect(fn (): ?int => $service->create($data))
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class, 'Payment gateway ID is missing');
+});
+
+test('creates a transaction with safe lifecycle events and excludes raw IPN and credential input', function (): void {
+    $transactionRepository = Mockery::mock(TransactionRepository::class);
+    $payGatewayRepository = Mockery::mock(PayGatewayRepository::class);
+    $em = Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('refresh')->byDefault();
+    $em->shouldReceive('close')->byDefault();
+    $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+    $em->shouldReceive('contains')->byDefault()->andReturnTrue();
+    $flushed = false;
+    $em->shouldReceive('persist')->once()->with(Mockery::on(static function (Transaction $transaction): bool {
+        setEntityId($transaction, 27);
+
+        return true;
+    }));
+    $em->shouldReceive('flush')->once()->andReturnUsing(function () use (&$flushed): void {
+        $flushed = true;
+    });
+
+    $events = [];
+    $dispatcher = new SymfonyEventDispatcher();
+    $dispatcher->addListener(BeforeAdminTransactionCreateEvent::class, static function (BeforeAdminTransactionCreateEvent $event) use (&$events, &$flushed): void {
+        $events[] = [$event, $flushed];
+    });
+    $dispatcher->addListener(AfterAdminTransactionCreateEvent::class, static function (AfterAdminTransactionCreateEvent $event) use (&$events, &$flushed): void {
+        $events[] = [$event, $flushed];
+    });
+
+    $service = transactionService($transactionRepository, $payGatewayRepository, $em);
+    $service->getDi()['event_dispatcher'] = $dispatcher;
+
+    $input = [
+        'skip_validation' => true,
+        'source' => 'admin',
+        'txn_id' => 'tx_safe_ref',
+        'post' => ['token' => 'secret-post-token'],
+        'get' => ['api_key' => 'secret-query-key'],
+        'server' => ['REMOTE_ADDR' => '192.0.2.1'],
+        'http_raw_post_data' => 'raw-secret-payload',
+        'password' => 'secret-password',
+        'config' => ['secret' => 'gateway-credential'],
+    ];
+
+    expect($service->create($input))->toBe(27)
+        ->and($events)->toHaveCount(2)
+        ->and($events[0][0])->toBeInstanceOf(BeforeAdminTransactionCreateEvent::class)
+        ->and($events[0][0]->input)->toBe([
+            'skip_validation' => true,
+            'source' => 'admin',
+            'txn_id' => 'tx_safe_ref',
+        ])
+        ->and($events[0][1])->toBeFalse()
+        ->and($events[1][0])->toBeInstanceOf(AfterAdminTransactionCreateEvent::class)
+        ->and($events[1][0]->transactionId)->toBe(27)
+        ->and($events[1][1])->toBeTrue();
+});
+
+test('stores only an allow-list of the callback server data', function (): void {
+    $stored = null;
+    $em = Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('refresh')->byDefault();
+    $em->shouldReceive('close')->byDefault();
+    $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+    $em->shouldReceive('contains')->byDefault()->andReturnTrue();
+    $em->shouldReceive('persist')->once()->with(Mockery::on(static function (Transaction $transaction) use (&$stored): bool {
+        setEntityId($transaction, 28);
+        $stored = $transaction;
+
+        return true;
+    }));
+    $em->shouldReceive('flush')->once();
+
+    $service = transactionService(null, null, $em);
+    $service->getDi()['event_dispatcher'] = new SymfonyEventDispatcher();
+
+    $service->create([
+        'skip_validation' => true,
+        'source' => 'ipn',
+        'server' => [
+            'REMOTE_ADDR' => '203.0.113.9',
+            'REQUEST_METHOD' => 'POST',
+            'REQUEST_TIME_FLOAT' => 1790000000.123456,
+            'CONTENT_TYPE' => 'application/x-www-form-urlencoded',
+            'HTTP_USER_AGENT' => 'GatewayBot/1.0',
+            'HTTP_PAYPAL_TRANSMISSION_SIG' => 'signature-value',
+            'HTTP_COOKIE' => 'fb_sid=session-secret; BBLANG=en',
+            'HTTP_AUTHORIZATION' => 'Bearer authorization-secret',
+            'PHP_AUTH_PW' => 'basic-auth-secret',
+            'DB_PASSWORD' => 'environment-secret',
+        ],
+    ]);
+
+    $ipn = $stored->getIpn();
+
+    expect($ipn['server'])->toBe([
+        'REMOTE_ADDR' => '203.0.113.9',
+        'REQUEST_METHOD' => 'POST',
+        'REQUEST_TIME_FLOAT' => 1790000000.123456,
+        'CONTENT_TYPE' => 'application/x-www-form-urlencoded',
+        'HTTP_USER_AGENT' => 'GatewayBot/1.0',
+        'HTTP_PAYPAL_TRANSMISSION_SIG' => 'signature-value',
+    ])
+        ->and($stored->getIpn())->not->toContain('session-secret')
+        ->not->toContain('authorization-secret')
+        ->not->toContain('basic-auth-secret')
+        ->not->toContain('environment-secret');
+});
+
+test('a callback without server data stores none', function (): void {
+    $stored = null;
+    $em = Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('refresh')->byDefault();
+    $em->shouldReceive('close')->byDefault();
+    $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+    $em->shouldReceive('contains')->byDefault()->andReturnTrue();
+    $em->shouldReceive('persist')->once()->with(Mockery::on(static function (Transaction $transaction) use (&$stored): bool {
+        setEntityId($transaction, 29);
+        $stored = $transaction;
+
+        return true;
+    }));
+    $em->shouldReceive('flush')->once();
+
+    $service = transactionService(null, null, $em);
+    $service->getDi()['event_dispatcher'] = new SymfonyEventDispatcher();
+
+    $service->create(['skip_validation' => true, 'source' => 'ipn']);
+
+    expect($stored->getIpn())->toBe([
+        'source' => 'ipn',
+        'get' => null,
+        'post' => null,
+        'http_raw_post_data' => null,
+        'server' => null,
+    ]);
 });
 
 test('deletes a transaction', function (): void {
     $em = Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('refresh')->byDefault();
+    $em->shouldReceive('close')->byDefault();
+    $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+    $em->shouldReceive('contains')->byDefault()->andReturnTrue();
+    $balanceRepository = Mockery::mock(ClientBalanceRepository::class);
+    $balanceRepository->shouldReceive('findBy')->andReturn([]);
+    $em->shouldReceive('getRepository')->with(ClientBalance::class)->andReturn($balanceRepository);
     $em->shouldReceive('remove')->atLeast()->once();
     $em->shouldReceive('flush')->atLeast()->once();
+
+    transactionDeletionConnection($em, 7);
 
     $service = transactionService(em: $em);
     $service->getDi()['logger'] = new Tests\Helpers\TestLogger();
@@ -128,12 +490,9 @@ test('converts to api array', function (): void {
     $payGatewayModel = createEntity(PayGateway::class, ['id' => 1]);
     $payGatewayModel->setName('Stripe');
 
-    $payGatewayRepo = Mockery::mock(PayGatewayRepository::class);
-    $payGatewayRepo->shouldReceive('find')->atLeast()->once()->andReturn($payGatewayModel);
+    $service = transactionService();
 
-    $service = transactionService(payGatewayRepo: $payGatewayRepo);
-
-    $transactionModel = createEntity(Transaction::class, ['id' => 5, 'gatewayId' => 1]);
+    $transactionModel = createEntity(Transaction::class, ['id' => 5, 'gateway' => $payGatewayModel]);
 
     $result = $service->toApiArray($transactionModel, false);
     expect($result)->toBeArray();
@@ -142,22 +501,29 @@ test('converts to api array', function (): void {
         ->and($result['amount'])->toBe(0.0);
 });
 
-test('converts a transaction search result without database access', function (): void {
+test('converts to api array with an empty ipn payload', function (): void {
     $service = transactionService();
 
-    $result = $service->searchResultToApiArray([
+    $transactionModel = createEntity(Transaction::class, ['id' => 6]);
+
+    $result = $service->toApiArray($transactionModel, true);
+    expect($result['ipn'])->toBe([]);
+});
+
+test('converts a transaction result without database access', function (): void {
+    $service = transactionService();
+
+    $transaction = createEntity(Transaction::class, [
         'id' => 12,
         'invoice_id' => 34,
         'txn_id' => 'txn_123',
         'txn_status' => 'complete',
         'gateway_id' => 2,
-        'gateway' => 'Stripe',
         'amount' => '19.95',
         'currency' => 'USD',
         'type' => 'payment',
         'status' => 'processed',
         'ip' => '192.0.2.1',
-        'validate_ipn' => 1,
         'error' => null,
         'error_code' => null,
         'note' => 'Test payment',
@@ -165,71 +531,32 @@ test('converts a transaction search result without database access', function ()
         'updated_at' => '2026-07-19 10:01:00',
     ]);
 
+    $result = $service->transactionResultToApiArray($transaction, 'Stripe');
+
     expect($result)->toMatchArray([
         'id' => 12,
         'gateway' => 'Stripe',
         'amount' => 19.95,
         'status' => 'processed',
+        'created_at' => '2026-07-19 10:00:00',
+        'updated_at' => '2026-07-19 10:01:00',
     ]);
 });
 
-test('gets search query with various parameters', function (array $data, array $expectedParams, string $expectedStringPart): void {
-    $service = transactionService();
-
-    $result = $service->getSearchQuery($data);
-    expect($result[0])->toBeString();
-    expect($result[1])->toBeArray();
-
-    expect(str_contains((string) $result[0], $expectedStringPart))->toBeTrue();
-    expect($result[1])->toBe($expectedParams);
-})->with([
-    [
-        [], [], 'LEFT JOIN pay_gateway as pg on m.gateway_id = pg.id',
-    ],
-    [
-        ['search' => 'keyword'], ['note' => '%keyword%', 'search_invoice_id' => '%keyword%', 'search_txn_id' => '%keyword%', 'ipn' => '%keyword%'], 'AND (m.note LIKE :note OR m.invoice_id LIKE :search_invoice_id OR m.txn_id LIKE :search_txn_id OR m.ipn LIKE :ipn)',
-    ],
-    [
-        ['invoice_hash' => 'hashString'], ['hash' => 'hashString'], 'AND i.hash = :hash',
-    ],
-    [
-        ['invoice_id' => '1'], ['invoice_id' => '1'], 'AND m.invoice_id = :invoice_id',
-    ],
-    [
-        ['gateway_id' => '2'], ['gateway_id' => '2'], 'AND m.gateway_id = :gateway_id',
-    ],
-    [
-        ['client_id' => '3'], ['client_id' => '3'], 'AND i.client_id = :client_id',
-    ],
-    [
-        ['status' => 'active'], ['status' => 'active'], 'AND m.status = :status',
-    ],
-    [
-        ['currency' => 'Eur'], ['currency' => 'Eur'], 'AND m.currency = :currency',
-    ],
-    [
-        ['type' => 'payment'], ['type' => 'payment'], 'AND m.type = :type',
-    ],
-    [
-        ['txn_id' => 'longTxn_id'], ['txn_id' => 'longTxn_id'], 'AND m.txn_id = :txn_id',
-    ],
-    [
-        ['date_from' => '2012-12-12'], ['date_from' => strtotime('2012-12-12 00:00:00 UTC')], 'AND UNIX_TIMESTAMP(m.created_at) >= :date_from',
-    ],
-    [
-        ['date_to' => '2012-12-12'], ['date_to' => strtotime('2012-12-12 00:00:00 UTC')], 'AND UNIX_TIMESTAMP(m.created_at) <= :date_to',
-    ],
-]);
-
 test('counts transactions', function (): void {
     $queryResult = [['status' => Transaction::STATUS_RECEIVED, 'counter' => 1]];
-    $dbMock = Mockery::mock('\Box_Database');
-    $dbMock->shouldReceive('getAll')
+    $connection = Mockery::mock(Doctrine\DBAL\Connection::class);
+    $connection->shouldReceive('getConfiguration')->byDefault()->andReturn(Tests\Helpers\fencedConfiguration());
+    $connection->shouldReceive('getTransactionNestingLevel')->byDefault()->andReturn(0);
+    $connection->shouldReceive('fetchOne')->with('SELECT 1')->zeroOrMoreTimes()->andReturn(1);
+    $connection->shouldReceive('quoteSingleIdentifier')->byDefault()->with('transaction')->andReturn('"transaction"');
+    $connection->shouldReceive('quoteSingleIdentifier')->with('transaction')->andReturn('"transaction"');
+    $connection->shouldReceive('fetchAllAssociative')
         ->atLeast()->once()
         ->andReturn($queryResult);
 
     $service = transactionService();
-    $service->getDi()['db'] = $dbMock;
+    $service->getDi()['em']->shouldReceive('getConnection')->andReturn($connection);
 
     $result = $service->counter();
     expect($result)->toBeArray();
@@ -243,10 +570,24 @@ test('createAndProcess marks transaction as error when processing throws', funct
     $transactionRepo->shouldReceive('find')->with(1)->andReturn($transactionModel);
 
     $em = Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('refresh')->byDefault();
+    $em->shouldReceive('close')->byDefault();
+    $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+    $em->shouldReceive('contains')->byDefault()->andReturnTrue();
     $em->shouldReceive('getRepository')->with(Transaction::class)->andReturn($transactionRepo);
     $em->shouldReceive('getRepository')->with(PayGateway::class)->andReturn(Mockery::mock(PayGatewayRepository::class));
-    $em->shouldReceive('flush')->once();
-    $em->shouldReceive('refresh')->with($transactionModel)->once();
+    $connection = Mockery::mock(Doctrine\DBAL\Connection::class);
+    $connection->shouldReceive('getConfiguration')->byDefault()->andReturn(Tests\Helpers\fencedConfiguration());
+    $connection->shouldReceive('getTransactionNestingLevel')->byDefault()->andReturn(0);
+    $connection->shouldReceive('fetchOne')->with('SELECT 1')->zeroOrMoreTimes()->andReturn(1);
+    $connection->shouldReceive('quoteSingleIdentifier')->byDefault()->with('transaction')->andReturn('"transaction"');
+    $updates = [];
+    $connection->shouldReceive('executeStatement')->twice()->andReturnUsing(function (string $sql, array $params) use (&$updates): int {
+        $updates[] = $params;
+
+        return 1;
+    });
+    $em->shouldReceive('getConnection')->andReturn($connection);
 
     $di = container();
     $di['em'] = $em;
@@ -270,9 +611,7 @@ test('createAndProcess marks transaction as error when processing throws', funct
 
     expect($thrown)->toBeInstanceOf(RuntimeException::class)
         ->and($thrown->getMessage())->toBe('Processing failed')
-        ->and($transactionModel->getStatus())->toBe(Transaction::STATUS_ERROR)
-        ->and($transactionModel->getError())->toBe('Processing failed')
-        ->and($transactionModel->getErrorCode())->toBe(1234);
+        ->and(array_slice($updates[1], 0, 2))->toBe(['Processing failed', 1234]);
 });
 
 test('createAndProcess skips processing when transaction is already processed', function (): void {
@@ -283,6 +622,10 @@ test('createAndProcess skips processing when transaction is already processed', 
     $transactionRepo->shouldReceive('find')->with(1)->andReturn($transactionModel);
 
     $em = Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('refresh')->byDefault();
+    $em->shouldReceive('close')->byDefault();
+    $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+    $em->shouldReceive('contains')->byDefault()->andReturnTrue();
     $em->shouldReceive('getRepository')->with(Transaction::class)->andReturn($transactionRepo);
     $em->shouldReceive('getRepository')->with(PayGateway::class)->andReturn(Mockery::mock(PayGatewayRepository::class));
     $em->shouldNotReceive('flush');
@@ -300,6 +643,95 @@ test('createAndProcess skips processing when transaction is already processed', 
     expect($result)->toBe(1);
 });
 
+test('preProcessTransaction returns a boolean result', function (): void {
+    $transactionModel = createEntity(Transaction::class, ['id' => 5]);
+
+    $events = [];
+    $dispatcher = new SymfonyEventDispatcher();
+    $dispatcher->addListener(AfterAdminTransactionProcessEvent::class, static function (AfterAdminTransactionProcessEvent $event) use (&$events): void {
+        $events[] = $event;
+    });
+
+    $di = container();
+    $di['em']->shouldReceive('contains')->with($transactionModel)->andReturnTrue();
+    $connection = Mockery::mock(Doctrine\DBAL\Connection::class);
+    $connection->shouldReceive('getConfiguration')->byDefault()->andReturn(Tests\Helpers\fencedConfiguration());
+    $connection->shouldReceive('getTransactionNestingLevel')->byDefault()->andReturn(0);
+    $connection->shouldReceive('fetchOne')->with('SELECT 1')->zeroOrMoreTimes()->andReturn(1);
+    $connection->shouldReceive('quoteSingleIdentifier')->byDefault()->with('transaction')->andReturn('"transaction"');
+    $connection->shouldReceive('executeStatement')->once()->andReturn(1);
+    $di['em']->shouldReceive('getConnection')->andReturn($connection);
+    $di['event_dispatcher'] = $dispatcher;
+    $di['logger'] = new Tests\Helpers\TestLogger();
+
+    $service = Mockery::mock(ServiceTransaction::class)->makePartial();
+    $service->shouldReceive('processTransaction')
+        ->with(5)
+        ->once()
+        ->andReturnUsing(function () use (&$events): int {
+            $events[] = 'processed';
+
+            return 1;
+        });
+    $service->setDi($di);
+
+    $result = $service->preProcessTransaction($transactionModel);
+    expect($result)->toBeTrue()
+        ->and($events)->toHaveCount(2)
+        ->and($events[0])->toBe('processed')
+        ->and($events[1])->toBeInstanceOf(AfterAdminTransactionProcessEvent::class)
+        ->and($events[1]->transactionId)->toBe(5);
+});
+
+test('preProcessTransaction skips a transaction claimed by another worker', function (): void {
+    $transactionModel = createEntity(Transaction::class, ['id' => 5]);
+
+    $di = container();
+    $connection = Mockery::mock(Doctrine\DBAL\Connection::class);
+    $connection->shouldReceive('getConfiguration')->byDefault()->andReturn(Tests\Helpers\fencedConfiguration());
+    $connection->shouldReceive('getTransactionNestingLevel')->byDefault()->andReturn(0);
+    $connection->shouldReceive('fetchOne')->with('SELECT 1')->zeroOrMoreTimes()->andReturn(1);
+    $connection->shouldReceive('quoteSingleIdentifier')->byDefault()->with('transaction')->andReturn('"transaction"');
+    $connection->shouldReceive('executeStatement')->once()->andReturn(0);
+    $di['em']->shouldReceive('getConnection')->andReturn($connection);
+    $logger = new Tests\Helpers\TestLogger();
+    $di['logger'] = $logger;
+
+    $service = Mockery::mock(ServiceTransaction::class)->makePartial();
+    $service->shouldNotReceive('processTransaction');
+    $service->setDi($di);
+
+    expect($service->preProcessTransaction($transactionModel))->toBeTrue()
+        ->and($logger->calls)->toContain([
+            'method' => 'info',
+            'params' => ['Skipped processing transaction #{id}: already claimed by another worker', ['id' => 5]],
+        ]);
+});
+
+test('preProcessTransaction returns true when the adapter returns nothing', function (): void {
+    $transactionModel = createEntity(Transaction::class, ['id' => 5]);
+
+    $di = container();
+    $connection = Mockery::mock(Doctrine\DBAL\Connection::class);
+    $connection->shouldReceive('getConfiguration')->byDefault()->andReturn(Tests\Helpers\fencedConfiguration());
+    $connection->shouldReceive('getTransactionNestingLevel')->byDefault()->andReturn(0);
+    $connection->shouldReceive('fetchOne')->with('SELECT 1')->zeroOrMoreTimes()->andReturn(1);
+    $connection->shouldReceive('quoteSingleIdentifier')->byDefault()->with('transaction')->andReturn('"transaction"');
+    $connection->shouldReceive('executeStatement')->once()->andReturn(1);
+    $di['em']->shouldReceive('getConnection')->andReturn($connection);
+    $di['logger'] = new Tests\Helpers\TestLogger();
+
+    $service = Mockery::mock(ServiceTransaction::class)->makePartial();
+    $service->shouldReceive('processTransaction')
+        ->with(5)
+        ->once()
+        ->andReturnNull();
+    $service->setDi($di);
+
+    $result = $service->preProcessTransaction($transactionModel);
+    expect($result)->toBeTrue();
+});
+
 test('preProcessTransaction marks error on a generic exception', function (): void {
     $transactionModel = createEntity(Transaction::class, ['id' => 5]);
     $transactionModel->setStatus(Transaction::STATUS_PROCESSING);
@@ -308,17 +740,34 @@ test('preProcessTransaction marks error on a generic exception', function (): vo
     $transactionRepo->shouldReceive('find')->with(5)->andReturn($transactionModel);
 
     $em = Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('refresh')->byDefault();
+    $em->shouldReceive('close')->byDefault();
+    $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+    $em->shouldReceive('contains')->byDefault()->andReturnTrue();
     $em->shouldReceive('getRepository')->with(Transaction::class)->andReturn($transactionRepo);
     $em->shouldReceive('getRepository')->with(PayGateway::class)->andReturn(Mockery::mock(PayGatewayRepository::class));
-    $em->shouldReceive('flush')->once();
-    $em->shouldReceive('refresh')->with($transactionModel)->once();
+    $connection = Mockery::mock(Doctrine\DBAL\Connection::class);
+    $connection->shouldReceive('getConfiguration')->byDefault()->andReturn(Tests\Helpers\fencedConfiguration());
+    $connection->shouldReceive('getTransactionNestingLevel')->byDefault()->andReturn(0);
+    $connection->shouldReceive('fetchOne')->with('SELECT 1')->zeroOrMoreTimes()->andReturn(1);
+    $connection->shouldReceive('quoteSingleIdentifier')->byDefault()->with('transaction')->andReturn('"transaction"');
+    $updates = [];
+    $connection->shouldReceive('executeStatement')->twice()->andReturnUsing(function (string $sql, array $params) use (&$updates): int {
+        $updates[] = $params;
 
-    $eventsMock = Mockery::mock('\Box_EventManager');
-    $eventsMock->shouldNotReceive('fire');
+        return 1;
+    });
+    $em->shouldReceive('getConnection')->andReturn($connection);
+
+    $events = [];
+    $dispatcher = new SymfonyEventDispatcher();
+    $dispatcher->addListener(AfterAdminTransactionProcessEvent::class, static function (AfterAdminTransactionProcessEvent $event) use (&$events): void {
+        $events[] = $event;
+    });
 
     $di = container();
     $di['em'] = $em;
-    $di['events_manager'] = $eventsMock;
+    $di['event_dispatcher'] = $dispatcher;
     $di['logger'] = new Tests\Helpers\TestLogger();
 
     $service = Mockery::mock(ServiceTransaction::class)->makePartial();
@@ -337,14 +786,50 @@ test('preProcessTransaction marks error on a generic exception', function (): vo
     }
 
     expect($thrown)->toBeInstanceOf(RuntimeException::class)
-        ->and($transactionModel->getStatus())->toBe(Transaction::STATUS_ERROR)
-        ->and($transactionModel->getError())->toBe('Unexpected DB error');
+        ->and($updates[1][0])->toBe('Unexpected DB error')
+        ->and($events)->toBeEmpty();
+});
+
+test('processes the rest of a received transaction batch after a failure', function (): void {
+    $first = createEntity(Transaction::class, ['id' => 1]);
+    $second = createEntity(Transaction::class, ['id' => 2]);
+
+    $transactionRepository = Mockery::mock(TransactionRepository::class);
+    $transactionRepository->shouldReceive('find')->once()->with(1)->andReturn($first);
+    $transactionRepository->shouldReceive('find')->once()->with(2)->andReturn($second);
+
+    $em = Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('refresh')->byDefault();
+    $em->shouldReceive('close')->byDefault();
+    $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+    $em->shouldReceive('contains')->byDefault()->andReturnTrue();
+    $em->shouldReceive('getRepository')->with(Transaction::class)->andReturn($transactionRepository);
+
+    $di = container();
+    $di['em'] = $em;
+    $di['logger'] = new Tests\Helpers\TestLogger();
+
+    $service = Mockery::mock(ServiceTransaction::class)->makePartial();
+    $service->shouldReceive('getReceived')->once()->andReturn([
+        ['id' => 1],
+        ['id' => 2],
+    ]);
+    $service->shouldReceive('preProcessTransaction')->once()->with($first)->andThrow(new RuntimeException('First transaction failed'));
+    $service->shouldReceive('preProcessTransaction')->once()->with($second)->andReturnTrue();
+    $service->setDi($di);
+
+    expect($service->processReceivedATransactions())->toBeTrue();
 });
 
 test('claimForProcessing includes error status in claim query', function (): void {
     $execArgs = [];
-    $dbMock = Mockery::mock('\Box_Database');
-    $dbMock->shouldReceive('exec')
+    $connection = Mockery::mock(Doctrine\DBAL\Connection::class);
+    $connection->shouldReceive('getConfiguration')->byDefault()->andReturn(Tests\Helpers\fencedConfiguration());
+    $connection->shouldReceive('getTransactionNestingLevel')->byDefault()->andReturn(0);
+    $connection->shouldReceive('fetchOne')->with('SELECT 1')->zeroOrMoreTimes()->andReturn(1);
+    $connection->shouldReceive('quoteSingleIdentifier')->byDefault()->with('transaction')->andReturn('"transaction"');
+    $connection->shouldReceive('quoteSingleIdentifier')->with('transaction')->andReturn('"transaction"');
+    $connection->shouldReceive('executeStatement')
         ->withArgs(function (string $sql, array $bindings) use (&$execArgs): bool {
             $execArgs = ['sql' => $sql, 'bindings' => $bindings];
 
@@ -354,29 +839,672 @@ test('claimForProcessing includes error status in claim query', function (): voi
         ->andReturn(1);
 
     $service = transactionService();
-    $service->getDi()['db'] = $dbMock;
+    $service->getDi()['em']->shouldReceive('getConnection')->andReturn($connection);
 
     $result = $service->claimForProcessing(7);
 
     expect($result)->toBeTrue()
         ->and($execArgs['bindings'])->toContain(Transaction::STATUS_ERROR)
         ->and($execArgs['bindings'])->toContain(Transaction::STATUS_RECEIVED)
+        ->and($execArgs['bindings'])->toContain(Transaction::STATUS_APPROVED)
         ->and($execArgs['bindings'])->toContain(Transaction::STATUS_PROCESSING)
-        ->and($execArgs['sql'])->toContain('IN (?, ?)');
+        ->and($execArgs['sql'])->toContain('IN (?, ?, ?)')
+        ->and($execArgs['sql'])->toContain('"transaction"');
 });
 
-test('markTransactionError does not clobber an already processed transaction', function (): void {
-    $transactionModel = createEntity(Transaction::class, ['id' => 3]);
-    $transactionModel->setStatus(Transaction::STATUS_PROCESSED);
+test('claimForProcessing executes on SQLite despite the reserved table name', function (): void {
+    // Regression test: the raw UPDATE used the bare `transaction` table name, which is a
+    // syntax error on SQLite - every claim threw, so no payment could complete there.
+    // A real connection, not a mock, is the only way to prove the quoting works.
+    $config = Doctrine\ORM\ORMSetup::createAttributeMetadataConfig([Symfony\Component\Filesystem\Path::join(__DIR__, '..', '..', '..', 'Entity')], true);
+    $config->setUseSchemaEditorApi(true);
+    $config->setProxyDir(sys_get_temp_dir());
+    $config->setProxyNamespace('FOSSBilling\\Core\\Tests\\DoctrineProxies');
+    $entityManager = new Doctrine\ORM\EntityManager(
+        Tests\Helpers\fencedConnection(['driver' => 'pdo_sqlite', 'memory' => true]),
+        $config
+    );
+    if ($entityManager->getConnection()->getDatabasePlatform() instanceof Doctrine\DBAL\Platforms\AbstractMySQLPlatform) {
+        $entityManager->getEventManager()->addEventListener(Doctrine\ORM\Tools\ToolEvents::postGenerateSchemaTable, new FOSSBilling\Core\Doctrine\IndexLengthsListener());
+    }
+    (new Doctrine\ORM\Tools\SchemaTool($entityManager))->createSchema([
+        $entityManager->getClassMetadata(Transaction::class),
+    ]);
+
+    $tx = (new Transaction())->setStatus(Transaction::STATUS_RECEIVED);
+    $entityManager->persist($tx);
+    $entityManager->flush();
+    $id = $tx->getId();
+    $entityManager->clear();
+
+    // claimForProcessing only needs the entity manager, so wire the real one directly.
+    $service = new ServiceTransaction();
+    $di = container();
+    $di['em'] = $entityManager;
+    $service->setDi($di);
+
+    expect($service->claimForProcessing((int) $id))->toBeTrue();
+
+    $entityManager->clear();
+    expect($entityManager->find(Transaction::class, $id)?->getStatus())->toBe(Transaction::STATUS_PROCESSING);
+});
+
+test('transaction errors are recorded atomically without reopening a closed entity manager', function (string $status): void {
+    $db = Tests\Helpers\fencedConnection(['driver' => 'pdo_sqlite', 'memory' => true]);
+    $db->executeStatement('CREATE TABLE "transaction" (id INTEGER PRIMARY KEY, status TEXT NOT NULL, error TEXT, error_code INTEGER, updated_at TEXT, processing_token TEXT, gateway_completion_state INTEGER NOT NULL DEFAULT 0)');
+    $db->executeStatement('INSERT INTO "transaction" (id, status) VALUES (?, ?)', [3, $status]);
+    $em = Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('refresh')->byDefault();
+    $em->shouldReceive('close')->byDefault();
+    $em->shouldReceive('isOpen')->byDefault()->andReturnFalse();
+    $em->shouldReceive('contains')->byDefault()->andReturnTrue();
+    $em->shouldReceive('getConnection')->andReturn($db);
+    $em->shouldNotReceive('refresh');
+    $em->shouldNotReceive('flush');
+    $di = container();
+    $di['em'] = $em;
+    $service = new ServiceTransaction();
+    $service->setDi($di);
+    $db->update('"transaction"', ['processing_token' => str_repeat('a', 32)], ['id' => 3]);
+    (new ReflectionClass($service))->getProperty('processingTokens')->setValue($service, [3 => str_repeat('a', 32)]);
+    $method = (new ReflectionClass($service))->getMethod('markTransactionError');
+    $method->invoke($service, 3, new RuntimeException('late error', 42));
+    $row = $db->fetchAssociative('SELECT status, error, error_code FROM "transaction" WHERE id = 3');
+    expect($row['status'])->toBe($status === Transaction::STATUS_PROCESSED ? Transaction::STATUS_PROCESSED : Transaction::STATUS_ERROR)
+        ->and($row['error'])->toBe($status === Transaction::STATUS_PROCESSED ? null : 'late error');
+    if ($status !== Transaction::STATUS_PROCESSED) {
+        expect((int) $row['error_code'])->toBe(42);
+    }
+})->with([Transaction::STATUS_PROCESSING, Transaction::STATUS_RECEIVED, Transaction::STATUS_PROCESSED]);
+
+test('IPN payloads use arrays and reject serialized or corrupt strings at the entity boundary', function (): void {
+    $service = transactionService();
+    $model = new Transaction();
+    expect($service->getIpnPayload($model))->toBe([]);
+    $model->setIpn([]);
+    expect($service->getIpnPayload($model))->toBe([]);
+    foreach (['', '{not-json', '"scalar"', '{"source":"ipn"}'] as $raw) {
+        expect(fn () => $model->setIpn($raw))->toThrow(TypeError::class);
+    }
+    $model->setIpn(['source' => 'ipn', 'get' => []]);
+    expect($service->getIpnPayload($model))->toBe(['source' => 'ipn', 'get' => []]);
+});
+
+test('processTransaction refuses offline gateways without resolving an adapter', function (): void {
+    $gateway = createEntity(PayGateway::class, ['id' => 1]);
+    $gateway->setGateway('Custom');
+    $gateway->setName('Custom');
+
+    // The legacy crash input: a null stored payload.
+    $transactionModel = createEntity(Transaction::class, ['id' => 1]);
+    $transactionModel->setGateway($gateway);
+    $transactionModel->setIpn(null);
 
     $transactionRepo = Mockery::mock(TransactionRepository::class);
-    $transactionRepo->shouldReceive('find')->with(3)->andReturn($transactionModel);
+    $transactionRepo->shouldReceive('find')->with(1)->andReturn($transactionModel);
+
+    $service = transactionService($transactionRepo);
+    $service->getDi()['logger'] = new Tests\Helpers\TestLogger();
+    $di = $service->getDi();
+    $di['mod_service'] = $di->protect(static function (): object {
+        throw new RuntimeException('adapter must not resolve for offline gateways');
+    });
+
+    try {
+        $service->processTransaction(1);
+        expect(false)->toBeTrue('processTransaction must throw for offline gateways');
+    } catch (Payment_Exception $e) {
+        expect($e->getMessage())->toBe('Custom payments must be approved by an administrator.')
+            ->and($e->getCode())->toBe(7002);
+    }
+});
+
+test('processTransaction passes an empty array for a missing IPN payload', function (): void {
+    $gateway = createEntity(PayGateway::class, ['id' => 2]);
+    $gateway->setGateway('Stripe');
+    $gateway->setName('Stripe');
+
+    $transactionModel = createEntity(Transaction::class, ['id' => 2]);
+    $transactionModel->setGateway($gateway);
+    $transactionModel->setIpn(null);
+
+    $adapter = new class {
+        public ?array $seen = null;
+
+        public function processTransaction($api, int $id, array $data, int $gatewayId): bool
+        {
+            $this->seen = $data;
+
+            return true;
+        }
+    };
+
+    $transactionRepo = Mockery::mock(TransactionRepository::class);
+    $transactionRepo->shouldReceive('find')->with(2)->andReturn($transactionModel);
+
+    $payGatewayService = Mockery::mock(ServicePayGateway::class);
+    $payGatewayService->shouldReceive('getPaymentAdapter')->once()->andReturn($adapter);
+
+    $service = transactionService($transactionRepo);
+    $di = $service->getDi();
+    $di['logger'] = new Tests\Helpers\TestLogger();
+    $di['api_system'] = new stdClass();
+    $di['mod_service'] = $di->protect(static fn (): object => $payGatewayService);
+
+    $db = Mockery::mock(Doctrine\DBAL\Connection::class);
+    $db->shouldReceive('getConfiguration')->andReturn(Tests\Helpers\fencedConfiguration());
+    $db->shouldReceive('getTransactionNestingLevel')->byDefault()->andReturn(0);
+    $db->shouldReceive('fetchOne')->with('SELECT 1')->zeroOrMoreTimes()->andReturn(1);
+    $db->shouldReceive('quoteSingleIdentifier')->andReturn('"transaction"');
+    $db->shouldReceive('executeStatement')->once()->andReturn(1);
+    $di['em']->shouldReceive('getConnection')->andReturn($db);
+    expect($service->claimForProcessing(2))->toBeTrue();
+    expect($service->processTransaction(2))->toBeTrue()
+        ->and($adapter->seen)->toBe([]);
+});
+
+test('approveTransaction settles an offline payment', function (): void {
+    $gateway = createEntity(PayGateway::class, ['id' => 1]);
+    $gateway->setGateway('Custom');
+    $gateway->setName('Custom');
+
+    $transactionModel = createEntity(Transaction::class, ['id' => 5]);
+    $transactionModel->setGateway($gateway);
+    $transactionModel->setStatus(Transaction::STATUS_RECEIVED);
+    $transactionModel->setError('stale error');
+    $transactionModel->setErrorCode(9999);
+
+    $adapter = new readonly class($transactionModel) {
+        public function __construct(private object $tx)
+        {
+        }
+
+        public function approveTransaction($api, int $id, int $gatewayId): bool
+        {
+            $this->tx->setStatus(Transaction::STATUS_PROCESSED);
+
+            return true;
+        }
+    };
+
+    $payGatewayService = Mockery::mock(ServicePayGateway::class);
+    $payGatewayService->shouldReceive('getPaymentAdapter')->once()->andReturn($adapter);
 
     $em = Mockery::mock(EntityManagerInterface::class);
-    $em->shouldReceive('getRepository')->with(Transaction::class)->andReturn($transactionRepo);
-    $em->shouldReceive('getRepository')->with(PayGateway::class)->andReturn(Mockery::mock(PayGatewayRepository::class));
+    $em->shouldReceive('refresh')->byDefault();
+    $em->shouldReceive('close')->byDefault();
+    $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+    $em->shouldReceive('contains')->byDefault()->andReturnTrue();
+    $em->shouldReceive('flush')->atLeast()->once();
+    $connection = Mockery::mock(Doctrine\DBAL\Connection::class);
+    $connection->shouldReceive('getConfiguration')->byDefault()->andReturn(Tests\Helpers\fencedConfiguration());
+    $connection->shouldReceive('getTransactionNestingLevel')->byDefault()->andReturn(0);
+    $connection->shouldReceive('fetchOne')->with('SELECT 1')->zeroOrMoreTimes()->andReturn(1);
+    $connection->shouldReceive('quoteSingleIdentifier')->byDefault()->with('transaction')->andReturn('"transaction"');
+    $connection->shouldReceive('executeStatement')->once()->andReturn(1);
+    $em->shouldReceive('getConnection')->andReturn($connection);
+
+    $events = [];
+    $dispatcher = new SymfonyEventDispatcher();
+    $dispatcher->addListener(AfterAdminTransactionProcessEvent::class, static function (AfterAdminTransactionProcessEvent $event) use (&$events): void {
+        $events[] = $event;
+    });
+
+    $di = container();
+    $di['em'] = $em;
+    $di['api_system'] = new stdClass();
+    $di['event_dispatcher'] = $dispatcher;
+    $di['logger'] = new Tests\Helpers\TestLogger();
+    $di['mod_service'] = $di->protect(static fn (): object => $payGatewayService);
+
+    $service = new ServiceTransaction();
+    $service->setDi($di);
+
+    expect($service->approveTransaction($transactionModel))->toBeTrue()
+        ->and($transactionModel->getStatus())->toBe(Transaction::STATUS_PROCESSED)
+        ->and($transactionModel->getError())->toBeNull()
+        ->and($transactionModel->getErrorCode())->toBeNull()
+        ->and($events)->toHaveCount(1)
+        ->and($events[0]->transactionId)->toBe(5);
+});
+
+test('offline approval rejects overlapping requests and processed retries', function (string $status): void {
+    $filesystem = new Symfony\Component\Filesystem\Filesystem();
+    $database = $filesystem->tempnam(sys_get_temp_dir(), 'approval-race-');
+    $config = Doctrine\ORM\ORMSetup::createAttributeMetadataConfig([], true);
+    $config->setUseSchemaEditorApi(true);
+    $config->setProxyDir(sys_get_temp_dir());
+    $config->setProxyNamespace('FOSSBilling\\Core\\Tests\\DoctrineProxies');
+    $firstEm = new Doctrine\ORM\EntityManager(
+        Tests\Helpers\fencedConnection(['driver' => 'pdo_sqlite', 'path' => $database]),
+        $config
+    );
+    if ($firstEm->getConnection()->getDatabasePlatform() instanceof Doctrine\DBAL\Platforms\AbstractMySQLPlatform) {
+        $firstEm->getEventManager()->addEventListener(Doctrine\ORM\Tools\ToolEvents::postGenerateSchemaTable, new FOSSBilling\Core\Doctrine\IndexLengthsListener());
+    }
+    $secondEm = new Doctrine\ORM\EntityManager(
+        Tests\Helpers\fencedConnection(['driver' => 'pdo_sqlite', 'path' => $database]),
+        $config
+    );
+    if ($secondEm->getConnection()->getDatabasePlatform() instanceof Doctrine\DBAL\Platforms\AbstractMySQLPlatform) {
+        $secondEm->getEventManager()->addEventListener(Doctrine\ORM\Tools\ToolEvents::postGenerateSchemaTable, new FOSSBilling\Core\Doctrine\IndexLengthsListener());
+    }
+
+    try {
+        (new Doctrine\ORM\Tools\SchemaTool($firstEm))->createSchema([
+            $firstEm->getClassMetadata(PayGateway::class),
+            $firstEm->getClassMetadata(Transaction::class),
+        ]);
+        $gateway = (new PayGateway())->setGateway('Custom');
+        $tx = (new Transaction())->setGateway($gateway)->setStatus($status)
+            ->setError('previous failure')->setErrorCode(9999);
+        $firstEm->persist($gateway);
+        $firstEm->persist($tx);
+        $firstEm->flush();
+        $id = (int) $tx->getId();
+        // Both requests load the transaction before either claims it.
+        $secondTx = $secondEm->find(Transaction::class, $id);
+        $secondService = new ServiceTransaction();
+        $dispatches = 0;
+        $settle = function () use ($firstEm, $secondEm, $secondService, $secondTx, $tx, $id, &$dispatches): void {
+            ++$dispatches;
+            if ($dispatches > 1) {
+                throw new RuntimeException('overlapping approval reached settlement');
+            }
+            // Run the competing approval after the first request's flush.
+            expect($secondService->approveTransaction($secondTx))->toBeTrue();
+            expect($secondEm->getConnection()->fetchOne('SELECT status FROM "transaction" WHERE id = ?', [$id]))
+                ->toBe(Transaction::STATUS_PROCESSING);
+            expect($tx->getStatus())->toBe(Transaction::STATUS_PROCESSING)
+                ->and($tx->getError())->toBeNull()
+                ->and($tx->getErrorCode())->toBeNull();
+            $tx->setStatus(Transaction::STATUS_PROCESSED);
+            $firstEm->flush();
+        };
+        $adapter = new readonly class($settle) {
+            public function __construct(private Closure $settle)
+            {
+            }
+
+            public function approveTransaction($api, int $id, int $gatewayId): bool
+            {
+                ($this->settle)();
+
+                return true;
+            }
+        };
+        $payGatewayService = Mockery::mock(ServicePayGateway::class);
+        $payGatewayService->shouldReceive('getPaymentAdapter')->andReturn($adapter);
+        $dispatcher = new SymfonyEventDispatcher();
+        $events = [];
+        $dispatcher->addListener(AfterAdminTransactionProcessEvent::class, static function ($event) use (&$events): void {
+            $events[] = $event;
+        });
+        $firstService = new ServiceTransaction();
+        foreach ([[$firstService, $firstEm], [$secondService, $secondEm]] as [$service, $em]) {
+            $di = container();
+            $di['em'] = $em;
+            $di['api_system'] = new stdClass();
+            $di['logger'] = new Tests\Helpers\TestLogger();
+            $di['event_dispatcher'] = $dispatcher;
+            $di['mod_service'] = $di->protect(static fn (): object => $payGatewayService);
+            $service->setDi($di);
+        }
+
+        expect($firstService->approveTransaction($tx))->toBeTrue();
+        // Retry using the second request's stale entity after settlement.
+        expect($secondService->approveTransaction($secondTx))->toBeTrue()
+            ->and($dispatches)->toBe(1)
+            ->and($events)->toHaveCount(1)
+            ->and($secondEm->getConnection()->fetchOne('SELECT status FROM "transaction" WHERE id = ?', [$id]))
+            ->toBe(Transaction::STATUS_PROCESSED);
+    } finally {
+        $firstEm->getConnection()->close();
+        $secondEm->getConnection()->close();
+        $filesystem->remove($database);
+    }
+})->with([Transaction::STATUS_RECEIVED, Transaction::STATUS_ERROR, Transaction::STATUS_APPROVED]);
+
+test('approveTransaction refuses automated gateways', function (): void {
+    $gateway = createEntity(PayGateway::class, ['id' => 2]);
+    $gateway->setGateway('Stripe');
+
+    $transactionModel = createEntity(Transaction::class, ['id' => 6]);
+    $transactionModel->setGateway($gateway);
+
+    $service = transactionService();
+
+    expect(fn () => $service->approveTransaction($transactionModel))
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class, 'does not require manual approval');
+});
+
+test('processReceivedATransactions skips offline gateways', function (): void {
+    $gateway = createEntity(PayGateway::class, ['id' => 1]);
+    $gateway->setGateway('Custom');
+
+    $transactionModel = createEntity(Transaction::class, ['id' => 1]);
+    $transactionModel->setGateway($gateway);
+
+    $transactionRepository = Mockery::mock(TransactionRepository::class);
+    $transactionRepository->shouldReceive('find')->once()->with(1)->andReturn($transactionModel);
+
+    $em = Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('refresh')->byDefault();
+    $em->shouldReceive('close')->byDefault();
+    $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+    $em->shouldReceive('contains')->byDefault()->andReturnTrue();
+    $em->shouldReceive('getRepository')->with(Transaction::class)->andReturn($transactionRepository);
+
+    $di = container();
+    $di['em'] = $em;
+    $logger = new Tests\Helpers\TestLogger();
+    $di['logger'] = $logger;
+
+    $service = Mockery::mock(ServiceTransaction::class)->makePartial();
+    $service->shouldReceive('getReceived')->once()->andReturn([['id' => 1]]);
+    $service->shouldNotReceive('preProcessTransaction');
+    $service->setDi($di);
+
+    expect($service->processReceivedATransactions())->toBeTrue()
+        ->and($logger->calls)->toContain([
+            'method' => 'info',
+            'params' => ['Skipped processing transaction #{id}: manual approval required', ['id' => 1]],
+        ]);
+});
+
+test('exposes gateway capability flags in api arrays', function (): void {
+    $service = transactionService();
+
+    $customGateway = createEntity(PayGateway::class, ['id' => 1]);
+    $customGateway->setGateway('Custom');
+    $customGateway->setName('Custom');
+    $customTx = createEntity(Transaction::class, ['id' => 8]);
+    $customTx->setGateway($customGateway);
+
+    $result = $service->toApiArray($customTx, false);
+    expect($result['gateway_code'])->toBe('Custom')
+        ->and($result['requires_manual_approval'])->toBeTrue();
+
+    $stripeGateway = createEntity(PayGateway::class, ['id' => 2]);
+    $stripeGateway->setGateway('Stripe');
+    $stripeGateway->setName('Stripe');
+    $stripeTx = createEntity(Transaction::class, ['id' => 9]);
+    $stripeTx->setGateway($stripeGateway);
+
+    $listRow = $service->transactionResultToApiArray($stripeTx, 'Stripe', 'Stripe');
+    expect($listRow['gateway_code'])->toBe('Stripe')
+        ->and($listRow['requires_manual_approval'])->toBeFalse();
+});
+
+test('a rolled back settlement can record its error after Doctrine closes the entity manager', function (): void {
+    $db = Tests\Helpers\fencedConnection(['driver' => 'pdo_sqlite', 'memory' => true]);
+    $db->executeStatement('CREATE TABLE "transaction" (id INTEGER PRIMARY KEY, status TEXT NOT NULL, error TEXT, error_code INTEGER, updated_at TEXT, processing_token TEXT, gateway_completion_state INTEGER NOT NULL DEFAULT 0)');
+    $db->executeStatement('INSERT INTO "transaction" (id, status) VALUES (?, ?)', [3, Transaction::STATUS_PROCESSING]);
+    $config = Doctrine\ORM\ORMSetup::createAttributeMetadataConfig([Symfony\Component\Filesystem\Path::join(__DIR__, '..', '..', '..', 'Entity')], true);
+    $config->setUseSchemaEditorApi(true);
+    $config->setProxyDir(sys_get_temp_dir());
+    $config->setProxyNamespace('FOSSBilling\\Core\\Tests\\DoctrineProxies');
+    $em = new Doctrine\ORM\EntityManager($db, $config);
+    if ($em->getConnection()->getDatabasePlatform() instanceof Doctrine\DBAL\Platforms\AbstractMySQLPlatform) {
+        $em->getEventManager()->addEventListener(Doctrine\ORM\Tools\ToolEvents::postGenerateSchemaTable, new FOSSBilling\Core\Doctrine\IndexLengthsListener());
+    }
+
+    try {
+        $em->wrapInTransaction(fn () => throw new RuntimeException('settlement failed'));
+    } catch (RuntimeException $e) {
+        expect($em->isOpen())->toBeFalse();
+        $di = container();
+        $di['em'] = $em;
+        $service = new ServiceTransaction();
+        $service->setDi($di);
+        $db->update('"transaction"', ['processing_token' => str_repeat('a', 32)], ['id' => 3]);
+        (new ReflectionClass($service))->getProperty('processingTokens')->setValue($service, [3 => str_repeat('a', 32)]);
+        (new ReflectionClass($service))->getMethod('markTransactionError')->invoke($service, 3, $e);
+    }
+    expect($db->fetchOne('SELECT status FROM "transaction" WHERE id = 3'))->toBe(Transaction::STATUS_ERROR)
+        ->and($db->fetchOne('SELECT error FROM "transaction" WHERE id = 3'))->toBe('settlement failed');
+});
+
+test('stale processing claims are never reclaimed automatically', function (): void {
+    $db = Tests\Helpers\fencedConnection(['driver' => 'pdo_sqlite', 'memory' => true]);
+    $db->executeStatement('CREATE TABLE "transaction" (id INTEGER PRIMARY KEY, status TEXT NOT NULL, updated_at TEXT, error TEXT, error_code INTEGER, processing_token TEXT, gateway_completion_state INTEGER NOT NULL DEFAULT 0)');
+    $db->executeStatement('INSERT INTO "transaction" (id, status, updated_at) VALUES (?, ?, ?)', [1, Transaction::STATUS_PROCESSING, '2000-01-01 00:00:00']);
+    $db->executeStatement('INSERT INTO "transaction" (id, status, updated_at) VALUES (?, ?, ?)', [2, Transaction::STATUS_RECEIVED, '2000-01-01 00:00:00']);
+    $em = Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('refresh')->byDefault();
+    $em->shouldReceive('close')->byDefault();
+    $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+    $em->shouldReceive('contains')->byDefault()->andReturnTrue();
+    $em->shouldReceive('getConnection')->andReturn($db);
+    $di = container();
+    $di['em'] = $em;
+    $service = new ServiceTransaction();
+    $service->setDi($di);
+    expect($service->claimForProcessing(1))->toBeFalse()
+        ->and(array_column($service->getReceived(), 'id'))->toBe([2])
+        ->and($db->fetchOne('SELECT status FROM "transaction" WHERE id = 1'))->toBe(Transaction::STATUS_PROCESSING);
+});
+
+test('staff can release only a stale processing transaction', function (string $status, ?string $updatedAt, bool $eligible): void {
+    $updatedAt = $updatedAt === 'now' ? date('Y-m-d H:i:s') : $updatedAt;
+    $db = Tests\Helpers\fencedConnection(['driver' => 'pdo_sqlite', 'memory' => true]);
+    $db->executeStatement('CREATE TABLE "transaction" (id INTEGER PRIMARY KEY, status TEXT NOT NULL, updated_at TEXT, error TEXT, error_code INTEGER, processing_token TEXT, gateway_completion_state INTEGER NOT NULL DEFAULT 0)');
+    $db->executeStatement('INSERT INTO "transaction" (id, status, updated_at) VALUES (?, ?, ?)', [1, $status, $updatedAt]);
+    $em = Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('refresh')->byDefault();
+    $em->shouldReceive('close')->byDefault();
+    $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+    $em->shouldReceive('contains')->byDefault()->andReturnTrue();
+    $em->shouldReceive('getConnection')->andReturn($db);
+    $di = container();
+    $di['em'] = $em;
+    $service = new ServiceTransaction();
+    $service->setDi($di);
+    if (!$eligible) {
+        expect(fn () => $service->releaseStaleProcessing(1))->toThrow(FOSSBilling\Core\Exception\InformationException::class);
+        expect($db->fetchOne('SELECT status FROM "transaction" WHERE id = 1'))->toBe($status);
+
+        return;
+    }
+    expect($service->releaseStaleProcessing(1))->toBeTrue()
+        ->and($db->fetchOne('SELECT status FROM "transaction" WHERE id = 1'))->toBe(Transaction::STATUS_ERROR)
+        ->and($service->claimForProcessing(1))->toBeTrue();
+})->with([
+    [Transaction::STATUS_PROCESSING, '2000-01-01 00:00:00', true],
+    [Transaction::STATUS_PROCESSING, null, true],
+    [Transaction::STATUS_PROCESSING, 'now', false],
+    [Transaction::STATUS_PROCESSED, '2000-01-01 00:00:00', false],
+    [Transaction::STATUS_RECEIVED, '2000-01-01 00:00:00', false],
+]);
+
+test('deletion rechecks a stale transaction before removing financial history', function (string $actualStatus): void {
+    $db = Tests\Helpers\fencedConnection(['driver' => 'pdo_sqlite', 'memory' => true]);
+    $db->executeStatement('CREATE TABLE "transaction" (id INTEGER PRIMARY KEY, status TEXT NOT NULL)');
+    $db->executeStatement('INSERT INTO "transaction" (id, status) VALUES (?, ?)', [1, $actualStatus]);
+    $em = Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('refresh')->byDefault();
+    $em->shouldReceive('close')->byDefault();
+    $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+    $em->shouldReceive('contains')->byDefault()->andReturnTrue();
+    $em->shouldReceive('getConnection')->andReturn($db);
+    $em->shouldReceive('wrapInTransaction')->andReturnUsing(fn (callable $callback): mixed => $db->transactional(fn (): mixed => $callback()));
+    $em->shouldNotReceive('remove');
     $em->shouldNotReceive('flush');
-    $em->shouldReceive('refresh')->with($transactionModel)->once();
+    $di = container();
+    $di['em'] = $em;
+    $service = new ServiceTransaction();
+    $service->setDi($di);
+    $stale = createEntity(Transaction::class, ['id' => 1]);
+    $stale->setStatus(Transaction::STATUS_RECEIVED);
+    expect(fn () => $service->delete($stale))->toThrow(FOSSBilling\Core\Exception\InformationException::class)
+        ->and($db->fetchOne('SELECT status FROM "transaction" WHERE id = 1'))->toBe($actualStatus);
+})->with([Transaction::STATUS_PROCESSING, Transaction::STATUS_PROCESSED]);
+
+test('a still-running worker cannot be reclaimed after its claim ages', function (): void {
+    $path = tempnam(sys_get_temp_dir(), 'fb-claim-race-');
+    $db1 = Tests\Helpers\fencedConnection(['driver' => 'pdo_sqlite', 'path' => $path]);
+    $db2 = Tests\Helpers\fencedConnection(['driver' => 'pdo_sqlite', 'path' => $path]);
+
+    try {
+        $db1->executeStatement('CREATE TABLE "transaction" (id INTEGER PRIMARY KEY, status TEXT NOT NULL, updated_at TEXT, processing_token TEXT, gateway_completion_state INTEGER NOT NULL DEFAULT 0)');
+        $db1->executeStatement('INSERT INTO "transaction" (id, status) VALUES (?, ?)', [1, Transaction::STATUS_RECEIVED]);
+        $model = createEntity(Transaction::class, ['id' => 1]);
+        $second = Mockery::mock(ServiceTransaction::class)->makePartial();
+        $second->shouldNotReceive('processTransaction');
+        foreach ([[$second, $db2]] as [$service, $db]) {
+            $em = Mockery::mock(EntityManagerInterface::class);
+            $em->shouldReceive('refresh')->byDefault();
+            $em->shouldReceive('close')->byDefault();
+            $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+            $em->shouldReceive('contains')->byDefault()->andReturnTrue();
+            $em->shouldReceive('getConnection')->andReturn($db);
+            $di = container();
+            $di['em'] = $em;
+            $service->setDi($di);
+        }
+        $first = Mockery::mock(ServiceTransaction::class)->makePartial();
+        $first->shouldReceive('processTransaction')->once()->with(1)->andReturnUsing(function () use ($db1, $second, $model): void {
+            $db1->executeStatement('UPDATE "transaction" SET updated_at = ? WHERE id = ?', ['2000-01-01 00:00:00', 1]);
+            expect($second->preProcessTransaction($model))->toBeTrue()
+                ->and($second->claimForProcessing(1))->toBeFalse()
+                ->and($second->getReceived())->toBe([]);
+            $db1->executeStatement('UPDATE "transaction" SET status = ? WHERE id = ?', [Transaction::STATUS_PROCESSED, 1]);
+        });
+        $em = Mockery::mock(EntityManagerInterface::class);
+        $em->shouldReceive('refresh')->byDefault();
+        $em->shouldReceive('close')->byDefault();
+        $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+        $em->shouldReceive('contains')->byDefault()->andReturnTrue();
+        $em->shouldReceive('getConnection')->andReturn($db1);
+        $di = container();
+        $di['em'] = $em;
+        $first->setDi($di);
+        expect($first->preProcessTransaction($model))->toBeTrue()
+            ->and($db1->fetchOne('SELECT status FROM "transaction" WHERE id = 1'))->toBe(Transaction::STATUS_PROCESSED);
+    } finally {
+        $db1->close();
+        $db2->close();
+        (new Symfony\Component\Filesystem\Filesystem())->remove($path);
+    }
+});
+
+test('locked transaction edits recheck settled history before applying stale values', function (string $currentStatus): void {
+    $db = Tests\Helpers\fencedConnection(['driver' => 'pdo_sqlite', 'memory' => true]);
+    $db->executeStatement('CREATE TABLE "transaction" (id INTEGER PRIMARY KEY, status TEXT NOT NULL, amount TEXT)');
+    $db->executeStatement('INSERT INTO "transaction" (id, status, amount) VALUES (?, ?, ?)', [1, $currentStatus, '25.00']);
+    $model = createEntity(Transaction::class, ['id' => 1, 'amount' => '10.00']);
+    $model->setStatus(Transaction::STATUS_RECEIVED);
+    $em = Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('refresh')->byDefault();
+    $em->shouldReceive('close')->byDefault();
+    $em->shouldReceive('isOpen')->byDefault()->andReturnTrue();
+    $em->shouldReceive('contains')->byDefault()->andReturnTrue();
+    $em->shouldReceive('getConnection')->andReturn($db);
+    $em->shouldReceive('wrapInTransaction')->andReturnUsing(fn (callable $callback): mixed => $db->transactional(fn (): mixed => $callback()));
+    $em->shouldReceive('refresh')->once()->with($model)->andReturnUsing(function () use ($model, $currentStatus): void {
+        $model->setStatus($currentStatus)->setAmount('25.00');
+    });
+    $em->shouldReceive('flush')->never();
+    $di = container();
+    $di['em'] = $em;
+    $service = new ServiceTransaction();
+    $service->setDi($di);
+    expect(fn () => $service->update($model, ['amount' => '10.00']))
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class, 'Processed')
+        ->and($db->fetchOne('SELECT amount FROM "transaction" WHERE id = 1'))->toBe('25.00');
+})->with([Transaction::STATUS_PROCESSED]);
+
+test('a stale Doctrine entity cannot rewrite a concurrently settled transaction', function (): void {
+    $path = tempnam(sys_get_temp_dir(), 'fb-transaction-edit-');
+    $config = Doctrine\ORM\ORMSetup::createAttributeMetadataConfig([Symfony\Component\Filesystem\Path::join(__DIR__, '..', '..', '..', 'Entity')], true);
+    $config->setUseSchemaEditorApi(true);
+    $config->setProxyDir(sys_get_temp_dir());
+    $config->setProxyNamespace('FOSSBilling\\Core\\Tests\\DoctrineProxies');
+    $first = new Doctrine\ORM\EntityManager(Tests\Helpers\fencedConnection(['driver' => 'pdo_sqlite', 'path' => $path]), $config);
+    if ($first->getConnection()->getDatabasePlatform() instanceof Doctrine\DBAL\Platforms\AbstractMySQLPlatform) {
+        $first->getEventManager()->addEventListener(Doctrine\ORM\Tools\ToolEvents::postGenerateSchemaTable, new FOSSBilling\Core\Doctrine\IndexLengthsListener());
+    }
+    $second = new Doctrine\ORM\EntityManager(Tests\Helpers\fencedConnection(['driver' => 'pdo_sqlite', 'path' => $path]), $config);
+    if ($second->getConnection()->getDatabasePlatform() instanceof Doctrine\DBAL\Platforms\AbstractMySQLPlatform) {
+        $second->getEventManager()->addEventListener(Doctrine\ORM\Tools\ToolEvents::postGenerateSchemaTable, new FOSSBilling\Core\Doctrine\IndexLengthsListener());
+    }
+
+    try {
+        (new Doctrine\ORM\Tools\SchemaTool($first))->createSchema([$first->getClassMetadata(Transaction::class)]);
+        $tx = (new Transaction())->setStatus(Transaction::STATUS_RECEIVED)->setAmount('10.00');
+        $first->persist($tx);
+        $first->flush();
+        $stale = $second->find(Transaction::class, $tx->getId());
+        $tx->setStatus(Transaction::STATUS_PROCESSED)->setAmount('25.00');
+        $first->flush();
+        $di = container();
+        $di['em'] = $second;
+        $service = new ServiceTransaction();
+        $service->setDi($di);
+        expect(fn () => $service->update($stale, ['amount' => '10.00']))
+            ->toThrow(FOSSBilling\Core\Exception\InformationException::class, 'Processed');
+        expect($first->getConnection()->fetchOne('SELECT amount FROM "transaction" WHERE id = ?', [$tx->getId()]))->toBe(25);
+    } finally {
+        $first->getConnection()->close();
+        $second->getConnection()->close();
+        (new Symfony\Component\Filesystem\Filesystem())->remove($path);
+    }
+});
+
+test('API metadata updates preserve a processing claim and notify after commit', function (): void {
+    $config = Doctrine\ORM\ORMSetup::createAttributeMetadataConfig([Symfony\Component\Filesystem\Path::join(__DIR__, '..', '..', '..', 'Entity')], true);
+    $config->setUseSchemaEditorApi(true);
+    $config->setProxyDir(sys_get_temp_dir());
+    $config->setProxyNamespace('FOSSBilling\\Core\\Tests\\DoctrineProxies');
+    $em = new Doctrine\ORM\EntityManager(Tests\Helpers\fencedConnection(['driver' => 'pdo_sqlite', 'memory' => true]), $config);
+    if ($em->getConnection()->getDatabasePlatform() instanceof Doctrine\DBAL\Platforms\AbstractMySQLPlatform) {
+        $em->getEventManager()->addEventListener(Doctrine\ORM\Tools\ToolEvents::postGenerateSchemaTable, new FOSSBilling\Core\Doctrine\IndexLengthsListener());
+    }
+    (new Doctrine\ORM\Tools\SchemaTool($em))->createSchema([$em->getClassMetadata(Transaction::class)]);
+    $tx = (new Transaction())->setStatus(Transaction::STATUS_RECEIVED);
+    $em->persist($tx);
+    $em->flush();
+    $em->getConnection()->executeStatement('UPDATE "transaction" SET status = ? WHERE id = ?', [Transaction::STATUS_PROCESSING, $tx->getId()]);
+    $dispatcher = new SymfonyEventDispatcher();
+    $delivered = false;
+    $dispatcher->addListener(AfterAdminTransactionUpdateEvent::class, function () use ($em, &$delivered): void {
+        expect($em->getConnection()->isTransactionActive())->toBeFalse();
+        $delivered = true;
+    });
+    $di = container();
+    $di['em'] = $em;
+    $di['event_dispatcher'] = $dispatcher;
+    $service = new ServiceTransaction();
+    $service->setDi($di);
+    expect($service->update($tx, ['note' => 'staff annotation']))->toBeTrue()
+        ->and($em->getConnection()->fetchOne('SELECT status FROM "transaction" WHERE id = ?', [$tx->getId()]))->toBe(Transaction::STATUS_PROCESSING)
+        ->and($em->getConnection()->fetchOne('SELECT note FROM "transaction" WHERE id = ?', [$tx->getId()]))->toBe('staff annotation')
+        ->and($delivered)->toBeTrue();
+});
+
+test('a received batch stops after ownership loss or a closed entity manager', function (bool $ownershipLost): void {
+    $first = createEntity(Transaction::class, ['id' => 1]);
+    $repo = Mockery::mock(TransactionRepository::class);
+    $repo->shouldReceive('find')->once()->with(1)->andReturn($first);
+    $repo->shouldNotReceive('find')->with(2);
+    $em = Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('refresh')->byDefault();
+    $em->shouldReceive('getRepository')->with(Transaction::class)->andReturn($repo);
+    $em->shouldReceive('isOpen')->andReturnFalse();
+    $di = container();
+    $di['em'] = $em;
+    $service = Mockery::mock(ServiceTransaction::class)->makePartial();
+    $service->setDi($di);
+    $service->shouldReceive('getReceived')->once()->andReturn([['id' => 1], ['id' => 2]]);
+    $service->shouldReceive('preProcessTransaction')->once()->with($first)->andThrow($ownershipLost
+        ? new FOSSBilling\Core\Payment\OwnershipLost('displaced') : new RuntimeException('manager closed'));
+    expect($service->processReceivedATransactions())->toBeTrue();
+})->with([true, false]);
+
+test('markTransactionError does not clobber an already processed transaction', function (): void {
+    [, $em, , , $transactionModel] = receiptTestContext();
+    $transactionModel->setStatus(Transaction::STATUS_PROCESSED);
+    $em->flush();
 
     $di = container();
     $di['em'] = $em;
@@ -386,155 +1514,84 @@ test('markTransactionError does not clobber an already processed transaction', f
 
     $refl = new ReflectionClass($service);
     $method = $refl->getMethod('markTransactionError');
-    $method->invoke($service, 3, new RuntimeException('late error'));
+    $method->invoke($service, $transactionModel->getId(), new RuntimeException('late error'));
 
     expect($transactionModel->getStatus())->toBe(Transaction::STATUS_PROCESSED);
 });
 
-test('_subscribe creates and persists a subscription from an approved transaction', function (): void {
-    $tx = createEntity(Transaction::class, ['id' => 1, 'gatewayId' => 5]);
-    $tx->setStatus(Transaction::STATUS_APPROVED);
-    $tx->setInvoiceId(10);
-    $tx->setSId('sub_gateway_1');
-    $tx->setAmount('29.99');
-    $tx->setCurrency('USD');
-    $tx->setTxnId('txn_001');
+test('transaction repository follows a replaced entity manager', function (): void {
+    $first = Mockery::mock(TransactionRepository::class);
+    $second = Mockery::mock(TransactionRepository::class);
+    $old = Mockery::mock(EntityManagerInterface::class);
+    $old->shouldReceive('refresh')->byDefault();
+    $new = Mockery::mock(EntityManagerInterface::class);
+    $new->shouldReceive('refresh')->byDefault();
+    $old->shouldReceive('getRepository')->with(Transaction::class)->andReturn($first);
+    $new->shouldReceive('getRepository')->with(Transaction::class)->andReturn($second);
+    $di = container();
+    $di['em'] = $old;
+    $service = new ServiceTransaction();
+    $service->setDi($di);
+    expect($service->getTransactionRepository())->toBe($first);
+    unset($di['em']);
+    $di['em'] = $new;
+    expect($service->getTransactionRepository())->toBe($second);
+});
 
-    $transactionRepo = Mockery::mock(TransactionRepository::class);
-    $transactionRepo->shouldReceive('findOneProcessedByTxnId')->andReturnNull();
+test('transaction errors are recorded through the replacement manager', function (): void {
+    [, $new, , , $transaction] = receiptTestContext();
+    $transaction->setProcessingToken(str_repeat('a', 32));
+    $new->flush();
+    $oldRepo = Mockery::mock(TransactionRepository::class);
+    $old = Mockery::mock(EntityManagerInterface::class);
+    $old->shouldReceive('refresh')->byDefault();
+    $old->shouldReceive('getRepository')->with(Transaction::class)->andReturn($oldRepo);
+    $di = container();
+    $di['em'] = $old;
+    $service = new ServiceTransaction();
+    $service->setDi($di);
+    $service->getTransactionRepository();
+    unset($di['em']);
+    $di['em'] = $new;
+    (new ReflectionProperty($service, 'processingTokens'))->setValue($service, [$transaction->getId() => str_repeat('a', 32)]);
+    (new ReflectionClass($service))->getMethod('markTransactionError')->invoke($service, $transaction->getId(), new RuntimeException('receipt failed'));
+    expect($transaction->getStatus())->toBe(Transaction::STATUS_ERROR)
+        ->and($transaction->getError())->toBe('receipt failed');
+});
 
-    $invoice = new Model_Invoice();
-    $invoice->loadBean(new Tests\Helpers\DummyBean());
-    $invoice->id = 10;
-    $invoice->client_id = 7;
-    $invoice->currency = 'USD';
+test('retryable callbacks discard dirty objects without reopening an enclosing payment worker', function (bool $enclosingCharge): void {
+    [, $em, , , $transaction] = receiptTestContext();
+    $db = $em->getConnection();
+    $id = (int) $transaction->getId();
+    $token = str_repeat('a', 32);
+    $db->update('"transaction"', ['processing_token' => $token], ['id' => $id]);
+    $before = $db->fetchOne('SELECT amount FROM "transaction" WHERE id = ?', [$id]);
+    $service = new ServiceTransaction();
+    $di = container();
+    $di['em'] = $em;
+    $service->setDi($di);
+    (new ReflectionProperty($service, 'processingTokens'))->setValue($service, [$id => $token]);
+    $run = fn () => (new ReflectionMethod($service, 'withProcessingFence'))->invoke($service, $id, function () use ($transaction): never {
+        $transaction->setAmount('999.00');
 
-    $dbMock = Mockery::mock('\Box_Database');
-    $dbMock->shouldReceive('load')->with('Invoice', 10)->andReturn($invoice);
-
-    $subscriptionService = Mockery::mock(ServiceSubscription::class);
-    $subscriptionService->shouldReceive('getSubscriptionPeriod')->with($invoice)->andReturn('1M');
-
-    $em = Mockery::mock(EntityManagerInterface::class);
-    $em->shouldReceive('getRepository')->with(Transaction::class)->andReturn($transactionRepo);
-    $em->shouldReceive('getRepository')->with(PayGateway::class)->andReturn(Mockery::mock(PayGatewayRepository::class));
-
-    $capturedSubscription = null;
-    $em->shouldReceive('persist')->once()->withArgs(function (object $entity) use (&$capturedSubscription): bool {
-        $capturedSubscription = $entity;
-
-        return $entity instanceof Subscription;
+        throw new Box\Mod\Invoice\Exception\RetryableCallbackException('Provider temporarily unavailable');
     });
-    $em->shouldReceive('flush')->atLeast()->once();
 
-    $eventsMock = Mockery::mock('\Box_EventManager');
-    $eventsMock->shouldReceive('fire');
-
-    $di = container();
-    $di['db'] = $dbMock;
-    $di['em'] = $em;
-    $di['events_manager'] = $eventsMock;
-    $di['logger'] = new Tests\Helpers\TestLogger();
-    $di['mod_service'] = $di->protect(fn ($module, $sub = '') => $subscriptionService);
-
-    $service = new ServiceTransaction();
-    $service->setDi($di);
-
-    $refl = new ReflectionClass($service);
-    $method = $refl->getMethod('_subscribe');
-    $method->invoke($service, $tx);
-
-    expect($tx->getStatus())->toBe(Transaction::STATUS_PROCESSED);
-    expect($capturedSubscription)->toBeInstanceOf(Subscription::class)
-        ->and($capturedSubscription->getSid())->toBe('sub_gateway_1')
-        ->and($capturedSubscription->getClientId())->toBe(7)
-        ->and($capturedSubscription->getPayGatewayId())->toBe(5)
-        ->and($capturedSubscription->getRelType())->toBe('invoice')
-        ->and($capturedSubscription->getRelId())->toBe(10)
-        ->and($capturedSubscription->getAmount())->toBe(29.99)
-        ->and($capturedSubscription->getCurrency())->toBe('USD')
-        ->and($capturedSubscription->getPeriod())->toBe('1M')
-        ->and($capturedSubscription->getStatus())->toBe('active');
-});
-
-test('_unsubscribe looks up the subscription by sid and delegates to the subscription service', function (): void {
-    $tx = createEntity(Transaction::class, ['id' => 1, 'gatewayId' => 5]);
-    $tx->setStatus(Transaction::STATUS_APPROVED);
-    $tx->setSId('sub_gateway_1');
-    $tx->setTxnId('txn_001');
-
-    $transactionRepo = Mockery::mock(TransactionRepository::class);
-    $transactionRepo->shouldReceive('findOneProcessedByTxnId')->andReturnNull();
-
-    $subscription = createEntity(Subscription::class, ['id' => 12]);
-    $subscriptionRepo = Mockery::mock(SubscriptionRepository::class);
-    $subscriptionRepo->shouldReceive('findOneBySid')
-        ->once()
-        ->with('sub_gateway_1')
-        ->andReturn($subscription);
-
-    $subscriptionService = Mockery::mock(ServiceSubscription::class);
-    $subscriptionService->shouldReceive('unsubscribe')
-        ->once()
-        ->with(Mockery::on(fn ($arg): bool => $arg instanceof Subscription && $arg->getId() === 12));
-
-    $em = Mockery::mock(EntityManagerInterface::class);
-    $em->shouldReceive('getRepository')->with(Transaction::class)->andReturn($transactionRepo);
-    $em->shouldReceive('getRepository')->with(PayGateway::class)->andReturn(Mockery::mock(PayGatewayRepository::class));
-    $em->shouldReceive('getRepository')->with(Subscription::class)->andReturn($subscriptionRepo);
-    $em->shouldReceive('flush')->atLeast()->once();
-
-    $eventsMock = Mockery::mock('\Box_EventManager');
-    $eventsMock->shouldReceive('fire');
-
-    $di = container();
-    $di['em'] = $em;
-    $di['events_manager'] = $eventsMock;
-    $di['logger'] = new Tests\Helpers\TestLogger();
-    $di['mod_service'] = $di->protect(fn ($module, $sub = '') => $subscriptionService);
-
-    $service = new ServiceTransaction();
-    $service->setDi($di);
-
-    $refl = new ReflectionClass($service);
-    $method = $refl->getMethod('_unsubscribe');
-    $method->invoke($service, $tx);
-
-    expect($tx->getStatus())->toBe(Transaction::STATUS_PROCESSED);
-});
-
-test('debitTransaction records a client balance credit', function (): void {
-    $proforma = new Model_Invoice();
-    $proforma->loadBean(new Tests\Helpers\DummyBean());
-    $proforma->id = 5;
-    $proforma->client_id = 20;
-    $proforma->currency = 'USD';
-
-    $client = new Model_Client();
-    $client->loadBean(new Tests\Helpers\DummyBean());
-    $client->id = 20;
-    $client->currency = 'USD';
-
-    $tx = createEntity(Transaction::class, ['id' => 7, 'invoice_id' => 5, 'currency' => 'USD', 'amount' => '25.00']);
-
-    $db = Mockery::mock(Box_Database::class);
-    $db->shouldReceive('load')->once()->with('Invoice', 5)->andReturn($proforma);
-    $db->shouldReceive('load')->once()->with('Client', 20)->andReturn($client);
-
-    $em = Mockery::mock(EntityManagerInterface::class);
-    $em->shouldReceive('persist')->once()->with(
-        Mockery::on(function (ClientBalance $balance): bool {
-            return $balance->getClientId() === 20
-                && $balance->getType() === 'transaction'
-                && $balance->getRelId() === '7'
-                && $balance->getDescription() === 'Invoice #5 payment received from transaction #7'
-                && $balance->getAmount() === '25.00';
-        })
-    );
-    $em->shouldReceive('flush')->once();
-
-    $service = transactionService(em: $em);
-    $service->getDi()['db'] = $db;
-
-    $service->debitTransaction($tx);
-});
+    try {
+        if ($enclosingCharge) {
+            $owner = null;
+            $attempt = Box\Mod\Invoice\GatewayChargeAttempts::begin($db, 42, 1, $owner);
+            expect(fn () => FOSSBilling\Core\Payment\ProcessingFence::charge($db, $attempt, $owner, $run))->toThrow(Box\Mod\Invoice\Exception\RetryableCallbackException::class);
+            expect($em->isOpen())->toBeFalse()
+                ->and(fn () => $em->flush())->toThrow(Doctrine\ORM\Exception\EntityManagerClosed::class);
+        } else {
+            expect($run)->toThrow(Box\Mod\Invoice\Exception\RetryableCallbackException::class);
+            expect($em->isOpen())->toBeTrue()->and($em->contains($transaction))->toBeFalse();
+            $em->flush();
+        }
+        expect($db->fetchOne('SELECT amount FROM "transaction" WHERE id = ?', [$id]))->toBe($before)
+            ->and(FOSSBilling\Core\Payment\ProcessingFence::claims())->toBe([]);
+    } finally {
+        $db->close();
+    }
+})->with([false, true]);

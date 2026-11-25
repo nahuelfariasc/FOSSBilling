@@ -16,10 +16,10 @@ declare(strict_types=1);
 namespace Box\Mod\Profile\Api;
 
 use Box\Mod\Client\Entity\Client as ClientEntity;
-use FOSSBilling\InformationException;
-use FOSSBilling\Validation\Api\RequiredParams;
+use FOSSBilling\Core\Exception\InformationException;
+use FOSSBilling\Core\Validation\Api\RequiredParams;
 
-class Client extends \FOSSBilling\Api\AbstractApi
+class Client extends \FOSSBilling\Core\Api\AbstractApi
 {
     /**
      * Get currently logged in client details.
@@ -79,18 +79,31 @@ class Client extends \FOSSBilling\Api\AbstractApi
      *
      * @return bool
      *
-     * @throws \FOSSBilling\Exception
+     * @throws \FOSSBilling\Core\Exception\BaseException
      */
     public function update($data)
     {
+        // `notes` are staff notes about the client and are not client-editable.
+        unset($data['notes']);
+
         if (!is_null($data['email'] ?? null)) {
-            $data['email'] = $this->getDi()['tools']->validateAndSanitizeEmail($data['email']);
+            $data['email'] = \FOSSBilling\Core\Validation\EmailValidator::validateAndSanitizeEmail($data['email']);
+            // A new sign-in email needs the current password: a stolen
+            // session alone must not take the account for good.
+            $client = $this->getClientEntity();
+            if (strcasecmp((string) $data['email'], (string) $client->getEmail()) !== 0) {
+                $this->getDi()['rate_limiter']->consumeOrThrow('profile_password_change_ip', $this->getIp());
+                $this->getDi()['rate_limiter']->consumeOrThrow('profile_password_change_account', 'client:' . $client->getId());
+                if (!$this->getDi()['password']->verify((string) ($data['current_password'] ?? ''), (string) $client->getPass())) {
+                    throw new InformationException('Enter your current password to change your email address.');
+                }
+            }
         }
 
         if (array_key_exists('billing_email', $data)) {
             $data['billing_email'] = empty($data['billing_email'])
                 ? null
-                : $this->getDi()['tools']->validateAndSanitizeEmail($data['billing_email']);
+                : \FOSSBilling\Core\Validation\EmailValidator::validateAndSanitizeEmail($data['billing_email']);
         }
 
         return $this->getService()->updateClient($this->getClientEntity(), $data);
@@ -119,7 +132,7 @@ class Client extends \FOSSBilling\Api\AbstractApi
      *
      * @return bool
      *
-     * @throws \FOSSBilling\Exception
+     * @throws \FOSSBilling\Core\Exception\BaseException
      */
     #[RequiredParams([
         'current_password' => 'Current password required',
@@ -133,7 +146,7 @@ class Client extends \FOSSBilling\Api\AbstractApi
 
         $client = $this->getClientEntity();
 
-        $this->getDi()['rate_limiter']->consumeOrThrow('profile_password_change_ip', (string) $this->getIp());
+        $this->getDi()['rate_limiter']->consumeOrThrow('profile_password_change_ip', $this->getIp());
         $this->getDi()['rate_limiter']->consumeOrThrow('profile_password_change_account', 'client:' . $client->getId());
 
         if (!$this->getDi()['password']->verify($data['current_password'], $client->getPass())) {
@@ -168,18 +181,12 @@ class Client extends \FOSSBilling\Api\AbstractApi
         return $this->resolveClientEntity($this->getIdentity());
     }
 
-    private function resolveClientEntity(ClientEntity|\Model_Admin|\Model_Client|\Model_Guest $identity): ClientEntity
+    private function resolveClientEntity(object $identity): ClientEntity
     {
-        if ($identity instanceof ClientEntity) {
-            return $identity;
+        if (!$identity instanceof ClientEntity) {
+            throw new InformationException('Client identity not found');
         }
 
-        $clientId = (int) ($identity->id ?? 0);
-        $client = $this->getDi()['em']->getRepository(ClientEntity::class)->find($clientId);
-        if (!$client instanceof ClientEntity) {
-            throw new InformationException('Client not found');
-        }
-
-        return $client;
+        return $identity;
     }
 }

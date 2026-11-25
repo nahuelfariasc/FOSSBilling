@@ -10,16 +10,22 @@ declare(strict_types=1);
  */
 
 require __DIR__ . DIRECTORY_SEPARATOR . 'load.php';
-global $di;
+global $di, $request;
 
 use DebugBar\DataCollector\TimeDataCollector;
-use FOSSBilling\Http\RequestFactory;
+use FOSSBilling\Core\Http\PaymentReturn;
+use FOSSBilling\Core\Http\RequestFactory;
 
-$config = FOSSBilling\Config::getConfig();
+// A cross-site payment return must not start a replacement session when the
+// browser withholds its Strict cookie. Resume through a same-site navigation.
+$paymentReturn = PaymentReturn::createResponse($request, $di['url']);
+if ($paymentReturn !== null) {
+    emitResponse($paymentReturn);
+}
+
+$config = FOSSBilling\Core\System\Config::getConfig();
 $debugBar = null;
 $timeCollector = null;
-/* @var Symfony\Component\HttpFoundation\Request $request */
-global $request;
 
 if ((bool) ($config['debug_and_monitoring']['debug'] ?? false)) {
     // Setting up the debug bar
@@ -33,8 +39,8 @@ if ((bool) ($config['debug_and_monitoring']['debug'] ?? false)) {
     // PDO collector
     $pdoCollector = new DebugBar\DataCollector\PDO\PDOCollector();
 
-    // RedBean
-    $pdoCollector->addConnection($di['pdo'], 'RedBeanPHP');
+    // PDO
+    $pdoCollector->addConnection($di['pdo'], 'PDO');
 
     // Doctrine
     $connection = $di['em']->getConnection();
@@ -55,21 +61,9 @@ if ((bool) ($config['debug_and_monitoring']['debug'] ?? false)) {
 }
 
 $url = RequestFactory::normalizeRoutePath($request);
-$http_err_code = $request->query->get('_errcode');
+$http_err_code = RequestFactory::getHttpErrorCode($request);
 
 $timeCollector?->startMeasure('session_start', 'Starting / restoring the session');
-
-/*
- * Workaround: Session IDs get reset when using PGs like PayPal because of the `samesite=strict` cookie attribute, resulting in the client getting logged out.
- * The return and cancel URLs include a signed restore_token that contains the session ID. We validate and extract it here.
- */
-if ($request->query->has('restore_token')) {
-    $restoreToken = $request->query->get('restore_token');
-    $restoredSessionId = is_string($restoreToken) ? FOSSBilling\Tools::validateSessionRestoreToken($restoreToken) : null;
-    if ($restoredSessionId !== null) {
-        session_id($restoredSessionId);
-    }
-}
 
 $di['session']->getId();
 $timeCollector?->stopMeasure('session_start');
@@ -79,11 +73,11 @@ if (strncasecmp($url, ADMIN_PREFIX, strlen(ADMIN_PREFIX)) === 0) {
     $urlWithoutQueryString = parse_url($url, PHP_URL_PATH) ?? $url;
     $adminRelativeUrl = str_replace(ADMIN_PREFIX, '', (string) $urlWithoutQueryString);
     $appUrl = $adminRelativeUrl;
-    $app = new Box_AppAdmin([], $debugBar);
+    $app = new FOSSBilling\Core\Http\AppAdmin([], $debugBar);
 } else {
     define('ADMIN_AREA', false);
     $appUrl = $url;
-    $app = new Box_AppClient([], $debugBar);
+    $app = new FOSSBilling\Core\Http\AppClient([], $debugBar);
 }
 
 $app->setUrl($appUrl);
@@ -95,22 +89,19 @@ $timeCollector?->stopMeasure('translate');
 
 // If HTTP error code has been passed, handle it.
 if (!is_null($http_err_code)) {
-    $http_err_code = intval($http_err_code);
     switch ($http_err_code) {
         case 404:
-            $e = new FOSSBilling\Exception('Page :url not found', [':url' => $url], 404);
+            $e = new FOSSBilling\Core\Exception\BaseException('Page :url not found', [':url' => $url], 404);
             $response = $app->show404($e);
 
             break;
         default:
-            $e = new FOSSBilling\Exception('HTTP Error :err_code occurred while attempting to load :url', [':err_code' => $http_err_code, ':url' => $url], $http_err_code);
+            $e = new FOSSBilling\Core\Exception\BaseException('HTTP Error :err_code occurred while attempting to load :url', [':err_code' => $http_err_code, ':url' => $url], $http_err_code);
             $response = $app->errorResponse($e);
     }
 } else {
     // If no HTTP error passed, run the app.
     $response = $app->run();
 }
-
-$di['cookie_queue']->applyToResponse($response);
 
 emitResponse($response);

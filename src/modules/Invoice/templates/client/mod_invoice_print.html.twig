@@ -1,5 +1,5 @@
 {% import 'macro_functions.html.twig' as mf %}
-{% set nr = invoice.serie ~ "%05s"|format(invoice.nr) %}
+{% set nr = invoice.issued ? invoice.serie_nr : invoice.id %}
 {% set seller = invoice.seller %}
 {% set buyer = invoice.buyer %}
 {% set company = guest.system_company %}
@@ -17,7 +17,7 @@
     <div class="row">
         <div class="col-md-10 offset-md-1">
             <div class="text-center">
-                <h2 id="invoice-title">{{ 'Invoice'|trans }} {{ nr }}</h2>
+                <h2 id="invoice-title">{% if not invoice.issued %}{{ 'Draft Invoice'|trans }}{% elseif invoice.credit_note_for_invoice_id %}{{ 'Credit Note'|trans }}{% elseif invoice.debit_note_for_invoice_id %}{{ 'Debit Note'|trans }}{% else %}{{ 'Invoice'|trans }}{% endif %} {{ nr }}</h2>
             </div>
 
             <div class="row">
@@ -201,6 +201,16 @@
                             <td><strong>{{ 'Total'|trans }}</strong></td>
                             <td><strong>{{ invoice.total|format_currency(invoice.currency ?? default_currency) }}</strong></td>
                         </tr>
+                        {% if invoice.status == 'unpaid' and invoice.amount_paid|default(0) > 0 %}
+                            <tr class="text-end">
+                                <td>{{ 'Amount paid'|trans }}</td>
+                                <td>−{{ invoice.amount_paid|format_currency(invoice.currency ?? default_currency) }}</td>
+                            </tr>
+                            <tr class="text-end">
+                                <td><strong>{{ 'Balance due'|trans }}</strong></td>
+                                <td><strong>{{ invoice.balance_due|format_currency(invoice.currency ?? default_currency) }}</strong></td>
+                            </tr>
+                        {% endif %}
                     </table>
                 </div>
             </div>

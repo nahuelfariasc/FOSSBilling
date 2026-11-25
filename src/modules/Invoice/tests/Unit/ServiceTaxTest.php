@@ -11,16 +11,17 @@
 declare(strict_types=1);
 
 use Box\Mod\Client\Service as ClientService;
+use Box\Mod\Invoice\Entity\Invoice;
 use Box\Mod\Invoice\Entity\InvoiceItem;
 use Box\Mod\Invoice\Entity\Tax;
 use Box\Mod\Invoice\Repository\InvoiceItemRepository;
 use Box\Mod\Invoice\Repository\TaxRepository;
-use Box\Mod\Invoice\ServiceInvoiceItem;
 use Box\Mod\Invoice\ServiceTax;
 use Doctrine\ORM\EntityManagerInterface;
 
 use function Tests\Helpers\container;
 use function Tests\Helpers\createEntity;
+use function Tests\Helpers\setEntityId;
 
 function taxService(TaxRepository $taxRepository, ?EntityManagerInterface $em = null): ServiceTax
 {
@@ -51,8 +52,7 @@ test('gets tax rate for client by country and state', function (): void {
     $clientServiceMock = Mockery::mock(ClientService::class);
     $clientServiceMock->shouldReceive('isClientTaxable')->andReturn(true);
 
-    $clientModel = new Model_Client();
-    $clientModel->loadBean(new Tests\Helpers\DummyBean());
+    $clientModel = createEntity(Box\Mod\Client\Entity\Client::class);
 
     $service = taxService($taxRepo);
     $service->getDi()['mod_service'] = $service->getDi()->protect(fn (): Mockery\MockInterface => $clientServiceMock);
@@ -74,8 +74,7 @@ test('gets tax rate for client by country', function (): void {
     $clientServiceMock = Mockery::mock(ClientService::class);
     $clientServiceMock->shouldReceive('isClientTaxable')->andReturn(true);
 
-    $clientModel = new Model_Client();
-    $clientModel->loadBean(new Tests\Helpers\DummyBean());
+    $clientModel = createEntity(Box\Mod\Client\Entity\Client::class);
 
     $service = taxService($taxRepo);
     $service->getDi()['mod_service'] = $service->getDi()->protect(fn (): Mockery\MockInterface => $clientServiceMock);
@@ -96,8 +95,7 @@ test('gets tax rate for client from global rule', function (): void {
     $clientServiceMock = Mockery::mock(ClientService::class);
     $clientServiceMock->shouldReceive('isClientTaxable')->andReturn(true);
 
-    $clientModel = new Model_Client();
-    $clientModel->loadBean(new Tests\Helpers\DummyBean());
+    $clientModel = createEntity(Box\Mod\Client\Entity\Client::class);
 
     $service = taxService($taxRepo);
     $service->getDi()['mod_service'] = $service->getDi()->protect(fn (): Mockery\MockInterface => $clientServiceMock);
@@ -116,8 +114,7 @@ test('returns zero tax rate when tax not found', function (): void {
     $clientServiceMock = Mockery::mock(ClientService::class);
     $clientServiceMock->shouldReceive('isClientTaxable')->andReturn(true);
 
-    $clientModel = new Model_Client();
-    $clientModel->loadBean(new Tests\Helpers\DummyBean());
+    $clientModel = createEntity(Box\Mod\Client\Entity\Client::class);
 
     $service = taxService($taxRepo);
     $service->getDi()['mod_service'] = $service->getDi()->protect(fn (): Mockery\MockInterface => $clientServiceMock);
@@ -132,8 +129,7 @@ test('returns zero tax rate when client is not taxable', function (): void {
     $clientServiceMock = Mockery::mock(ClientService::class);
     $clientServiceMock->shouldReceive('isClientTaxable')->andReturn(false);
 
-    $clientModel = new Model_Client();
-    $clientModel->loadBean(new Tests\Helpers\DummyBean());
+    $clientModel = createEntity(Box\Mod\Client\Entity\Client::class);
 
     $service = taxService($taxRepo);
     $service->getDi()['mod_service'] = $service->getDi()->protect(fn (): Mockery\MockInterface => $clientServiceMock);
@@ -145,19 +141,19 @@ test('returns zero tax when invoice tax rate is zero', function (): void {
     $taxRepo = Mockery::mock(TaxRepository::class);
     $service = taxService($taxRepo);
 
-    $invoiceModel = new Model_Invoice();
-    $invoiceModel->loadBean(new Tests\Helpers\DummyBean());
-    $invoiceModel->taxrate = 0;
+    $invoiceModel = createEntity(Invoice::class);
+
+    $invoiceModel->setTaxrate(0);
 
     expect($service->getTax($invoiceModel))->toBeInt()->toBe(0);
 });
 
 test('gets tax for an invoice', function (): void {
-    $invoiceModel = new Model_Invoice();
-    $invoiceModel->loadBean(new Tests\Helpers\DummyBean());
-    $invoiceModel->taxrate = 15;
+    $invoiceModel = createEntity(Invoice::class);
 
-    $invoiceItem = createEntity(InvoiceItem::class, ['quantity' => 1]);
+    $invoiceModel->setTaxrate(15);
+
+    $invoiceItem = createEntity(InvoiceItem::class, ['quantity' => 1, 'price' => 140, 'taxed' => true]);
 
     $invoiceItemRepo = Mockery::mock(InvoiceItemRepository::class);
     $invoiceItemRepo->shouldReceive('findByInvoiceId')->andReturn([$invoiceItem]);
@@ -168,14 +164,50 @@ test('gets tax for an invoice', function (): void {
     $taxRepo = Mockery::mock(TaxRepository::class);
     $service = taxService($taxRepo, $em);
 
-    $invoiceItemService = Mockery::mock(ServiceInvoiceItem::class);
-    $invoiceItemService->shouldReceive('getTax')->andReturn(21);
-
-    $di = $service->getDi();
-    $di['mod_service'] = $di->protect(fn (): Mockery\MockInterface => $invoiceItemService);
-
-    expect($service->getTax($invoiceModel))->toBeInt();
+    // 140 * 15% = 21.00, single line so per-unit and invoice-level agree.
+    expect($service->getTax($invoiceModel))->toEqual(21.0);
 });
+
+test('rounds invoice tax once on the subtotal', function (): void {
+    $invoiceModel = createEntity(Invoice::class);
+    $invoiceModel->setTaxrate(10);
+
+    // Classic 1c drift: per-unit rounding gives 0.03 * 3 = 0.09,
+    // invoice-level rounding gives round(0.99 * 10%) = 0.10.
+    $item = createEntity(InvoiceItem::class, ['quantity' => 3, 'price' => 0.33, 'taxed' => true]);
+
+    $invoiceItemRepo = Mockery::mock(InvoiceItemRepository::class);
+    $invoiceItemRepo->shouldReceive('findByInvoiceId')->andReturn([$item]);
+
+    $em = Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('getRepository')->with(InvoiceItem::class)->andReturn($invoiceItemRepo);
+
+    $taxRepo = Mockery::mock(TaxRepository::class);
+    $service = taxService($taxRepo, $em);
+
+    expect($service->getTax($invoiceModel))->toEqual(0.10);
+});
+
+test('invoice and tax services agree on mixed taxable lines and rounding', function (array $lines, int $rate, float $expected): void {
+    $invoice = createEntity(Invoice::class, ['id' => 17, 'taxrate' => $rate]);
+    $items = array_map(fn (array $line): InvoiceItem => createEntity(InvoiceItem::class, $line), $lines);
+    $repo = Mockery::mock(InvoiceItemRepository::class);
+    $repo->shouldReceive('findByInvoiceId')->with(17)->andReturn($items);
+    $em = Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('getRepository')->with(InvoiceItem::class)->andReturn($repo);
+    $tax = taxService(Mockery::mock(TaxRepository::class), $em);
+    $billing = new Box\Mod\Invoice\Service();
+    $billing->setDi($tax->getDi());
+
+    expect($billing->getTax($invoice))->toBe($expected)
+        ->and($tax->getTax($invoice))->toEqual($expected);
+})->with([
+    'mixed lines' => [[['quantity' => 3, 'price' => 0.33, 'taxed' => true], ['quantity' => 2, 'price' => 10, 'taxed' => false], ['quantity' => 1, 'price' => 0.06, 'taxed' => true]], 10, 0.11],
+    'no items' => [[], 10, 0.0],
+    'zero tax rate' => [[['quantity' => 1, 'price' => 10, 'taxed' => true]], 0, 0.0],
+    'rounds to zero' => [[['quantity' => 1, 'price' => 0.01, 'taxed' => true]], 10, 0.0],
+    'negative line' => [[['quantity' => 1, 'price' => -1, 'taxed' => true]], 10, -0.1],
+]);
 
 test('deletes a tax', function (): void {
     $taxEntity = createEntity(Tax::class, ['id' => 1, 'name' => 'VAT']);
@@ -198,7 +230,7 @@ test('creates a tax', function (): void {
     $em->shouldReceive('persist')
         ->once()
         ->withArgs(function (Tax $tax) use ($newId): bool {
-            $tax->setId($newId);
+            setEntityId($tax, $newId);
 
             return true;
         });

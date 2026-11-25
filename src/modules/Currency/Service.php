@@ -11,10 +11,14 @@ declare(strict_types=1);
 
 namespace Box\Mod\Currency;
 
+use Box\Mod\Cron\Event\BeforeAdminCronRunEvent;
 use Box\Mod\Currency\Entity\Currency;
+use Box\Mod\Currency\Event\AfterAdminDeleteCurrencyEvent;
+use Box\Mod\Currency\Event\BeforeAdminDeleteCurrencyEvent;
 use Box\Mod\Currency\Repository\CurrencyRepository;
-use FOSSBilling\InformationException;
-use FOSSBilling\InjectionAwareInterface;
+use FOSSBilling\Core\Container\InjectionAwareInterface;
+use FOSSBilling\Core\Exception\InformationException;
+use Symfony\Component\EventDispatcher\Attribute\AsEventListener;
 use Symfony\Component\Intl\Currencies;
 use Symfony\Contracts\Cache\ItemInterface;
 use Twig\Extra\Intl\IntlExtension;
@@ -46,7 +50,7 @@ class Service implements InjectionAwareInterface
     {
         if ($this->currencyRepository === null) {
             if ($this->di === null) {
-                throw new \FOSSBilling\Exception('The dependency injection container has not been set.');
+                throw new \FOSSBilling\Core\Exception\BaseException('The dependency injection container has not been set.');
             }
 
             $this->currencyRepository = $this->di['em']->getRepository(Currency::class);
@@ -101,14 +105,14 @@ class Service implements InjectionAwareInterface
      *
      * @return float Amount converted to the default currency
      *
-     * @throws \FOSSBilling\Exception If default currency cannot be found
+     * @throws \FOSSBilling\Core\Exception\BaseException If default currency cannot be found
      */
     public function toBaseCurrency(string $fromCurrencyCode, float|int $amount): float
     {
         $defaultCurrency = $this->currencyRepository->findDefault();
 
         if ($defaultCurrency === null) {
-            throw new \FOSSBilling\Exception('Default currency not found.');
+            throw new \FOSSBilling\Core\Exception\BaseException('Default currency not found.');
         }
 
         if ($defaultCurrency->getCode() === $fromCurrencyCode) {
@@ -127,18 +131,18 @@ class Service implements InjectionAwareInterface
      *
      * @return float Conversion rate to convert from the specified currency to the default currency
      *
-     * @throws \FOSSBilling\Exception If currency not found or rate is zero
+     * @throws \FOSSBilling\Core\Exception\BaseException If currency not found or rate is zero
      */
     public function getBaseCurrencyRate(string $fromCurrencyCode): float
     {
         $rate = $this->currencyRepository->getRateByCode($fromCurrencyCode);
 
         if ($rate === null) {
-            throw new \FOSSBilling\Exception('Currency not found.');
+            throw new \FOSSBilling\Core\Exception\BaseException('Currency not found.');
         }
 
         if ($rate === 0.0) {
-            throw new \FOSSBilling\Exception('Currency conversion rate cannot be zero.');
+            throw new \FOSSBilling\Core\Exception\BaseException('Currency conversion rate cannot be zero.');
         }
 
         return 1 / $rate;
@@ -153,7 +157,7 @@ class Service implements InjectionAwareInterface
      * @return Currency Currency entity for the client's currency or the default currency if client
      *                  has no specific currency set
      *
-     * @throws \FOSSBilling\Exception If default currency cannot be found
+     * @throws \FOSSBilling\Core\Exception\BaseException If default currency cannot be found
      */
     public function getCurrencyByClientId(int $clientId): Currency
     {
@@ -162,7 +166,7 @@ class Service implements InjectionAwareInterface
         if ($currencyCode === null) {
             $defaultCurrency = $this->currencyRepository->findDefault();
             if ($defaultCurrency === null) {
-                throw new \FOSSBilling\Exception('Default currency not found.');
+                throw new \FOSSBilling\Core\Exception\BaseException('Default currency not found.');
             }
 
             return $defaultCurrency;
@@ -175,7 +179,7 @@ class Service implements InjectionAwareInterface
 
         $defaultCurrency = $this->currencyRepository->findDefault();
         if ($defaultCurrency === null) {
-            throw new \FOSSBilling\Exception('Default currency not found.');
+            throw new \FOSSBilling\Core\Exception\BaseException('Default currency not found.');
         }
 
         return $defaultCurrency;
@@ -187,7 +191,7 @@ class Service implements InjectionAwareInterface
      *
      * @param Currency $currency Currency entity to set as default
      *
-     * @throws \FOSSBilling\Exception If currency code is invalid or if the currency cannot be found after clearing the identity map
+     * @throws \FOSSBilling\Core\Exception\BaseException If currency code is invalid or if the currency cannot be found after clearing the identity map
      */
     public function setAsDefault(Currency $currency): bool
     {
@@ -196,7 +200,7 @@ class Service implements InjectionAwareInterface
         }
 
         if (!$currency->getCode()) {
-            throw new \FOSSBilling\Exception('Currency code not provided.');
+            throw new \FOSSBilling\Core\Exception\BaseException('Currency code not provided.');
         }
 
         // Store currency code before clearing identity map (entity will be detached)
@@ -210,7 +214,7 @@ class Service implements InjectionAwareInterface
 
         $currency = $this->currencyRepository->findOneByCode($currencyCode);
         if (!$currency instanceof Currency) {
-            throw new \FOSSBilling\Exception("Currency with code {$currencyCode} not found after clearing identity map.");
+            throw new \FOSSBilling\Core\Exception\BaseException("Currency with code {$currencyCode} not found after clearing identity map.");
         }
 
         $currency
@@ -219,7 +223,7 @@ class Service implements InjectionAwareInterface
         $em->persist($currency);
         $em->flush();
 
-        $this->di['logger']->info('Set currency %s as default.', $currency->getCode());
+        $this->di['logger']->info('Set currency {currency_code} as default.', ['currency_code' => $currency->getCode()]);
 
         return true;
     }
@@ -244,7 +248,7 @@ class Service implements InjectionAwareInterface
      *
      * @return string The code of the newly created currency
      *
-     * @throws \FOSSBilling\Exception If currency code is invalid or if fetching the conversion rate fails
+     * @throws \FOSSBilling\Core\Exception\BaseException If currency code is invalid or if fetching the conversion rate fails
      */
     public function createCurrency(
         string $currencyCode,
@@ -260,19 +264,23 @@ class Service implements InjectionAwareInterface
                 $conversionRate = $this->getRate(null, $currencyCode);
             } catch (\Exception $e) {
                 // If rate fetch fails, log a warning and use a default rate of 1.0
-                $this->di['logger']->warning(
-                    'Failed to fetch conversion rate for %s: %s. Using default rate of 1.0.',
-                    $currencyCode,
-                    $e->getMessage()
-                );
+                $this->di['logger']->warning('Failed to fetch conversion rate for {currency_code}: {exception}. Using default rate of 1.0.', ['currency_code' => $currencyCode, 'exception' => $e]);
+                $conversionRate = 1.0;
+            }
+
+            try {
+                $conversionRate = $this->normalizeConversionRate($conversionRate);
+            } catch (InformationException) {
+                // A fetched rate that would round to zero is unusable, so fall back to 1.0 rather than persisting zero.
+                $this->di['logger']->warning('Fetched conversion rate for {currency_code} would round to zero. Using default rate of 1.0.', ['currency_code' => $currencyCode]);
                 $conversionRate = 1.0;
             }
         } else {
             if (!is_numeric($conversionRate) || $conversionRate <= 0) {
-                throw new \FOSSBilling\Exception('Currency conversion rate must be a positive number.');
+                throw new \FOSSBilling\Core\Exception\BaseException('Currency conversion rate must be a positive number.');
             }
 
-            $conversionRate = (float) $conversionRate;
+            $conversionRate = $this->normalizeConversionRate($conversionRate);
         }
 
         $currency = new Currency($currencyCode);
@@ -284,7 +292,7 @@ class Service implements InjectionAwareInterface
         $em->persist($currency);
         $em->flush();
 
-        $this->di['logger']->info('Added new currency %s.', $currency->getCode());
+        $this->di['logger']->info('Added new currency {currency_code}.', ['currency_code' => $currency->getCode()]);
 
         return $currency->getCode();
     }
@@ -294,30 +302,30 @@ class Service implements InjectionAwareInterface
      *
      * @param string $currencyCode Currency code to remove
      *
-     * @throws InformationException   If trying to remove the default currency
-     * @throws \FOSSBilling\Exception If currency code is invalid
+     * @throws InformationException                      If trying to remove the default currency
+     * @throws \FOSSBilling\Core\Exception\BaseException If currency code is invalid
      */
     public function removeCurrency(string $currencyCode): bool
     {
         $currency = $this->currencyRepository->findOneByCode($currencyCode);
 
         if (!$currency instanceof Currency) {
-            throw new \FOSSBilling\Exception('Currency not found.');
+            throw new \FOSSBilling\Core\Exception\BaseException('Currency not found.');
         }
 
         if ($currency->isDefault()) {
             throw new InformationException('Cannot remove the default currency.');
         }
 
-        $this->di['events_manager']->fire(['event' => 'onBeforeAdminDeleteCurrency', 'params' => ['code' => $currencyCode]]);
+        $this->di['event_dispatcher']->dispatch(new BeforeAdminDeleteCurrencyEvent($currencyCode));
 
         $em = $this->di['em'];
         $em->remove($currency);
         $em->flush();
 
-        $this->di['events_manager']->fire(['event' => 'onAfterAdminDeleteCurrency', 'params' => ['code' => $currencyCode]]);
+        $this->di['event_dispatcher']->dispatch(new AfterAdminDeleteCurrencyEvent($currencyCode));
 
-        $this->di['logger']->info('Removed currency %s.', $currency->getCode());
+        $this->di['logger']->info('Removed currency {currency_code}.', ['currency_code' => $currency->getCode()]);
 
         return true;
     }
@@ -333,8 +341,8 @@ class Service implements InjectionAwareInterface
      * } $formatting Formatting values to update; omitted keys are left unchanged
      * @param bool|null $isRateManual Whether bulk rate synchronization should preserve this rate; null leaves it unchanged
      *
-     * @throws \FOSSBilling\Exception If currency not found
-     * @throws InformationException   If a provided value is invalid
+     * @throws \FOSSBilling\Core\Exception\BaseException If currency not found
+     * @throws InformationException                      If a provided value is invalid
      */
     public function updateCurrency(
         string $currencyCode,
@@ -344,7 +352,7 @@ class Service implements InjectionAwareInterface
     ): bool {
         $model = $this->currencyRepository->findOneByCode($currencyCode);
         if (!$model instanceof Currency) {
-            throw new \FOSSBilling\Exception('Currency not found.');
+            throw new \FOSSBilling\Core\Exception\BaseException('Currency not found.');
         }
 
         $updateFormatPattern = array_key_exists('format_pattern', $formatting);
@@ -360,7 +368,7 @@ class Service implements InjectionAwareInterface
             if (!is_numeric($conversionRate) || $conversionRate <= 0) {
                 throw new InformationException('Currency conversion rate is invalid.', null, 151);
             }
-            $model->setConversionRate($conversionRate);
+            $model->setConversionRate($this->normalizeConversionRate($conversionRate));
         }
 
         if ($updateFormatPattern) {
@@ -380,7 +388,7 @@ class Service implements InjectionAwareInterface
         $em->flush();
 
         unset($this->formattingCache[$currencyCode]);
-        $this->di['logger']->info('Updated currency %s.', $model->getCode());
+        $this->di['logger']->info('Updated currency {model_code}.', ['model_code' => $model->getCode()]);
 
         return true;
     }
@@ -414,6 +422,19 @@ class Service implements InjectionAwareInterface
         $intl = $this->intlExtension ??= new IntlExtension();
 
         return $intl->formatNumber($amount, $attributes, 'decimal', 'default', $locale);
+    }
+
+    // Rejects positive rates that would persist as zero: the column is
+    // DECIMAL(13,6) and setters format with '%.6f' (e.g. 0.0000001 -> 0.0).
+    private function normalizeConversionRate(string|float $conversionRate): float
+    {
+        $rate = (float) $conversionRate;
+
+        if ((float) sprintf('%.6f', $rate) <= 0) {
+            throw new InformationException('Currency conversion rate is too small and would round to zero.', null, 151);
+        }
+
+        return $rate;
     }
 
     private function normalizeFormatPattern(mixed $formatPattern): ?string
@@ -512,14 +533,14 @@ class Service implements InjectionAwareInterface
      * This will fetch the latest rates from the configured provider and update all
      * non-default currencies accordingly.
      *
-     * @throws \FOSSBilling\Exception If default currency cannot be found
+     * @throws \FOSSBilling\Core\Exception\BaseException If default currency cannot be found
      */
     public function updateCurrencyRates(): bool
     {
         $defaultCurrency = $this->currencyRepository->findDefault();
 
         if ($defaultCurrency === null) {
-            throw new \FOSSBilling\Exception('Default currency not found. Cannot update rates.');
+            throw new \FOSSBilling\Core\Exception\BaseException('Default currency not found. Cannot update rates.');
         }
 
         $em = $this->di['em'];
@@ -533,6 +554,12 @@ class Service implements InjectionAwareInterface
                 continue;
             } else {
                 $rate = $this->getRate($defaultCurrency->getCode(), $currency->getCode());
+
+                if ((float) sprintf('%.6f', $rate) <= 0) {
+                    $this->di['logger']->warning('Skipped currency rate update for {currency_code}: fetched rate would round to zero.', ['currency_code' => $currency->getCode()]);
+
+                    continue;
+                }
             }
 
             $currency->setConversionRate($rate);
@@ -541,7 +568,7 @@ class Service implements InjectionAwareInterface
 
         $em->flush();
 
-        $this->di['logger']->info('Updated %d currency rates.', $updatedCount);
+        $this->di['logger']->info('Updated {updated_count} currency rates.', ['updated_count' => $updatedCount]);
 
         return true;
     }
@@ -557,8 +584,8 @@ class Service implements InjectionAwareInterface
      *
      * @return float Conversion rate from the source currency to the target currency
      *
-     * @throws \FOSSBilling\Exception If default currency cannot be found
-     * @throws InformationException   If API configuration is invalid, or unable to fetch conversion rate
+     * @throws \FOSSBilling\Core\Exception\BaseException If default currency cannot be found
+     * @throws InformationException                      If API configuration is invalid, or unable to fetch conversion rate
      */
     protected function getRate(?string $fromCurrencyCode, string $toCurrencyCode): float
     {
@@ -566,7 +593,7 @@ class Service implements InjectionAwareInterface
         if ($fromCurrencyCode === null || $fromCurrencyCode === '') {
             $defaultCurrency = $this->currencyRepository->findDefault();
             if ($defaultCurrency === null) {
-                throw new \FOSSBilling\Exception('Default currency not found.');
+                throw new \FOSSBilling\Core\Exception\BaseException('Default currency not found.');
             }
             $fromCurrencyCode = $defaultCurrency->getCode();
         }
@@ -606,7 +633,7 @@ class Service implements InjectionAwareInterface
             return floatval($rates[$toCurrencyCode]);
         }
 
-        throw new \FOSSBilling\Exception("Unable to fetch conversion rate for currency: {$toCurrencyCode}.");
+        throw new \FOSSBilling\Core\Exception\BaseException("Unable to fetch conversion rate for currency: {$toCurrencyCode}.");
     }
 
     /**
@@ -632,14 +659,14 @@ class Service implements InjectionAwareInterface
 
             if ($array['result'] !== 'success') {
                 $item->expiresAfter(15 * 60 * 60); // Try again in 15 min
-                error_log('ExchangeRate-API Gave an error: ' . $array['error-type']);
+                $this->di['logger']->error('ExchangeRate-API Gave an error: ' . $array['error-type']);
 
-                throw new \FOSSBilling\Exception('There was an error when fetching currency rates from ExchangeRate-API. See the error log for details.');
+                throw new \FOSSBilling\Core\Exception\BaseException('There was an error when fetching currency rates from ExchangeRate-API. See the error log for details.');
             }
 
             if ($validFor === 0) {
                 // ExchangeRate-API is great and will tell us exactly when the data will next have an update, so we will use that for the cache expiration when "auto" is the sync mode.
-                $item->expiresAt(new \DateTime($array['time_next_update_utc']));
+                $item->expiresAt(new \DateTimeImmutable($array['time_next_update_utc']));
             } else {
                 $item->expiresAfter($validFor);
             }
@@ -685,9 +712,9 @@ class Service implements InjectionAwareInterface
             $array = $response->toArray();
 
             if ($array['success'] !== true) {
-                error_log($array['error']['info']);
+                $this->di['logger']->error($array['error']['info']);
 
-                throw new \FOSSBilling\Exception('There was an error when fetching currency rates from Currency Data API. See the error log for details.');
+                throw new \FOSSBilling\Core\Exception\BaseException('There was an error when fetching currency rates from Currency Data API. See the error log for details.');
             }
 
             return $array;
@@ -709,7 +736,7 @@ class Service implements InjectionAwareInterface
             $from_currency = urlencode($from);
 
             $httpClient = $this->di['http_client'];
-            $response = $httpClient->request('GET', 'https://api.apilayer.com/currency_data/live', [
+            $response = $httpClient->request('GET', 'https://api.currencylayer.com/live', [
                 'query' => [
                     'access_key' => $key,
                     'source' => $from_currency,
@@ -718,9 +745,9 @@ class Service implements InjectionAwareInterface
             $array = $response->toArray();
 
             if ($array['success'] !== true) {
-                error_log($array['error']['info']);
+                $this->di['logger']->error($array['error']['info']);
 
-                throw new \FOSSBilling\Exception('There was an error when fetching currency rates from currencylayer. See the error log for details.');
+                throw new \FOSSBilling\Core\Exception\BaseException('There was an error when fetching currency rates from currencylayer. See the error log for details.');
             }
 
             return $array;
@@ -751,19 +778,15 @@ class Service implements InjectionAwareInterface
     /**
      * If enabled, automatically call _getRate to fetch exchange rates whenever CRON jobs are run.
      */
-    public static function onBeforeAdminCronRun(\Box_Event $event): bool
+    #[AsEventListener]
+    public function updateRatesBeforeAdminCronRun(BeforeAdminCronRunEvent $event): void
     {
-        $di = $event->getDi();
-        $currencyService = $di['mod_service']('currency');
-
         try {
-            if ($currencyService->isCronEnabled()) {
-                $currencyService->updateCurrencyRates();
+            if ($this->isCronEnabled()) {
+                $this->updateCurrencyRates();
             }
         } catch (\Exception $e) {
-            error_log($e->getMessage());
+            $this->di['logger']->error($e->getMessage());
         }
-
-        return true;
     }
 }

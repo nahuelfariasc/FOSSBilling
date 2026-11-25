@@ -13,11 +13,11 @@ namespace Box\Mod\Email\Entity;
 
 use Doctrine\DBAL\Types\Types;
 use Doctrine\ORM\Mapping as ORM;
-use FOSSBilling\Interfaces\ApiArrayInterface;
+use FOSSBilling\Core\Api\ArrayInterface;
 
 #[ORM\Entity(repositoryClass: \Box\Mod\Email\Repository\EmailTemplateRepository::class)]
 #[ORM\Table(name: 'email_template')]
-class EmailTemplate implements ApiArrayInterface
+class EmailTemplate implements ArrayInterface
 {
     #[ORM\Column(type: Types::STRING, length: 30, nullable: true)]
     private ?string $category = null;
@@ -40,9 +40,6 @@ class EmailTemplate implements ApiArrayInterface
     #[ORM\Column(type: Types::TEXT, nullable: true)]
     private ?string $description = null;
 
-    #[ORM\Column(type: Types::TEXT, nullable: true)]
-    private ?string $vars = null;
-
     #[ORM\Column(name: 'last_error', type: Types::TEXT, nullable: true)]
     private ?string $lastError = null;
 
@@ -54,7 +51,7 @@ class EmailTemplate implements ApiArrayInterface
         private string $actionCode,
         #[ORM\Id]
         #[ORM\GeneratedValue]
-        #[ORM\Column(type: Types::INTEGER)]
+        #[ORM\Column(type: Types::BIGINT)]
         private ?int $id = null,
     ) {
     }
@@ -171,18 +168,6 @@ class EmailTemplate implements ApiArrayInterface
     public function setDescription(?string $description): self
     {
         $this->description = $description;
-
-        return $this;
-    }
-
-    public function getVars(): ?string
-    {
-        return $this->vars;
-    }
-
-    public function setVars(?string $vars): self
-    {
-        $this->vars = $vars;
 
         return $this;
     }

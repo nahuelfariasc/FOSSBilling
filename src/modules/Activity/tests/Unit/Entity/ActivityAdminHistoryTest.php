@@ -10,17 +10,17 @@ use Doctrine\ORM\ORMSetup;
 test('maps the existing admin activity history table', function (): void {
     $config = ORMSetup::createAttributeMetadataConfig([dirname(__DIR__, 3) . '/Entity'], true);
     $config->setProxyDir(sys_get_temp_dir());
-    $config->setProxyNamespace('FOSSBilling\\Tests\\DoctrineProxies');
+    $config->setProxyNamespace('FOSSBilling\\Core\\Tests\\DoctrineProxies');
     $entityManager = new EntityManager(DriverManager::getConnection(['driver' => 'pdo_sqlite', 'memory' => true]), $config);
     $metadata = $entityManager->getClassMetadata(ActivityAdminHistory::class);
 
     expect($metadata->getTableName())->toBe('activity_admin_history')
         ->and($metadata->getColumnNames())->toBe(['id', 'admin_id', 'ip', 'created_at'])
-        ->and($metadata->table['indexes']['admin_id_idx']['columns'])->toBe(['admin_id']);
+        ->and($metadata->table['indexes']['activity_admin_history_admin_id_idx']['columns'])->toBe(['admin_id']);
 });
 
 test('stores admin activity history and preserves its timestamp', function (): void {
-    $createdAt = new DateTime('2026-01-01 12:00:00');
+    $createdAt = new DateTimeImmutable('2026-01-01 12:00:00');
     $history = (new ActivityAdminHistory())
         ->setAdminId(2)
         ->setIp('192.0.2.1')
@@ -39,5 +39,5 @@ test('initializes the timestamp when it is unset', function (): void {
 
     $history->onPrePersist();
 
-    expect($history->getCreatedAt())->toBeInstanceOf(DateTime::class);
+    expect($history->getCreatedAt())->toBeInstanceOf(DateTimeImmutable::class);
 });

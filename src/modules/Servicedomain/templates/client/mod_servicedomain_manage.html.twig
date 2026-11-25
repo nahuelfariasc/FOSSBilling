@@ -38,6 +38,16 @@
                             <span class="fs-4">{{ service.registered_at|format_date(pattern="MMM dd, yyyy") }}</span>
                         </div>
                     </div>
+                    <div class="d-flex flex-column align-items-center text-center pb-3">
+                        <span class="small text-muted mb-2" id="synced-at-value">
+                            {% if service.synced_at %}
+                                {{ 'Last synced with registrar on %date%'|trans({'%date%': service.synced_at|format_date(pattern="MMM dd, yyyy HH:mm")}) }}
+                            {% else %}
+                                {{ 'Never synced with registrar'|trans }}
+                            {% endif %}
+                        </span>
+                        <button class="btn btn-secondary btn-sm" type="button" id="domain-sync">{{ 'Sync Now'|trans }}</button>
+                    </div>
                 </div>
             </div>
 
@@ -217,7 +227,8 @@
                                 document.getElementById('domain-lock').style.display === 'none' ? '' : 'none';
                             document.getElementById('domain-unlock').style.display =
                                 document.getElementById('domain-unlock').style.display === 'none' ? '' : 'none';
-                        });
+                        },
+                        (error) => FOSSBilling.message(`${error.message} (${error.code})`, 'error'));
                 });
 
                 document.getElementById('domain-unlock').addEventListener('click', function(event) {
@@ -231,7 +242,8 @@
                                 document.getElementById('domain-lock').style.display === 'none' ? '' : 'none';
                             document.getElementById('domain-unlock').style.display =
                                 document.getElementById('domain-unlock').style.display === 'none' ? '' : 'none';
-                        });
+                        },
+                        (error) => FOSSBilling.message(`${error.message} (${error.code})`, 'error'));
                 });
 
                 document.getElementById('domain-enable-pp').addEventListener('click', function(event) {
@@ -246,7 +258,8 @@
 
                             enableBtn.style.display = enableBtn.style.display === 'none' ? '' : 'none';
                             disableBtn.style.display = disableBtn.style.display === 'none' ? '' : 'none';
-                        });
+                        },
+                        (error) => FOSSBilling.message(`${error.message} (${error.code})`, 'error'));
                 });
 
                 document.getElementById('domain-disable-pp').addEventListener('click', function(event) {
@@ -261,8 +274,8 @@
 
                             enableBtn.style.display = enableBtn.style.display === 'none' ? '' : 'none';
                             disableBtn.style.display = disableBtn.style.display === 'none' ? '' : 'none';
-                        }
-                    );
+                        },
+                        (error) => FOSSBilling.message(`${error.message} (${error.code})`, 'error'));
                 });
 
                 document.getElementById('get-epp').addEventListener('click', function(event) {
@@ -271,7 +284,19 @@
                     FOSSBilling.api.client.post('servicedomain/get_transfer_code', { order_id: {{ order.id }} },
                         (result) => {
                             FOSSBilling.message('Domain transfer code is: ' + result);
-                        });
+                        },
+                        (error) => FOSSBilling.message(`${error.message} (${error.code})`, 'error'));
+                });
+
+                document.getElementById('domain-sync').addEventListener('click', function(event) {
+                    event.preventDefault();
+
+                    FOSSBilling.api.client.post('servicedomain/sync', { order_id: {{ order.id }} },
+                        () => {
+                            FOSSBilling.message('{{ 'Domain synchronized with registrar'|trans }}');
+                            window.location.reload();
+                        },
+                        (error) => FOSSBilling.message(`${error.message} (${error.code})`, 'error'));
                 });
             });
         </script>

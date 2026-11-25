@@ -16,7 +16,7 @@ use Box\Mod\Servicecustom\Service;
 
 test('calls custom service method', function (): void {
     $api = apiEndpoint(new Client());
-    $identity = (object) ['id' => 1];
+    $identity = \Tests\Helpers\client(['id' => 1]);
     $serviceMock = Mockery::mock(Service::class);
     $serviceMock->shouldReceive('getServiceCustomByOrderId')
         ->with(1, 1)
@@ -39,7 +39,7 @@ test('calls custom service method', function (): void {
 
 test('throws exception when calling custom method without order_id', function (): void {
     $api = apiEndpoint(new Client());
-    $identity = (object) ['id' => 1];
+    $identity = \Tests\Helpers\client(['id' => 1]);
     $serviceMock = Mockery::mock(Service::class);
     $serviceMock->shouldReceive('getServiceCustomByOrderId')
         ->never();
@@ -55,7 +55,7 @@ test('throws exception when calling custom method without order_id', function ()
 
 test('throws exception when calling custom method without method', function (): void {
     $api = apiEndpoint(new Client());
-    $identity = (object) ['id' => 1];
+    $identity = \Tests\Helpers\client(['id' => 1]);
     $serviceMock = Mockery::mock(Service::class);
     $serviceMock->shouldReceive('getServiceCustomByOrderId')
         ->never();
@@ -66,5 +66,21 @@ test('throws exception when calling custom method without method', function (): 
     $api->setIdentity($identity);
 
     expect(fn () => $api->call(['order_id' => 1]))
+        ->toThrow(Exception::class);
+});
+
+test('throws exception when calling custom method with a non-string method', function (): void {
+    $api = apiEndpoint(new Client());
+    $identity = \Tests\Helpers\client(['id' => 1]);
+    $serviceMock = Mockery::mock(Service::class);
+    $serviceMock->shouldReceive('getServiceCustomByOrderId')
+        ->never();
+    $serviceMock->shouldReceive('customCall')
+        ->never();
+
+    $api->setService($serviceMock);
+    $api->setIdentity($identity);
+
+    expect(fn () => $api->call(['order_id' => 1, 'method' => ['delete']]))
         ->toThrow(Exception::class);
 });

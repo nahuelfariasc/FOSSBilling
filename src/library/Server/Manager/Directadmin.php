@@ -145,7 +145,7 @@ class Server_Manager_Directadmin extends Server_Manager
      */
     public function getPort(): int
     {
-        return FOSSBilling\Tools::normalizePort($this->_config['port'] ?? null, 2222);
+        return FOSSBilling\Core\Utils\Normalizer::normalizePort($this->_config['port'] ?? null, 2222);
     }
 
     /**
@@ -422,18 +422,15 @@ class Server_Manager_Directadmin extends Server_Manager
     }
 
     /**
-     * Synchronizes the server account with the DirectAdmin server.
-     * This method currently does nothing and simply returns the account as is.
+     * Account synchronization is not supported by this manager.
      *
      * @param Server_Account $account the server account
      *
-     * @return Server_Account the same server account
-     *
-     * @throws Server_Exception
+     * @throws Server_UnsupportedOperationException
      */
     public function synchronizeAccount(Server_Account $account): Server_Account
     {
-        throw new Server_Exception(':type: does not support :action:', [':type:' => 'DirectAdmin', ':action:' => __trans('synchronizing the account')]);
+        throw new Server_UnsupportedOperationException(':type: does not support :action:', [':type:' => 'DirectAdmin', ':action:' => __trans('synchronizing the account')]);
     }
 
     /**
@@ -510,84 +507,16 @@ class Server_Manager_Directadmin extends Server_Manager
      */
     public function modifyAccount(Server_Account $account): bool
     {
-        // Get the package associated with the account
         $package = $account->getPackage();
 
-        // Prepare the fields for the request
-        $fields = [
-            'aftp' => $package->getHasAnonymousFtp() ? 'ON' : 'OFF', // ON or OFF. If ON, the User will be able to have anonymous ftp accounts.
-            'action' => 'customize',
-            'bandwidth' => $package->getBandwidth(), // Bandwidth quota in MB
-            'catchall' => $package->getHasCatchAll() ? 'ON' : 'OFF', // ON or OFF. If ON, the User will have the ability to enable and customize a catch-all email (*@domain.com).
-            'cgi' => $package->getHasCgi() ? 'ON' : 'OFF', // ON or OFF. If ON, the User will have the ability to run cgi scripts in their cgi-bin.
-            'cron' => $package->getHasCron() ? 'ON' : 'OFF', // ON or OFF. If ON, the User will have the ability to create cronjobs.
-            'dnscontrol' => 'ON', // ON or OFF. If ON, the User will be able to modify his/her dns records.
-            'domainptr' => $package->getMaxParkedDomains(), // Domain pointer quota
-            'ftp' => $package->getMaxFtp(), // FTP account quota
-            'mysql' => $package->getMaxSql(), // MySQL database quota
-            'nemailf' => $package->getMaxEmailForwarders(), // Email forwarder quota
-            'nemailml' => $package->getMaxEmailLists(), // Mailing list quota
-            'nemailr' => $package->getMaxEmailAutoresponders(), // Autoresponder quota
-            'nemails' => $package->getMaxPop(), // Email account quota
-            'nsubdomains' => $package->getMaxSubdomains(), // Subdomain quota
-            'ns1' => $account->getNs1(),
-            'ns2' => $account->getNs2(),
-            'php' => $package->getHasPhp() ? 'ON' : 'OFF', // ON or OFF. If ON, the User will have the ability to run php scripts.
-            'quota' => $package->getQuota(), // Disk space quota in MB
-            'spam' => $package->getHasSpamFilter() ? 'ON' : 'OFF', // ON or OFF. If ON, the User will have the ability to run scan email with SpamAssassin.
-            'ssh' => $package->getHasShell() ? 'ON' : 'OFF', // ON or OFF. If ON, the User will have an ssh account.
-            'ssl' => $package->getHasSsl() ? 'ON' : 'OFF', // ON or OFF. If ON, the User will have the ability to access their websites through secure https://.
-            'sysinfo' => 'ON', // ON or OFF. If ON, the User will have access to a page that shows the system information.
-            'user' => $account->getUsername(),
-            'vdomains' => $package->getMaxDomains(), // Domain quota
-        ];
+        $fields = $this->getCustomPackageFields($package);
+        $fields['dnscontrol'] = $this->getCustomPackageFlag($package, 'dnscontrol', 'ON');
+        $fields['sysinfo'] = $this->getCustomPackageFlag($package, 'sysinfo', 'ON');
+        $fields['action'] = 'customize';
+        $fields['ns1'] = $account->getNs1();
+        $fields['ns2'] = $account->getNs2();
+        $fields['user'] = $account->getUsername();
 
-        // Check if certain parameters are set to 'unlimited' and set the corresponding fields to 'ON'
-        if ($package->getBandwidth() == 'unlimited') {
-            $fields['ubandwidth'] = 'ON'; // ON or OFF. If ON, bandwidth is ignored and no limit is set
-        }
-
-        if ($package->getQuota() == 'unlimited') {
-            $fields['uquota'] = 'ON'; // ON or OFF. If ON, quota is ignored and no limit is set
-        }
-
-        if ($package->getMaxDomains() == 'unlimited') {
-            $fields['uvdomains'] = 'ON'; // ON or OFF. If ON, vdomains is ignored and no limit is set
-        }
-
-        if ($package->getMaxSubdomains() == 'unlimited') {
-            $fields['unsubdomains'] = 'ON'; // ON or OFF. If ON, nsubdomains is ignored and no limit is set
-        }
-
-        if ($package->getMaxPop() == 'unlimited') {
-            $fields['unemails'] = 'ON'; // ON or OFF Unlimited option for nemails
-        }
-
-        if ($package->getMaxEmailForwarders() == 'unlimited') {
-            $fields['unemailf'] = 'ON'; // ON or OFF Unlimited option for nemailf
-        }
-
-        if ($package->getMaxEmailLists() == 'unlimited') {
-            $fields['unemailml'] = 'ON'; // ON or OFF Unlimited option for nemailml
-        }
-
-        if ($package->getMaxEmailAutoresponders() == 'unlimited') {
-            $fields['unemailr'] = 'ON'; // ON or OFF Unlimited option for nemailr
-        }
-
-        if ($package->getMaxSql() == 'unlimited') {
-            $fields['umysql'] = 'ON'; // ON or OFF Unlimited option for mysql
-        }
-
-        if ($package->getMaxParkedDomains() == 'unlimited') {
-            $fields['udomainptr'] = 'ON'; // ON or OFF Unlimited option for domainptr
-        }
-
-        if ($package->getMaxFtp() == 'unlimited') {
-            $fields['uftp'] = 'ON'; // ON or OFF Unlimited option for ftp
-        }
-
-        // Send the request to the server
         $this->request('API_MODIFY_USER', $fields);
 
         return true;
@@ -606,16 +535,13 @@ class Server_Manager_Directadmin extends Server_Manager
      */
     private function request(string $command, array $fields = [], bool $post = true, string $asUser = ''): array
     {
-        $verifyTls = FOSSBilling\Tools::normalizeBoolean($this->_config['config']['tls_verify'] ?? true, true);
+        $verifyTls = FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($this->_config['config']['tls_verify'] ?? true, true);
 
         // Get the host from the configuration
         $host = $this->_config['host'];
 
         // Determine the protocol based on the 'secure' configuration option
         $protocol = $this->_config['secure'] ? 'https://' : 'http://';
-
-        // Build the field string for the request
-        $field_string = http_build_query($fields);
 
         // Support login-as for non-admin functions
         $username = $this->_config['username'];
@@ -632,7 +558,10 @@ class Server_Manager_Directadmin extends Server_Manager
         ]);
 
         // Construct the URL for the request
-        $url = $protocol . $host . ':' . $this->getPort() . '/CMD_' . $command . '?' . $field_string;
+        $url = $protocol . $host . ':' . $this->getPort() . '/CMD_' . $command;
+        if (!$post && $fields !== []) {
+            $url .= '?' . http_build_query($fields);
+        }
 
         // Log the URL for debugging purposes
         $this->getLog()->debug($url);
@@ -739,28 +668,28 @@ class Server_Manager_Directadmin extends Server_Manager
     private function getCustomPackageFields(Server_Package $package): array
     {
         $fields = [
-            'aftp' => $package->getCustomValue('aftp') ? 'ON' : 'OFF',
+            'aftp' => $this->getCustomPackageFlag($package, 'aftp'),
             'bandwidth' => $package->getBandwidth(),
-            'catchall' => $package->getCustomValue('catchall') ? 'ON' : 'OFF',
-            'cgi' => $package->getCustomValue('cgi') ? 'ON' : 'OFF',
-            'cron' => $package->getCustomValue('cron') ? 'ON' : 'OFF',
-            'dnscontrol' => $package->getCustomValue('dnscontrol') ? 'ON' : 'OFF',
+            'catchall' => $this->getCustomPackageFlag($package, 'catchall'),
+            'cgi' => $this->getCustomPackageFlag($package, 'cgi'),
+            'cron' => $this->getCustomPackageFlag($package, 'cron'),
+            'dnscontrol' => $this->getCustomPackageFlag($package, 'dnscontrol', 'ON'),
             'domainptr' => $package->getMaxParkedDomains(),
             'ftp' => $package->getMaxFtp(),
-            'login_keys' => $package->getCustomValue('login_keys') ? 'ON' : 'OFF',
+            'login_keys' => $this->getCustomPackageFlag($package, 'login_keys'),
             'mysql' => $package->getMaxSql(),
-            'nemailf' => $package->getMaxEmailForwarders(),
-            'nemailml' => $package->getMaxEmailLists(),
-            'nemailr' => $package->getMaxEmailAutoresponders(),
+            'nemailf' => $package->getCustomValue('nemailf'),
+            'nemailml' => $package->getCustomValue('nemailml'),
+            'nemailr' => $package->getCustomValue('nemailr'),
             'nemails' => $package->getMaxPop(),
             'nsubdomains' => $package->getMaxSubdomains(),
-            'php' => $package->getCustomValue('php') ? 'ON' : 'OFF',
+            'php' => $this->getCustomPackageFlag($package, 'php'),
             'quota' => $package->getQuota(),
-            'spam' => $package->getCustomValue('spam') ? 'ON' : 'OFF',
-            'ssh' => $package->getCustomValue('ssh') ? 'ON' : 'OFF',
-            'ssl' => $package->getCustomValue('ssl') ? 'ON' : 'OFF',
-            'suspend_at_limit' => $package->getCustomValue('suspend_at_limit') ? 'ON' : 'OFF',
-            'sysinfo' => $package->getCustomValue('sysinfo') ? 'ON' : 'OFF',
+            'spam' => $this->getCustomPackageFlag($package, 'spam'),
+            'ssh' => $this->getCustomPackageFlag($package, 'ssh'),
+            'ssl' => $this->getCustomPackageFlag($package, 'ssl'),
+            'suspend_at_limit' => $this->getCustomPackageFlag($package, 'suspend_at_limit'),
+            'sysinfo' => $this->getCustomPackageFlag($package, 'sysinfo', 'ON'),
             'vdomains' => $package->getMaxDomains(),
         ];
 
@@ -811,6 +740,16 @@ class Server_Manager_Directadmin extends Server_Manager
         return $fields;
     }
 
+    private function getCustomPackageFlag(Server_Package $package, string $key, string $default = 'OFF'): string
+    {
+        $value = $package->getCustomValue($key);
+        if ($value === null) {
+            return $default;
+        }
+
+        return FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($value) ? 'ON' : 'OFF';
+    }
+
     /**
      * Retrieves the information of an account from the DirectAdmin server.
      *
@@ -822,13 +761,14 @@ class Server_Manager_Directadmin extends Server_Manager
      */
     private function getAccountInfo(Server_Account $account): array
     {
+        // CMD_API_SHOW_USER_CONFIG only accepts the `user` parameter.
         $fields = [
-            'action' => 'create',
-            'add' => 'Submit',
             'user' => $account->getUsername(),
         ];
 
-        return $this->request('API_SHOW_USER_CONFIG', $fields);
+        // CMD_API_SHOW_USER_CONFIG is documented as GET-only by DirectAdmin,
+        // so the user parameter must travel in the query string.
+        return $this->request('API_SHOW_USER_CONFIG', $fields, false);
     }
 
     /**
@@ -840,7 +780,8 @@ class Server_Manager_Directadmin extends Server_Manager
      */
     private function getUserPackages(): array
     {
-        $results = $this->request('API_PACKAGES_USER');
+        // CMD_API_PACKAGES_USER is documented as GET-only by DirectAdmin.
+        $results = $this->request('API_PACKAGES_USER', [], false);
 
         if (isset($results['error']) && $results['error'] == 1) {
             throw new Server_Exception('Failed to retrieve user packages: ' . $results['text'] . ': ' . $results['details']);

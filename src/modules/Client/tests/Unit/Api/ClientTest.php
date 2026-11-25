@@ -29,7 +29,7 @@ test('balanceGetList returns array', function (): void {
     $client = createEntity(Box\Mod\Client\Entity\Client::class, ['id' => 1]);
     $balance = createEntity(Box\Mod\Client\Entity\ClientBalance::class, [
         'id' => 1,
-        'client_id' => $client->getId(),
+        'client' => $client,
     ]);
     $queryBuilder = Mockery::mock(Doctrine\ORM\QueryBuilder::class);
 
@@ -45,13 +45,13 @@ test('balanceGetList returns array', function (): void {
     ->with($balance, $client)
     ->andReturn([]);
 
-    $pagerMock = Mockery::mock(FOSSBilling\Pagination::class)->makePartial();
+    $pagerMock = Mockery::mock(FOSSBilling\Core\Pagination\Service::class)->makePartial();
     $pagerMock
     ->shouldReceive('paginateMappedQuery')
     ->once()
-    ->andReturnUsing(static function (Doctrine\ORM\QueryBuilder $query, FOSSBilling\PaginationOptions $pagination, callable $mapper) use ($queryBuilder, $balance): array {
+    ->andReturnUsing(static function (Doctrine\ORM\QueryBuilder $query, FOSSBilling\Core\Pagination\Options $pagination, callable $mapper) use ($queryBuilder, $balance): array {
         expect($query)->toBe($queryBuilder)
-            ->and($pagination)->toBeInstanceOf(FOSSBilling\PaginationOptions::class);
+            ->and($pagination)->toBeInstanceOf(FOSSBilling\Core\Pagination\Options::class);
 
         return ['list' => [$mapper($balance)]];
     });
@@ -74,14 +74,14 @@ test('balanceGetTotal returns float', function (): void {
     $balanceAmount = 0.00;
     $model = createEntity(Box\Mod\Client\Entity\Client::class);
 
-    $serviceMock = Mockery::mock(Box\Mod\Client\ServiceBalance::class);
+    $serviceMock = Mockery::mock(Box\Mod\Invoice\Service::class);
     $serviceMock
-    ->shouldReceive('getClientBalance')
+    ->shouldReceive('getFreeCredit')
     ->atLeast()->once()
     ->andReturn($balanceAmount);
 
     $di = container();
-    $di['mod_service'] = $di->protect(moduleService(['client:balance' => $serviceMock]));
+    $di['mod_service'] = $di->protect(moduleService(['invoice' => $serviceMock]));
 
     $api->setDi($di);
     $api->setIdentity($model);

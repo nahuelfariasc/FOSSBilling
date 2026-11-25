@@ -3,9 +3,23 @@
 
 {% import "macro_functions.html.twig" as mf %}
 
-{% set nr = invoice.serie ~ "%05s"|format(invoice.nr) %}
+{% set nr = invoice.serie_nr %}
+{% if invoice.credit_note_for_invoice_id %}
+    {% set doc_label = 'Credit Note'|trans %}
+{% elseif invoice.debit_note_for_invoice_id %}
+    {% set doc_label = 'Debit Note'|trans %}
+{% else %}
+    {% set doc_label = 'Invoice'|trans %}
+{% endif %}
+{% if invoice.status == 'canceled' %}
+    {% set doc_label = 'Canceled Invoice'|trans %}
+{% endif %}
+{% if not invoice.issued %}
+    {% set doc_label = 'Draft Invoice'|trans %}
+    {% set nr = invoice.id %}
+{% endif %}
 
-{% block meta_title %}{{ 'Invoice'|trans }} #{{ nr }}{% endblock %}
+{% block meta_title %}{{ doc_label }} #{{ nr }}{% endblock %}
 
 {% block body_class %}invoice-invoice{% endblock %}
 
@@ -20,11 +34,20 @@
 {% set company = guest.system_company %}
     <div class="row mb-3">
         <div class="col-md-12">
-            {% if invoice.status == 'unpaid' %}
+            {% if invoice.status == 'unpaid' and invoice.pending_payment|default(null) %}
+                <div class="card">
+                <div class="card-body">
+                    <h5 class="mb-1">{{ 'Payment pending'|trans }}</h5>
+                    <p class="small text-muted mb-0">{{ 'A bank payment of :amount from :date is clearing. No further action is needed - the invoice is marked paid when it clears.'|trans({':amount': invoice.pending_payment.amount|format_currency(invoice.pending_payment.currency|upper), ':date': invoice.pending_payment.created_at|format_date}) }}</p>
+                </div>
+                </div>
+            {% endif %}
+            {% if invoice.status == 'unpaid' and not invoice.pending_payment|default(null) %}
                 <div class="card">
                 <div class="card-body">
                     <h5 class="mb-1">{{ 'Payment methods'|trans }}</h5>
                     <p class="small text-muted">{{ 'Please choose a payment type and pay for your chosen products.'|trans }}</p>
+                    {% if gateway_fees is not null %}
                     <form method="post" action="{{ 'invoice/payment'|api_url(role: 'guest') }}"
                         {{ fb_api_form({ redirect: ("invoice/#{invoice.hash}")|url(query: { 'auto_redirect': 1 }) }) }}>
                         <input type="hidden" name="hash" value="{{ invoice.hash }}"/>
@@ -34,28 +57,92 @@
                                 {% set banklink = 'invoice/banklink'|url %}
                                 <div class="invoice-gateway rounded-2 p-2">
                                     <input type="radio" class="btn-check border-0" name="gateway_id" gateway_id="{{ gtw.id }}" id="{{ gtw.id }}" autocomplete="off">
+                                    {% if gtw.logo.custom|default(false) %}
                                     <label class="btn" for="{{ gtw.id }}"
-                                        style="background: transparent url('{{gtw.logo.logo}}') no-repeat center center; background-size: contain; height:{{gtw.logo.height}}; width:{{gtw.logo.width}};"
+                                        style="width:{{ gtw.logo.width }}; padding: 0;"
                                         onclick="paymentPrompt('{{ gtw.id }}', {{ gtw.allow_recurrent ? 'true' : 'false' }}, {{ gtw.allow_single ? 'true' : 'false' }}, `{{ gtw.title }}`)"
-                                        data-bs-toggle="tooltip" data-bs-title="{{ gtw.title }}"></label>
+                                        data-bs-toggle="tooltip" data-bs-title="{{ gtw.title }}">
+                                        <picture class="d-block w-100">
+                                            {% if gtw.logo.avif|default(null) %}
+                                                <source srcset="{{ gtw.logo.avif }}" type="image/avif">
+                                            {% endif %}
+                                            <img src="{{ gtw.logo.logo }}" alt="{{ gtw.title }}" style="max-width: 100%; max-height: 150px; width: auto; height: auto; display: block; margin: 0 auto;">
+                                        </picture>
+                                    </label>
+                                    {% else %}
+                                    <label class="btn" for="{{ gtw.id }}"
+                                        style="height:{{ gtw.logo.height }}; width:{{ gtw.logo.width }}; padding: 0;"
+                                        onclick="paymentPrompt('{{ gtw.id }}', {{ gtw.allow_recurrent ? 'true' : 'false' }}, {{ gtw.allow_single ? 'true' : 'false' }}, `{{ gtw.title }}`)"
+                                        data-bs-toggle="tooltip" data-bs-title="{{ gtw.title }}">
+                                        <picture class="d-block h-100">
+                                            {% if gtw.logo.avif|default(null) %}
+                                                <source srcset="{{ gtw.logo.avif }}" type="image/avif">
+                                            {% endif %}
+                                            <img src="{{ gtw.logo.logo }}" alt="{{ gtw.title }}" style="width: 100%; height: 100%; object-fit: contain;">
+                                        </picture>
+                                    </label>
+                                    {% endif %}
+                                    {% set fee = gateway_fees[gtw.id].fee|default(0) %}
+                                    {% if fee > 0 %}
+                                        <div class="small text-muted text-center">+ {{ fee|format_currency(invoice.currency ?? default_currency) }} {{ 'fee'|trans }}</div>
+                                    {% endif %}
                                     </div>
                                 {% endif %}
                             {% endfor %}
                         </div>
                         <input type="hidden" name="gateway_id" id="gateway_id">
                     </form>
+                    {% if client and client.invoice_card_available %}
+                        <p class="small text-muted mt-2 mb-0">{{ 'Want this paid automatically next time?'|trans }} <a href="{{ 'payment-methods'|url }}">{{ 'Manage payment methods'|trans }}</a></p>
+                    {% endif %}
+                    {% else %}
+                        <div class="alert alert-warning">{{ 'Payment fee information is temporarily unavailable. Please reload this page before choosing a payment method.'|trans }}</div>
+                    {% endif %}
                 </div>
             </div>
+            {% set free_credit = client and client.profile_get.id == invoice.client.id ? client.balance_get_total|default(0) : 0 %}
+            {% if free_credit > 0 and invoice.balance_due > 0 and 'deposit' not in invoice.lines|map(l => l.type) %}
+                {% set credit = min(free_credit, invoice.balance_due) %}
+                <div class="card mt-3">
+                <div class="card-body">
+                    <h5 class="mb-1">{{ 'Apply credit'|trans }}</h5>
+                    <p class="small text-muted">{{ 'You have :amount of credit. Apply all or part of it to this invoice.'|trans({ ':amount': free_credit|format_currency(invoice.currency ?? default_currency) }) }}</p>
+                    <form method="post" action="{{ 'invoice/apply_credit'|api_url }}" {{ fb_api_form({reload: true}) }}>
+                        <input type="hidden" name="hash" value="{{ invoice.hash }}">
+                        <div class="d-flex gap-2 align-items-end">
+                            <div>
+                                <label class="form-label" for="credit-amount">{{ 'Amount'|trans }}</label>
+                                <input class="form-control" type="number" name="amount" id="credit-amount" min="0.01" step="0.01" max="{{ credit }}" value="{{ credit }}" required>
+                            </div>
+                            <button type="submit" class="btn btn-primary">{{ 'Apply credit'|trans }}</button>
+                        </div>
+                    </form>
+                </div>
+                </div>
+            {% endif %}
             {% endif %}
         </div>
     </div>
+    {% if invoice.status == 'canceled' %}
+    <div class="row mb-3">
+        <div class="col-md-12">
+            <div class="alert alert-secondary mb-0" role="alert">
+                {{ 'This invoice was canceled and can no longer be paid.'|trans }}
+                {% if invoice.replaced_by_invoice_id %}
+                    {{ 'A replacement invoice has been issued. You can find it in your invoices list.'|trans }}
+                    <a href="{{ 'invoice'|url }}" class="alert-link">{{ 'View invoices'|trans }}</a>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    {% endif %}
     <div class="row">
         <div class="col-md-12">
             <div class="card mb-4">
                 <div class="card-header py-3 py-3">
                     <div class="d-flex justify-content-between">
                         <div class="d-flex flex-column">
-                            <h5 class="mb-1 d-flex align-items-center">{{ 'Invoice'|trans }}</h5>
+                            <h5 class="mb-1 d-flex align-items-center">{{ doc_label }}</h5>
                             <span class="small text-muted">{{ 'You can print this invoice or export it to a PDF file by clicking on the corresponding button.'|trans }}</span>
                         </div>
                         <div class="d-flex align-items-center">
@@ -72,8 +159,20 @@
                         <div class="row">
                             <div class="col-md-6 mb-4">
                                 <div class="well small">
-                                    <h4 class="fw-light mt-2 mb-3">{{ 'Invoice'|trans }} #{{ nr }}</h4>
+                                    <h4 class="fw-light mt-2 mb-3">{{ doc_label }} #{{ nr }}</h4>
                                     <dl class="row">
+                                        {% if invoice.credit_note_for_invoice_id or invoice.debit_note_for_invoice_id %}
+                                        <dt class="col-sm-4 text-muted">{{ 'Refers to invoice'|trans }}</dt>
+                                        <dd class="col-sm-8">#{{ invoice.related_invoices[invoice.credit_note_for_invoice_id ?? invoice.debit_note_for_invoice_id]|default(invoice.credit_note_for_invoice_id ?? invoice.debit_note_for_invoice_id) }}</dd>
+                                        {% endif %}
+                                        {% if invoice.refunded_by_invoice_ids %}
+                                        <dt class="col-sm-4 text-muted">{{ 'Credited by'|trans }}</dt>
+                                        <dd class="col-sm-8">{% for ref_id in invoice.refunded_by_invoice_ids %}#{{ invoice.related_invoices[ref_id]|default(ref_id) }}{% if not loop.last %}, {% endif %}{% endfor %}</dd>
+                                        {% endif %}
+                                        {% if invoice.debited_by_invoice_ids %}
+                                        <dt class="col-sm-4 text-muted">{{ 'Debited by'|trans }}</dt>
+                                        <dd class="col-sm-8">{% for ref_id in invoice.debited_by_invoice_ids %}#{{ invoice.related_invoices[ref_id]|default(ref_id) }}{% if not loop.last %}, {% endif %}{% endfor %}</dd>
+                                        {% endif %}
                                         <dt class="col-sm-4 text-muted">{{ 'Invoice Date'|trans }}</dt>
                                         <dd class="col-sm-8">
                                             {% if invoice.paid_at|trim %}
@@ -238,6 +337,16 @@
                                         <td><strong>{{ 'Total'|trans }}</strong></td>
                                         <td><strong>{{ invoice.total|format_currency(invoice.currency ?? default_currency) }}</strong></td>
                                     </tr>
+                                    {% if invoice.status == 'unpaid' and invoice.amount_paid > 0 %}
+                                        <tr class="text-end">
+                                            <td>{{ 'Amount paid'|trans }}</td>
+                                            <td>{{ invoice.amount_paid|format_currency(invoice.currency ?? default_currency) }}</td>
+                                        </tr>
+                                        <tr class="text-end">
+                                            <td><strong>{{ 'Balance due'|trans }}</strong></td>
+                                            <td><strong>{{ invoice.balance_due|format_currency(invoice.currency ?? default_currency) }}</strong></td>
+                                        </tr>
+                                    {% endif %}
                                 </table>
                             </div>
                         </div>
@@ -280,6 +389,8 @@
                 placement: 'top'
             });
         });
+
+
     });
 
     function paymentPrompt(id, supportsSubscription, supportsOneTime, title){

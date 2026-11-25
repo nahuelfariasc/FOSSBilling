@@ -13,7 +13,7 @@ namespace Box\Mod\Servicelicense;
 
 use Box\Mod\Servicelicense\Entity\ServiceLicense;
 
-class Server implements \FOSSBilling\InjectionAwareInterface
+class Server implements \FOSSBilling\Core\Container\InjectionAwareInterface
 {
     private array $_result = [
         'licensed_to' => null,
@@ -53,7 +53,7 @@ class Server implements \FOSSBilling\InjectionAwareInterface
             throw new \LogicException('Your license key is invalid.', 1005);
         }
 
-        $model->setPingedAt(new \DateTime());
+        $model->setPingedAt(new \DateTimeImmutable());
         $this->di['em']->flush();
 
         if (!isset($data['host']) || empty($data['host'])) {

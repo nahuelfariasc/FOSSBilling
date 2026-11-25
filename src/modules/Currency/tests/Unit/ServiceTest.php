@@ -10,13 +10,16 @@
 
 declare(strict_types=1);
 
+use Box\Mod\Currency\Event\AfterAdminDeleteCurrencyEvent;
+use Box\Mod\Currency\Event\BeforeAdminDeleteCurrencyEvent;
+use Symfony\Component\EventDispatcher\EventDispatcher as SymfonyEventDispatcher;
+
 use function Tests\Helpers\container;
 
 test('di returns dependency injection container', function (): void {
     $service = new Box\Mod\Currency\Service();
 
     $di = container();
-    $db = Mockery::mock('Box_Database');
 
     $repositoryStub = Mockery::mock(Box\Mod\Currency\Repository\CurrencyRepository::class)->shouldIgnoreMissing();
 
@@ -25,7 +28,6 @@ test('di returns dependency injection container', function (): void {
         ->atLeast()->once()
         ->andReturn($repositoryStub);
 
-    $di['db'] = $db;
     $di['em'] = $emMock;
     $service->setDi($di);
     $result = $service->getDi();
@@ -73,7 +75,7 @@ test('getBaseCurrencyRate throws exception when rate is zero', function (): void
     $code = 'EUR';
 
     expect(fn (): float => $service->getBaseCurrencyRate($code))
-        ->toThrow(FOSSBilling\Exception::class);
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class);
 });
 
 test('getBaseCurrencyRate throws exception when currency not found', function (): void {
@@ -95,7 +97,7 @@ test('getBaseCurrencyRate throws exception when currency not found', function ()
     $code = 'XYZ';
 
     expect(fn (): float => $service->getBaseCurrencyRate($code))
-        ->toThrow(FOSSBilling\Exception::class, 'Currency not found');
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class, 'Currency not found');
 });
 
 dataset('toBaseCurrencyProvider', fn (): array => [
@@ -315,7 +317,7 @@ test('setAsDefault throws exception when currency code is empty', function (): v
     $service->setDi($di);
 
     expect(fn (): bool => $service->setAsDefault($model))
-        ->toThrow(FOSSBilling\Exception::class);
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class);
 });
 
 test('getPairs returns currency pairs', function (): void {
@@ -371,7 +373,7 @@ test('removeCurrency throws exception when deleting default currency', function 
     $service->setDi($di);
 
     expect(fn (): bool => $service->removeCurrency('EUR'))
-        ->toThrow(FOSSBilling\InformationException::class);
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class);
 });
 
 test('removeCurrency removes currency', function (): void {
@@ -393,19 +395,30 @@ test('removeCurrency removes currency', function (): void {
     $emMock->shouldReceive('getRepository')
         ->atLeast()->once()
         ->andReturn($repositoryMock);
-    $emMock->shouldReceive('remove')
-        ->atLeast()->once()
-        ->with($model);
-    $emMock->shouldReceive('flush')
-        ->atLeast()->once();
+    $events = new ArrayObject();
+    $eventDispatcher = new SymfonyEventDispatcher();
+    foreach ([BeforeAdminDeleteCurrencyEvent::class, AfterAdminDeleteCurrencyEvent::class] as $eventClass) {
+        $eventDispatcher->addListener($eventClass, static function (object $event) use ($events): void {
+            $events->append($event);
+        });
+    }
 
-    $eventsManager = Mockery::mock(Box_EventManager::class);
-    $eventsManager->shouldReceive('fire')
-        ->twice();
+    $emMock->shouldReceive('remove')
+        ->once()
+        ->with($model)
+        ->andReturnUsing(function () use ($events): void {
+            expect($events->getArrayCopy())->toHaveCount(1);
+            expect($events[0])->toBeInstanceOf(BeforeAdminDeleteCurrencyEvent::class);
+        });
+    $emMock->shouldReceive('flush')
+        ->once()
+        ->andReturnUsing(function () use ($events): void {
+            expect($events->getArrayCopy())->toHaveCount(1);
+        });
 
     $di = new Pimple\Container();
     $di['em'] = $emMock;
-    $di['events_manager'] = $eventsManager;
+    $di['event_dispatcher'] = $eventDispatcher;
     $di['logger'] = new Tests\Helpers\TestLogger();
 
     $service = new Box\Mod\Currency\Service();
@@ -413,6 +426,10 @@ test('removeCurrency removes currency', function (): void {
     $result = $service->removeCurrency('EUR');
 
     expect($result)->toBeTrue();
+    expect(array_map(static fn (object $event): string => $event::class, $events->getArrayCopy()))
+        ->toBe([BeforeAdminDeleteCurrencyEvent::class, AfterAdminDeleteCurrencyEvent::class]);
+    expect($events[0]->code)->toBe('EUR');
+    expect($events[1]->code)->toBe('EUR');
 });
 
 test('removeCurrency throws exception when currency is not found', function (): void {
@@ -434,7 +451,7 @@ test('removeCurrency throws exception when currency is not found', function (): 
     $service->setDi($di);
 
     expect(fn (): bool => $service->removeCurrency(''))
-        ->toThrow(FOSSBilling\Exception::class);
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class);
 });
 
 test('toApiArray returns API array for currency', function (): void {
@@ -509,7 +526,7 @@ test('createCurrency requires an explicit rate for a manual override', function 
     $service->setDi($di);
 
     expect(fn (): string => $service->createCurrency('LAK', null, true))
-        ->toThrow(FOSSBilling\InformationException::class, 'A conversion rate is required when manual override is enabled.');
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class, 'A conversion rate is required when manual override is enabled.');
 });
 
 test('updateCurrency updates currency', function (): void {
@@ -578,7 +595,7 @@ test('updateCurrency rejects manual overrides for the default currency', functio
     $service->setDi($di);
 
     expect(fn (): bool => $service->updateCurrency('USD', 2.0, [], true))
-        ->toThrow(FOSSBilling\InformationException::class, 'The default currency cannot use a manual rate override.');
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class, 'The default currency cannot use a manual rate override.');
 });
 
 test('updateCurrency throws exception when currency not found', function (): void {
@@ -602,7 +619,7 @@ test('updateCurrency throws exception when currency not found', function (): voi
     $service->setDi($di);
 
     expect(fn (): bool => $service->updateCurrency($code, $conversion_rate))
-        ->toThrow(FOSSBilling\Exception::class);
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class);
 });
 
 test('updateCurrency throws exception when conversion rate is zero', function (): void {
@@ -630,7 +647,7 @@ test('updateCurrency throws exception when conversion rate is zero', function ()
     $service->setDi($di);
 
     expect(fn (): bool => $service->updateCurrency($code, $conversion_rate))
-        ->toThrow(FOSSBilling\Exception::class);
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class);
 });
 
 test('updateCurrencyRates updates rates for all currencies', function (): void {
@@ -772,6 +789,18 @@ test('updateCurrencyRates preserves manual overrides', function (): void {
     expect($service->updateCurrencyRates())->toBeTrue();
 });
 
+test('updates currency rates before admin cron through a typed event listener', function (): void {
+    $service = Mockery::mock(Box\Mod\Currency\Service::class)->makePartial();
+    $service->shouldReceive('isCronEnabled')->once()->andReturn(true);
+    $service->shouldReceive('updateCurrencyRates')->once()->andReturn(true);
+    $dispatcher = new FOSSBilling\Core\Events\EventDispatcher(
+        static fn (): array => ['currency'],
+        static fn (string $module): object => $service,
+    );
+
+    $dispatcher->dispatch(new Box\Mod\Cron\Event\BeforeAdminCronRunEvent());
+});
+
 test('removeCurrency deletes currency by code', function (): void {
     $model = Mockery::mock(Box\Mod\Currency\Entity\Currency::class);
     $model->shouldReceive('getCode')
@@ -797,15 +826,10 @@ test('removeCurrency deletes currency by code', function (): void {
     $emMock->shouldReceive('flush')
         ->atLeast()->once();
 
-    $manager = Mockery::mock('Box_EventManager');
-    $manager->shouldReceive('fire')
-        ->atLeast()->once()
-        ->andReturn(true);
-
     $di = new Pimple\Container();
     $di['logger'] = new Tests\Helpers\TestLogger();
     $di['em'] = $emMock;
-    $di['events_manager'] = $manager;
+    $di['event_dispatcher'] = new FOSSBilling\Core\Events\EventDispatcher(static fn (): array => [], static fn (string $module): object => new stdClass());
 
     $service = new Box\Mod\Currency\Service();
     $service->setDi($di);
@@ -836,5 +860,182 @@ test('removeCurrency throws exception when currency not found by code', function
     $service->setDi($di);
 
     expect(fn (): bool => $service->removeCurrency($code))
-        ->toThrow(FOSSBilling\Exception::class);
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class);
+});
+
+dataset('subPrecisionRates', fn (): array => [
+    [0.0000001],
+    ['0.0000001'],
+    ['1e-7'],
+    [0.0000005],
+]);
+
+test('createCurrency rejects rates that would round to zero', function (string|float $rate): void {
+    $repositoryMock = Mockery::mock(Box\Mod\Currency\Repository\CurrencyRepository::class)->shouldIgnoreMissing();
+
+    $emMock = Mockery::mock(Doctrine\ORM\EntityManager::class);
+    $emMock->shouldReceive('getRepository')
+        ->atLeast()->once()
+        ->andReturn($repositoryMock);
+    $emMock->shouldNotReceive('persist');
+    $emMock->shouldNotReceive('flush');
+
+    $di = new Pimple\Container();
+    $di['em'] = $emMock;
+
+    $service = new Box\Mod\Currency\Service();
+    $service->setDi($di);
+
+    expect(fn (): string => $service->createCurrency('EUR', $rate))
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class, 'round to zero');
+})->with('subPrecisionRates');
+
+test('updateCurrency rejects rates that would round to zero without mutating the currency', function (string|float $rate): void {
+    $model = Mockery::mock(Box\Mod\Currency\Entity\Currency::class);
+    $model->shouldNotReceive('setConversionRate');
+
+    $repositoryMock = Mockery::mock(Box\Mod\Currency\Repository\CurrencyRepository::class)->shouldIgnoreMissing();
+    $repositoryMock->shouldReceive('findOneByCode')
+        ->atLeast()->once()
+        ->with('EUR')
+        ->andReturn($model);
+
+    $emMock = Mockery::mock(Doctrine\ORM\EntityManager::class);
+    $emMock->shouldReceive('getRepository')
+        ->atLeast()->once()
+        ->andReturn($repositoryMock);
+    $emMock->shouldNotReceive('persist');
+    $emMock->shouldNotReceive('flush');
+
+    $di = new Pimple\Container();
+    $di['em'] = $emMock;
+
+    $service = new Box\Mod\Currency\Service();
+    $service->setDi($di);
+
+    expect(fn (): bool => $service->updateCurrency('EUR', $rate))
+        ->toThrow(FOSSBilling\Core\Exception\InformationException::class, 'round to zero');
+})->with('subPrecisionRates');
+
+test('createCurrency accepts the smallest storable rate', function (): void {
+    $repositoryMock = Mockery::mock(Box\Mod\Currency\Repository\CurrencyRepository::class)->shouldIgnoreMissing();
+
+    $emMock = Mockery::mock(Doctrine\ORM\EntityManager::class);
+    $emMock->shouldReceive('getRepository')
+        ->atLeast()->once()
+        ->andReturn($repositoryMock);
+    $emMock->shouldReceive('persist')
+        ->once()
+        ->with(Mockery::on(static fn (mixed $currency): bool => $currency instanceof Box\Mod\Currency\Entity\Currency && $currency->getConversionRate() === 1.0E-6));
+    $emMock->shouldReceive('flush')
+        ->once();
+
+    $di = container();
+    $di['logger'] = new Tests\Helpers\TestLogger();
+    $di['em'] = $emMock;
+
+    $service = new Box\Mod\Currency\Service();
+    $service->setDi($di);
+
+    expect($service->createCurrency('EUR', 0.000001))->toBe('EUR');
+});
+
+test('numeric string conversion rates are normalized to six decimals', function (): void {
+    $currency = (new Box\Mod\Currency\Entity\Currency('EUR'))->setConversionRate('0.92');
+
+    expect($currency->getConversionRateRaw())->toBe('0.920000')
+        ->and($currency->getConversionRate())->toBe(0.92);
+});
+
+test('updateCurrencyRates skips fetched rates that would round to zero', function (): void {
+    $defaultModel = Mockery::mock(Box\Mod\Currency\Entity\Currency::class);
+    $defaultModel->shouldReceive('getCode')->byDefault()->andReturn('USD');
+    $defaultModel->shouldReceive('isDefault')->byDefault()->andReturn(true);
+    $defaultModel->shouldReceive('setConversionRate')->once()->with(1.0);
+
+    $tinyModel = Mockery::mock(Box\Mod\Currency\Entity\Currency::class);
+    $tinyModel->shouldReceive('getCode')->byDefault()->andReturn('EUR');
+    $tinyModel->shouldReceive('isDefault')->byDefault()->andReturn(false);
+    $tinyModel->shouldReceive('isRateManual')->byDefault()->andReturn(false);
+    $tinyModel->shouldNotReceive('setConversionRate');
+
+    $repositoryMock = Mockery::mock(Box\Mod\Currency\Repository\CurrencyRepository::class);
+    $repositoryMock->shouldReceive('findDefault')->once()->andReturn($defaultModel);
+    $repositoryMock->shouldReceive('findAll')->once()->andReturn([$defaultModel, $tinyModel]);
+
+    $emMock = Mockery::mock(Doctrine\ORM\EntityManager::class);
+    $emMock->shouldReceive('getRepository')->andReturn($repositoryMock);
+    $emMock->shouldReceive('flush')->once();
+
+    $service = Mockery::mock(Box\Mod\Currency\Service::class)
+        ->makePartial()
+        ->shouldAllowMockingProtectedMethods();
+    $service->shouldReceive('getRate')->once()->with('USD', 'EUR')->andReturn(1e-7);
+
+    $di = container();
+    $di['logger'] = new Tests\Helpers\TestLogger();
+    $di['em'] = $emMock;
+    $service->setDi($di);
+
+    expect($service->updateCurrencyRates())->toBeTrue();
+});
+
+describe('currency API requests', function (): void {
+    beforeEach(function (): void {
+        $this->capturedRequests = [];
+        $httpClient = new Symfony\Component\HttpClient\MockHttpClient(function (string $method, string $url, array $options): Symfony\Component\HttpClient\Response\MockResponse {
+            $this->capturedRequests[] = ['url' => $url, 'options' => $options];
+
+            return new Symfony\Component\HttpClient\Response\MockResponse(
+                json_encode([
+                    'success' => true,
+                    'timestamp' => 1_760_000_000,
+                    'source' => 'USD',
+                    // cspell:ignore USDEUR USDGBP
+                    'quotes' => ['USDEUR' => 0.9, 'USDGBP' => 0.8],
+                ], JSON_THROW_ON_ERROR),
+                ['response_headers' => ['content-type: application/json']]
+            );
+        });
+
+        $repositoryStub = Mockery::mock(Box\Mod\Currency\Repository\CurrencyRepository::class)->shouldIgnoreMissing();
+        $emMock = Mockery::mock(Doctrine\ORM\EntityManager::class);
+        $emMock->shouldReceive('getRepository')
+            ->atLeast()->once()
+            ->andReturn($repositoryStub);
+
+        $di = container();
+        $di['em'] = $emMock;
+        $di['cache'] = static fn (): Symfony\Component\Cache\Adapter\ArrayAdapter => new Symfony\Component\Cache\Adapter\ArrayAdapter();
+        $di['http_client'] = static fn (): Symfony\Component\HttpClient\MockHttpClient => $httpClient;
+
+        $this->service = new Box\Mod\Currency\Service();
+        $this->service->setDi($di);
+    });
+
+    test('currencylayer rates are requested from the currencylayer API with an access key', function (): void {
+        $method = new ReflectionMethod($this->service, 'getCurrencyLayerRates');
+        $rates = $method->invoke($this->service, 'USD', 3600, 'test-key');
+
+        expect($this->capturedRequests)->toHaveCount(1)
+            ->and($this->capturedRequests[0]['url'])->toStartWith('https://api.currencylayer.com/live')
+            ->and($this->capturedRequests[0]['url'])->toContain('access_key=test-key')
+            ->and($this->capturedRequests[0]['url'])->toContain('source=USD')
+            ->and($rates)->toBe(['EUR' => 0.9, 'GBP' => 0.8]);
+    });
+
+    test('currency data api rates keep using the APILayer marketplace endpoint and apikey header', function (): void {
+        $method = new ReflectionMethod($this->service, 'getCurrencyDataRates');
+        $rates = $method->invoke($this->service, 'USD', 3600, 'test-key');
+
+        expect($this->capturedRequests)->toHaveCount(1);
+        $request = $this->capturedRequests[0];
+        parse_str((string) parse_url($request['url'], PHP_URL_QUERY), $query);
+
+        expect($request['url'])->toStartWith('https://api.apilayer.com/currency_data/live')
+            ->and($query)->toHaveKey('source', 'USD')
+            ->and($query)->not->toHaveKey('access_key')
+            ->and($request['options']['normalized_headers']['apikey'] ?? [])->toBe(['apikey: test-key'])
+            ->and($rates)->toBe(['EUR' => 0.9, 'GBP' => 0.8]);
+    });
 });

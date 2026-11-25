@@ -14,7 +14,7 @@ namespace Box\Mod\Serviceapikey;
 use Box\Mod\Order\Entity\Order;
 use Box\Mod\Product\Entity\Product;
 use Box\Mod\Serviceapikey\Entity\ServiceApiKey;
-use FOSSBilling\InjectionAwareInterface;
+use FOSSBilling\Core\Container\InjectionAwareInterface;
 
 class Service implements InjectionAwareInterface
 {
@@ -55,19 +55,19 @@ class Service implements InjectionAwareInterface
 
     public function attachOrderConfig(Product $product, array $data): array
     {
-        $config = json_decode($product->getConfig() ?? '', true) ?? [];
+        $config = $product->getConfig() ?? [];
 
         return array_merge($config, $data);
     }
 
     /**
-     * @param \Model_ClientOrder $order with client_id and config properties
+     * @param Order $order with client_id and config properties
      */
-    public function action_create(\Model_ClientOrder $order): ServiceApiKey
+    public function action_create(Order $order): ServiceApiKey
     {
         $model = new ServiceApiKey();
-        $model->setClientId((int) $order->client_id);
-        $model->setConfig($order->config);
+        $model->setClientId((int) $order->getClientId());
+        $model->setConfig($order->getConfig());
 
         $this->di['em']->persist($model);
         $this->di['em']->flush();
@@ -75,10 +75,10 @@ class Service implements InjectionAwareInterface
         return $model;
     }
 
-    public function action_activate(\Model_ClientOrder $order): bool
+    public function action_activate(Order $order): bool
     {
         $model = $this->_getService($order);
-        $config = json_decode($order->config ?? '', true);
+        $config = $order->getConfig();
         $model->setApiKey($this->generateKey($config));
 
         $this->di['em']->flush();
@@ -86,31 +86,31 @@ class Service implements InjectionAwareInterface
         return true;
     }
 
-    public function action_suspend(\Model_ClientOrder $order): bool
+    public function action_suspend(Order $order): bool
     {
         $this->_getService($order);
 
         return true;
     }
 
-    public function action_unsuspend(\Model_ClientOrder $order): bool
+    public function action_unsuspend(Order $order): bool
     {
         $this->_getService($order);
 
         return true;
     }
 
-    public function action_cancel(\Model_ClientOrder $order): bool
+    public function action_cancel(Order $order): bool
     {
         return $this->action_suspend($order);
     }
 
-    public function action_uncancel(\Model_ClientOrder $order): bool
+    public function action_uncancel(Order $order): bool
     {
         return $this->action_unsuspend($order);
     }
 
-    public function action_delete(\Model_ClientOrder $order): void
+    public function action_delete(Order $order, bool $forceDelete = false): void
     {
         $model = $this->_getService($order, false);
         if ($model instanceof ServiceApiKey) {
@@ -126,7 +126,7 @@ class Service implements InjectionAwareInterface
             'created_at' => $model->getCreatedAt()?->format('Y-m-d H:i:s'),
             'updated_at' => $model->getUpdatedAt()?->format('Y-m-d H:i:s'),
             'api_key' => $model->getApiKey(),
-            'config' => json_decode($model->getConfig() ?? '', true),
+            'config' => $model->getConfig(),
         ];
     }
 
@@ -138,12 +138,12 @@ class Service implements InjectionAwareInterface
     public function isValid(array $data): bool
     {
         if (empty($data['key'])) {
-            throw new \FOSSBilling\Exception('You must provide an API key to check it\'s validity.');
+            throw new \FOSSBilling\Core\Exception\BaseException('You must provide an API key to check it\'s validity.');
         }
 
         $model = $this->getRepository()->findByApiKey($data['key']);
         if ($model === null) {
-            throw new \FOSSBilling\Exception('API key does not exist');
+            throw new \FOSSBilling\Core\Exception\BaseException('API key does not exist');
         }
 
         return $this->isActive($model);
@@ -159,11 +159,11 @@ class Service implements InjectionAwareInterface
     public function resetApiKey(array $data): bool
     {
         if (empty($data['key']) && empty($data['order_id'])) {
-            throw new \FOSSBilling\Exception('You must provide either the API key or API key order ID in order to reset it.');
+            throw new \FOSSBilling\Core\Exception\BaseException('You must provide either the API key or API key order ID in order to reset it.');
         } elseif (!empty($data['order_id'])) {
             $order = $this->getOrderRepository()->find($data['order_id']);
             if ($order === null) {
-                throw new \FOSSBilling\Exception('Order not found');
+                throw new \FOSSBilling\Core\Exception\BaseException('Order not found');
             }
 
             $orderService = $this->di['mod_service']('order');
@@ -173,7 +173,7 @@ class Service implements InjectionAwareInterface
         }
 
         if (!$model instanceof ServiceApiKey) {
-            throw new \FOSSBilling\Exception('API key does not exist');
+            throw new \FOSSBilling\Core\Exception\BaseException('API key does not exist');
         }
 
         $client = null;
@@ -181,15 +181,15 @@ class Service implements InjectionAwareInterface
             $client = $this->di['loggedin_client'];
         }
 
-        if (!is_null($client) && $client->id !== $model->getClientId()) {
-            throw new \FOSSBilling\Exception('API key does not exist');
+        if (!is_null($client) && $client->getId() !== $model->getClientId()) {
+            throw new \FOSSBilling\Core\Exception\BaseException('API key does not exist');
         }
 
         if (!$this->isActive($model)) {
-            throw new \FOSSBilling\InformationException('Order is not active');
+            throw new \FOSSBilling\Core\Exception\InformationException('Order is not active');
         }
 
-        $config = json_decode($model->getConfig() ?? '', true);
+        $config = $model->getConfig();
 
         $model->setApiKey($this->generateKey($config));
         $this->di['em']->flush();
@@ -207,26 +207,26 @@ class Service implements InjectionAwareInterface
     public function updateApiKey(array $data): bool
     {
         if (empty($data['order_id'])) {
-            throw new \FOSSBilling\Exception('You must provide the API key order ID in order to update it.');
+            throw new \FOSSBilling\Core\Exception\BaseException('You must provide the API key order ID in order to update it.');
         }
 
         $order = $this->getOrderRepository()->find($data['order_id']);
         if ($order === null) {
-            throw new \FOSSBilling\Exception('Order not found');
+            throw new \FOSSBilling\Core\Exception\BaseException('Order not found');
         }
 
         $orderService = $this->di['mod_service']('order');
         $model = $orderService->getOrderService($order);
 
         if (!$model instanceof ServiceApiKey) {
-            throw new \FOSSBilling\Exception('API key does not exist');
+            throw new \FOSSBilling\Core\Exception\BaseException('API key does not exist');
         }
 
         if (isset($data['api_key']) && $model->getApiKey() !== $data['api_key']) {
-            throw new \FOSSBilling\Exception('To change the API key, please use the reset function rather than updating it.');
+            throw new \FOSSBilling\Core\Exception\BaseException('To change the API key, please use the reset function rather than updating it.');
         }
 
-        $config = !empty($data['config']) ? json_encode($data['config']) : $model->getConfig();
+        $config = $data['config'] ?? $model->getConfig();
         $model->setConfig($config);
         $this->di['em']->flush();
 
@@ -238,17 +238,14 @@ class Service implements InjectionAwareInterface
      */
     public function install(): bool
     {
-        $sql = '
-        CREATE TABLE IF NOT EXISTS `service_apikey` (
-            `id` bigint(20) NOT NULL AUTO_INCREMENT UNIQUE,
-            `client_id` bigint(20) NOT NULL,
-            `api_key` varchar(255),
-            `config` text NOT NULL,
-            `created_at` datetime,
-            `updated_at` datetime,
-            PRIMARY KEY (`id`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8 AUTO_INCREMENT=1 ;';
-        $this->di['db']->exec($sql);
+        // Raw MySQL-only DDL here (backticks, ENGINE=InnoDB) would fail outright on
+        // PostgreSQL/SQLite. On MySQL, the pre-cutover schema doesn't create service_apikey either -
+        // UpdatePatcher::patch111() does, as a startup-safety-net fix - so this hook is already
+        // redundant there and only load-bearing on PG/SQLite fresh installs where nothing else
+        // creates the table. SchemaSynchronizer::syncEntities() creates (or catches up) just
+        // this module's own table from current metadata, additively and safely, scoped so
+        // installing this one extension never reports every *other* table in the app as missing.
+        \FOSSBilling\Core\Doctrine\SchemaSynchronizer::syncEntities($this->di['em'], [ServiceApiKey::class]);
 
         return true;
     }
@@ -258,7 +255,9 @@ class Service implements InjectionAwareInterface
      */
     public function uninstall(): bool
     {
-        $this->di['db']->exec('DROP TABLE IF EXISTS `service_apikey`');
+        // No backticks: PostgreSQL doesn't recognize them as identifier quoting (a parse error,
+        // not a no-op), unlike the install() hook above's now-portable path.
+        $this->di['em']->getConnection()->executeStatement('DROP TABLE IF EXISTS service_apikey');
 
         return true;
     }
@@ -283,7 +282,7 @@ class Service implements InjectionAwareInterface
         do {
             // Try 10 times to generate a unique API key. Fail if we are unable to.
             if ($i++ >= 10) {
-                throw new \FOSSBilling\Exception('Maximum number of iterations reached while generating API key');
+                throw new \FOSSBilling\Core\Exception\BaseException('Maximum number of iterations reached while generating API key');
             }
 
             // Generate random bytes half the length of the configured length, as the length will doubled when converted to a hex string.
@@ -318,7 +317,7 @@ class Service implements InjectionAwareInterface
 
                     break;
                 default:
-                    throw new \FOSSBilling\Exception("Unknown uppercase option ':case:'. API generator only accepts 'lower', 'upper', or 'mixed'.", [':case:' => $case]);
+                    throw new \FOSSBilling\Core\Exception\BaseException("Unknown uppercase option ':case:'. API generator only accepts 'lower', 'upper', or 'mixed'.", [':case:' => $case]);
             }
         } while ($this->getRepository()->findByApiKey($apiKey) !== null);
 
@@ -332,7 +331,7 @@ class Service implements InjectionAwareInterface
             'serviceType' => \Box\Mod\Product\Service::APIKEY,
         ]);
         if (!$order instanceof Order) {
-            throw new \FOSSBilling\Exception('API key does not exist');
+            throw new \FOSSBilling\Core\Exception\BaseException('API key does not exist');
         }
 
         if ($order->getStatus() !== Order::STATUS_ACTIVE) {
@@ -347,13 +346,13 @@ class Service implements InjectionAwareInterface
         return true;
     }
 
-    private function _getService(\Model_ClientOrder $order, bool $required = true): ?ServiceApiKey
+    private function _getService(Order $order, bool $required = true): ?ServiceApiKey
     {
         $orderService = $this->di['mod_service']('order');
         $model = $orderService->getOrderService($order);
         if (!$model instanceof ServiceApiKey) {
             if ($required) {
-                throw new \FOSSBilling\Exception('Could not find active service');
+                throw new \FOSSBilling\Core\Exception\BaseException('Could not find active service');
             }
 
             return null;

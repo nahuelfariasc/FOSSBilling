@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 use Box\Mod\Massmailer\Entity\MassmailerMessage;
 use Box\Mod\Massmailer\Repository\MassmailerMessageRepository;
-use FOSSBilling\InformationException;
+use FOSSBilling\Core\Exception\InformationException;
 
 use function Tests\Helpers\moduleService;
 
@@ -38,7 +38,7 @@ test('update stores normalized filter', function (): void {
 
     $service = new Box\Mod\Massmailer\Service();
     $di = createMassmailerAdminDi($model);
-    $di['logger'] = new Box_Log();
+    $di['logger'] = new FOSSBilling\Core\Logging\Logger();
     $service->setDi($di);
 
     $api = apiEndpoint(new Box\Mod\Massmailer\Api\Admin());
@@ -54,7 +54,7 @@ test('update stores normalized filter', function (): void {
     ]);
 
     expect($result)->toBeTrue();
-    expect($model->getFilter())->toBe('{"client_status":["active","canceled"],"has_order_with_status":["active","suspended"]}');
+    expect($model->getFilter())->toBe(['client_status' => ['active', 'canceled'], 'has_order_with_status' => ['active', 'suspended']]);
 });
 
 test('update rejects invalid filter', function (): void {
@@ -65,7 +65,7 @@ test('update rejects invalid filter', function (): void {
 
     $service = new Box\Mod\Massmailer\Service();
     $di = createMassmailerAdminDi($model, false);
-    $di['logger'] = new Box_Log();
+    $di['logger'] = new FOSSBilling\Core\Logging\Logger();
     $service->setDi($di);
 
     $api = apiEndpoint(new Box\Mod\Massmailer\Api\Admin());

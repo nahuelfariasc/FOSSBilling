@@ -12,7 +12,7 @@ declare(strict_types=1);
 
 use Symfony\Component\HttpFoundation\Request;
 
-class BoxAppRouteDispatchSharedController implements FOSSBilling\InjectionAwareInterface
+class BoxAppRouteDispatchSharedController implements FOSSBilling\Core\Container\InjectionAwareInterface
 {
     private ?Pimple\Container $di = null;
 
@@ -21,19 +21,19 @@ class BoxAppRouteDispatchSharedController implements FOSSBilling\InjectionAwareI
         $this->di = $di;
     }
 
-    public function priority(Box_App $app, string $id): string
+    public function priority(FOSSBilling\Core\Http\App $app, string $id): string
     {
         return 'shared:' . $id;
     }
 
-    public function injected(Box_App $app): string
+    public function injected(FOSSBilling\Core\Http\App $app): string
     {
         return $this->di instanceof Pimple\Container && $this->di['shared_marker'] === 'available'
             ? 'di:available'
             : 'di:missing';
     }
 
-    public function collectDebugbar(Box_App $app): string
+    public function collectDebugbar(FOSSBilling\Core\Http\App $app): string
     {
         $app->getDebugBar()->getData();
 
@@ -41,7 +41,7 @@ class BoxAppRouteDispatchSharedController implements FOSSBilling\InjectionAwareI
     }
 }
 
-class BoxAppRouteDispatchApp extends Box_App
+class BoxAppRouteDispatchApp extends FOSSBilling\Core\Http\App
 {
     public function __construct(private readonly string $routeMode)
     {
@@ -123,8 +123,13 @@ class BoxAppRouteDispatchApp extends Box_App
     }
 }
 
-class BoxAppMaintenanceCheckApp extends Box_App
+class BoxAppMaintenanceCheckApp extends FOSSBilling\Core\Http\App
 {
+    public function adminPrefixAllowed(): bool
+    {
+        return $this->checkAdminPrefix();
+    }
+
     public function pathAllowed(string $requestPath, string $allowedPath): bool
     {
         return $this->pathMatchesMaintenancePattern($requestPath, $allowedPath);
@@ -150,7 +155,7 @@ function routeDispatchApp(string $routeMode, string $path): BoxAppRouteDispatchA
         }
     };
     $di['logger'] = new class {
-        public function setChannel(string $channel): self
+        public function withChannel(string $channel): self
         {
             return $this;
         }
@@ -224,6 +229,15 @@ test('maintenance path allowlist uses literal prefixes and explicit wildcards', 
         ->and($app->pathAllowed('/api/guest/staff/login', '/api/guest/staff/*'))->toBeTrue()
         ->and($app->pathAllowed('/docs/v10', '/docs/v1.0'))->toBeFalse()
         ->and($app->pathAllowed('/api/admin', ''))->toBeFalse();
+});
+
+test('maintenance mode recognizes the configured admin prefix', function (): void {
+    $app = new BoxAppMaintenanceCheckApp();
+    $di = new Pimple\Container();
+    $di['request'] = Request::create(rtrim(SYSTEM_URL, '/') . '/' . ltrim(ADMIN_PREFIX, '/') . '/settings');
+    $app->setDi($di);
+
+    expect($app->adminPrefixAllowed())->toBeFalse();
 });
 
 test('maintenance IP allowlist supports exact IPs, CIDR ranges, and IPv6', function (): void {

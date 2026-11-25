@@ -27,22 +27,22 @@ define('PATH_TESTS', __DIR__);
 // with 255 mid-suite. 2G is comfortably above peak usage (~185M).
 ini_set('memory_limit', '2G');
 
-// Disable DEBUG mode to prevent FOSSBilling\Exception from logging stack traces
+// Disable DEBUG mode to prevent FOSSBilling\Core\Exception\BaseException from logging stack traces
 // Must be defined BEFORE load.php is included
 if (!defined('DEBUG')) {
     define('DEBUG', false);
 }
 
-// Pre-declare translation functions to prevent Box_Translate from trying to redefine them
+// Pre-declare translation functions before the application bootstrap loads them.
 // These stubs will be used if the full translation system isn't initialized
 if (!function_exists('__trans')) {
-    function __trans(string $msgid, ?array $values = null): string
+    function __trans(string $msgid, ?array $values = null, ?string $from = null): string
     {
         return $values ? strtr($msgid, $values) : $msgid;
     }
 }
 if (!function_exists('__pluralTrans')) {
-    function __pluralTrans(string $msgid, string $msgidPlural, int $number, ?array $values = null): string
+    function __pluralTrans(string $msgid, string $msgidPlural, int $number, ?array $values = null, ?string $from = null): string
     {
         return $values ? strtr($msgid, $values) : $msgid;
     }
@@ -54,9 +54,10 @@ require_once __DIR__ . '/../src/vendor/autoload.php';
 
 // Load test helpers
 require_once __DIR__ . '/Helpers/Container.php';
+require_once __DIR__ . '/Helpers/Database.php';
 require_once __DIR__ . '/Helpers/Factories.php';
 require_once __DIR__ . '/Helpers/Api.php';
-require_once __DIR__ . '/Helpers/DummyBean.php';
+require_once __DIR__ . '/Helpers/Zip.php';
 require_once __DIR__ . '/Support/CombinedTwigLoader.php';
 require_once __DIR__ . '/Support/PermissiveStub.php';
 require_once __DIR__ . '/Support/PermissiveContainer.php';
@@ -71,42 +72,140 @@ require_once __DIR__ . '/Datasets/ValidationData.php';
 require_once __DIR__ . '/Datasets/GeographicData.php';
 
 /**
+ * Whether a Redis client extension is available. Cache-backend tests that need an
+ * environment without it (to exercise the connection-failure/fallback paths) skip
+ * themselves when this is true.
+ */
+function hasRedisExtension(): bool
+{
+    return class_exists(Redis::class) || class_exists(Relay\Relay::class) || class_exists(RedisCluster::class);
+}
+
+/**
  * Construct an API endpoint with the default test container.
  *
- * @template T of FOSSBilling\Api\AbstractApi
+ * @template T of FOSSBilling\Core\Api\AbstractApi
  *
  * @param T $api
  *
  * @return T
  */
-function apiEndpoint(FOSSBilling\Api\AbstractApi $api): FOSSBilling\Api\AbstractApi
+function apiEndpoint(FOSSBilling\Core\Api\AbstractApi $api): FOSSBilling\Core\Api\AbstractApi
 {
     $api->setDi(Tests\Helpers\container());
+
+    try {
+        $api->getIdentity();
+    } catch (Throwable) {
+        $realClass = $api::class;
+        // Mockery mocks have names like Mockery_2_Box_Mod_..._Api_Admin; unwrap to the mocked class.
+        if (str_starts_with($realClass, 'Mockery_') && ($parent = get_parent_class($api)) !== false) {
+            $realClass = $parent;
+        }
+        // Normalize both namespace separators for checks (mocks use underscores).
+        $normalized = str_replace(['\\', '_'], '\\', $realClass);
+        $api->setIdentity(match (true) {
+            str_contains($normalized, '\\Api\\Admin') => \Tests\Helpers\admin(),
+            str_contains($normalized, '\\Api\\Client') => \Tests\Helpers\client(),
+            default => new FOSSBilling\Core\Identity\Guest(),
+        });
+    }
 
     return $api;
 }
 
-// Define TestLogger class after autoloader is registered
-// This must be done here because it extends Box_Log which is loaded via the autoloader
-// Using eval() to defer class definition until runtime when Box_Log is available
+/**
+ * Runs $callback with APP_ENV set to $value (or unset entirely when $value is null),
+ * restoring the previous value afterward regardless of outcome.
+ */
+function withAppEnv(?string $value, callable $callback): mixed
+{
+    $previous = getenv('APP_ENV');
+
+    if ($value === null) {
+        putenv('APP_ENV');
+    } else {
+        putenv('APP_ENV=' . $value);
+    }
+
+    try {
+        return $callback();
+    } finally {
+        putenv($previous === false ? 'APP_ENV' : 'APP_ENV=' . $previous);
+    }
+}
+
+/** Run an operation without PHP warnings, including warnings swallowed by its error handling. */
+function withoutPhpWarnings(callable $callback): mixed
+{
+    $warnings = [];
+    set_error_handler(static function (int $severity, string $message, string $file, int $line) use (&$warnings): bool {
+        if ((error_reporting() & $severity) !== 0) {
+            $warnings[] = sprintf('%s in %s:%d', $message, $file, $line);
+        }
+
+        return true;
+    }, E_WARNING | E_NOTICE | E_USER_WARNING | E_USER_NOTICE);
+
+    try {
+        return $callback();
+    } finally {
+        restore_error_handler();
+        expect($warnings)->toBe([], implode("\n", $warnings));
+    }
+}
+
+// Define TestLogger class after autoloader is registered.
+// This is deferred because FOSSBilling\Core\Logging\Logger is loaded via the autoloader.
 // @phpstan-ignore-next-line
 if (!class_exists(Tests\Helpers\TestLogger::class)) {
     // @phpstan-ignore-next-line
     eval('
         namespace Tests\Helpers;
 
-        class TestLogger extends \Box_Log
+        class TestLogger extends \Psr\Log\AbstractLogger
         {
             public array $calls = [];
+            private string $channel = "application";
+            private array $context = [];
 
             public function __construct()
             {
                 $this->calls = [];
             }
 
-            public function __call($method, $params): void
+            public function log($level, string|\\Stringable $message, array $context = []): void
             {
-                $this->calls[] = ["method" => $method, "params" => $params];
+                $effectiveContext = [...$this->context, ...$context];
+                $params = [$message];
+                if ($effectiveContext !== []) {
+                    $params[] = $effectiveContext;
+                }
+
+                $call = ["method" => $level, "params" => $params];
+                if ($this->channel !== "application") {
+                    $call["channel"] = $this->channel;
+                }
+
+                $this->calls[] = $call;
+            }
+
+            public function withChannel(string $channel): static
+            {
+                $logger = clone $this;
+                $logger->calls =& $this->calls;
+                $logger->channel = $channel;
+
+                return $logger;
+            }
+
+            public function withContext(array $context): static
+            {
+                $logger = clone $this;
+                $logger->calls =& $this->calls;
+                $logger->context = [...$this->context, ...$context];
+
+                return $logger;
             }
         }
     ');

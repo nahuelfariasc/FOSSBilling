@@ -11,9 +11,14 @@ declare(strict_types=1);
 
 namespace Box\Mod\Support\Repository;
 
+use Box\Mod\Staff\Entity\Admin;
 use Box\Mod\Support\Entity\SupportTicket;
+use Box\Mod\Support\Entity\SupportTicketAssignment;
+use Box\Mod\Support\TicketPriority;
 use Doctrine\ORM\EntityRepository;
 use Doctrine\ORM\QueryBuilder;
+use FOSSBilling\Core\Doctrine\SqlExpr;
+use FOSSBilling\Core\SortOptions;
 
 class SupportTicketRepository extends EntityRepository
 {
@@ -36,11 +41,12 @@ class SupportTicketRepository extends EntityRepository
      *  - `search`            (string)  LIKE on subject / author_email / author_name
      *  - `date_from`         (string)  created_at lower bound (Y-m-d)
      *  - `date_to`           (string)  created_at upper bound (Y-m-d)
+     *  - `sort`              (string)  sort column: 'id', 'status', 'priority', 'subject', 'created_at' or 'updated_at'
+     *  - `direction`         (string)  sort direction: 'ASC' or 'DESC'
      */
     public function getSearchQueryBuilder(array $data = []): QueryBuilder
     {
-        $qb = $this->createQueryBuilder('t')
-            ->orderBy('t.id', 'DESC');
+        $qb = $this->createQueryBuilder('t');
 
         if (!empty($data['id'])) {
             $qb->andWhere('t.id = :id')
@@ -53,8 +59,14 @@ class SupportTicketRepository extends EntityRepository
         }
 
         if (isset($data['priority']) && $data['priority'] !== '') {
-            $qb->andWhere('t.priority = :priority')
-                ->setParameter('priority', (int) $data['priority']);
+            if (is_numeric($data['priority'])) {
+                $qb->andWhere('t.priority = :priority')
+                    ->setParameter('priority', (int) $data['priority']);
+            } else {
+                [$operator, $number] = TicketPriority::filter((string) $data['priority']);
+                $qb->andWhere('t.priority ' . $operator . ' :priority')
+                    ->setParameter('priority', $number);
+            }
         }
 
         if (!empty($data['client_id'])) {
@@ -119,12 +131,57 @@ class SupportTicketRepository extends EntityRepository
 
         if (!empty($data['date_from'])) {
             $qb->andWhere('t.createdAt >= :date_from')
-                ->setParameter('date_from', new \DateTime($data['date_from'] . ' 00:00:00'));
+                ->setParameter('date_from', new \DateTimeImmutable($data['date_from'] . ' 00:00:00'));
         }
 
         if (!empty($data['date_to'])) {
             $qb->andWhere('t.createdAt <= :date_to')
-                ->setParameter('date_to', new \DateTime($data['date_to'] . ' 23:59:59'));
+                ->setParameter('date_to', new \DateTimeImmutable($data['date_to'] . ' 23:59:59'));
+        }
+
+        $sort = SortOptions::fromArray($data, [
+            'id' => 't.id',
+            'status' => 't.status',
+            'priority' => 't.priority',
+            'subject' => 't.subject',
+            'created_at' => 't.createdAt',
+            'updated_at' => 't.updatedAt',
+        ]);
+
+        // Apply assignment membership in SQL, before ticket filters and pagination.
+        $assigned = $data['assigned_filter'] ?? null;
+        if (is_int($assigned) || $assigned === 'any' || $assigned === 'none') {
+            $assignments = $this->getEntityManager()->createQueryBuilder()
+                ->select('a.ticketId')
+                ->from(SupportTicketAssignment::class, 'a')
+                ->innerJoin(Admin::class, 'ad', 'WITH', 'ad.id = a.adminId')
+                ->where("ad.status = 'active'")
+                ->andWhere('ad.systemName IS NULL');
+            if (is_int($assigned)) {
+                $assignments->andWhere('a.adminId = :assigned_admin');
+                $qb->setParameter('assigned_admin', $assigned);
+            }
+            $qb->andWhere('t.id ' . ($assigned === 'none' ? 'NOT IN' : 'IN') . ' (' . $assignments->getDQL() . ')');
+        }
+
+        // Pinned tickets first (staff list): the "With Selected" pin action.
+        // Applies to the default newest-first order; an explicit column sort
+        // wins so the sort headers keep working.
+        $pinned = !empty($data['pinned_first'])
+            ? array_slice(array_values(array_filter(array_map(intval(...), (array) $data['pinned_first']))), 0, 500)
+            : [];
+        if ($sort->isSorted()) {
+            $qb->orderBy($sort->expression, $sort->direction);
+            if ($sort->expression !== 't.id') {
+                $qb->addOrderBy('t.id', $sort->direction);
+            }
+        } elseif ($pinned !== []) {
+            $qb->addSelect('(CASE WHEN t.id IN (:pinned_ids) THEN 0 ELSE 1 END) AS HIDDEN pin_first')
+                ->setParameter('pinned_ids', $pinned)
+                ->orderBy('pin_first', 'ASC')
+                ->addOrderBy('t.id', 'DESC');
+        } else {
+            $qb->orderBy('t.id', \SortDirection::Descending);
         }
 
         return $qb;
@@ -137,7 +194,7 @@ class SupportTicketRepository extends EntityRepository
     {
         $ticket = $this->find($id);
         if (!$ticket instanceof SupportTicket) {
-            throw new \FOSSBilling\InformationException('Ticket not found');
+            throw new \FOSSBilling\Core\Exception\InformationException('Ticket not found');
         }
 
         return $ticket;
@@ -176,7 +233,9 @@ class SupportTicketRepository extends EntityRepository
     {
         $ticket = $this->findOneByClient($clientId, $id);
         if (!$ticket instanceof SupportTicket) {
-            throw new \FOSSBilling\InformationException('Ticket not found');
+            // Coded so a client probing another client's ticket id gets a
+            // 404 rather than a generic error.
+            throw new \FOSSBilling\Core\Exception\InformationException('Ticket not found', [], 404);
         }
 
         return $ticket;
@@ -210,7 +269,7 @@ class SupportTicketRepository extends EntityRepository
     public function findLatest(int $limit = 10): array
     {
         return $this->createQueryBuilder('t')
-            ->orderBy('t.id', 'DESC')
+            ->orderBy('t.id', \SortDirection::Descending)
             ->setMaxResults($limit)
             ->getQuery()
             ->getResult();
@@ -298,18 +357,22 @@ class SupportTicketRepository extends EntityRepository
      */
     public function findExpiredOnHold(\DateTimeInterface $now): array
     {
-        $sql = 'SELECT st.*
+        $connection = $this->getEntityManager()->getConnection();
+        // sh.close_after is per-row (each helpdesk sets its own window), so it can't be reduced
+        // to a single bound parameter the way :now can - see SqlExpr::addHours().
+        $expiresAt = SqlExpr::addHours($connection, 'st.updated_at', 'sh.close_after');
+
+        $sql = "SELECT st.*
                 FROM support_ticket AS st
                     LEFT JOIN support_helpdesk sh ON sh.id = st.support_helpdesk_id
                 WHERE st.status = :status
-                  AND DATE_ADD(st.updated_at, INTERVAL sh.close_after HOUR) < :now
-                ORDER BY st.id ASC';
+                  AND {$expiresAt} < :now
+                ORDER BY st.id ASC";
 
-        return $this->getEntityManager()->getConnection()
-            ->fetchAllAssociative($sql, [
-                'status' => SupportTicket::STATUS_ONHOLD,
-                'now' => $now->format('Y-m-d H:i:s'),
-            ]);
+        return $connection->fetchAllAssociative($sql, [
+            'status' => SupportTicket::STATUS_ONHOLD,
+            'now' => $now->format('Y-m-d H:i:s'),
+        ]);
     }
 
     /**

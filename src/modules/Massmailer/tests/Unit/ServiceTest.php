@@ -6,7 +6,8 @@ use Box\Mod\Massmailer\Entity\MassmailerMessage;
 use Box\Mod\Massmailer\Repository\MassmailerMessageRepository;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\DriverManager;
-use FOSSBilling\InformationException;
+use FOSSBilling\Core\Enums\ExtensionType;
+use FOSSBilling\Core\Exception\InformationException;
 
 function createMassmailerDi(?Connection $dbal = null): Pimple\Container
 {
@@ -15,7 +16,8 @@ function createMassmailerDi(?Connection $dbal = null): Pimple\Container
     $em = Mockery::mock(Doctrine\ORM\EntityManagerInterface::class);
     $em->shouldReceive('getRepository')->with(MassmailerMessage::class)->andReturn($repo);
     $di['em'] = $em;
-    $di['dbal'] = $dbal ?? DriverManager::getConnection(['driver' => 'pdo_sqlite', 'memory' => true]);
+    $di['em']->shouldReceive('getConnection')->andReturn($dbal ?? DriverManager::getConnection(['driver' => 'pdo_sqlite', 'memory' => true]));
+    $di['validator'] = new FOSSBilling\Core\Validation\Validator();
 
     return $di;
 }
@@ -29,13 +31,53 @@ function seedReceiverTables(Connection $dbal): void
 {
     $dbal->executeStatement('CREATE TABLE client_group (id INTEGER PRIMARY KEY)');
     $dbal->executeStatement('CREATE TABLE product (id INTEGER PRIMARY KEY)');
-    $dbal->executeStatement('CREATE TABLE client (id INTEGER PRIMARY KEY, status TEXT, client_group_id INTEGER)');
+    $dbal->executeStatement('CREATE TABLE client (id INTEGER PRIMARY KEY, status TEXT, email TEXT)');
+    $dbal->executeStatement('CREATE TABLE client_group_members (id INTEGER PRIMARY KEY, client_id INTEGER, client_group_id INTEGER)');
     $dbal->executeStatement('CREATE TABLE client_order (id INTEGER PRIMARY KEY, client_id INTEGER, product_id INTEGER, status TEXT)');
 
     $dbal->executeStatement('INSERT INTO client_group (id) VALUES (1), (2)');
     $dbal->executeStatement('INSERT INTO product (id) VALUES (10), (11)');
-    $dbal->executeStatement("INSERT INTO client (id, status, client_group_id) VALUES (1, 'active', 1), (2, 'canceled', 1), (3, 'active', 2)");
-    $dbal->executeStatement("INSERT INTO client_order (id, client_id, product_id, status) VALUES (1, 1, 10, 'active'), (2, 2, 10, 'suspended'), (3, 3, 11, 'active')");
+    $dbal->executeStatement("INSERT INTO client (id, status, email) VALUES (1, 'active', 'client@example.com'), (2, 'canceled', 'other@example.com'), (3, 'active', ' third@example.com '), (4, 'active', NULL), (5, 'active', '   '), (6, 'active', '0'), (7, 'active', 'not-an-email'), (8, 'active', '')");
+    $dbal->executeStatement('INSERT INTO client_group_members (client_id, client_group_id) VALUES (1, 1), (2, 1), (3, 1), (3, 2), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1)');
+    $dbal->executeStatement("INSERT INTO client_order (id, client_id, product_id, status) VALUES (1, 1, 10, 'active'), (2, 2, 10, 'suspended'), (3, 3, 11, 'active'), (4, 4, 10, 'active'), (5, 5, 10, 'active'), (6, 6, 10, 'active'), (7, 7, 10, 'active'), (8, 8, 10, 'active')");
+}
+
+function clientWithEmail(?string $email): Box\Mod\Client\Entity\Client
+{
+    $client = new Box\Mod\Client\Entity\Client();
+    $property = new ReflectionProperty(Box\Mod\Client\Entity\Client::class, 'email');
+    $property->setValue($client, $email);
+
+    return $client;
+}
+
+function createSendMessageDi(Box\Mod\Client\Entity\Client $client): Pimple\Container
+{
+    $di = createMassmailerDi();
+
+    $clientService = Mockery::mock(Box\Mod\Client\Service::class);
+    $clientService->shouldReceive('get')->with(['id' => 1])->andReturn($client);
+    $clientService->shouldReceive('toApiArray')->andReturn([]);
+
+    $systemService = Mockery::mock(Box\Mod\System\Service::class);
+    $systemService->shouldReceive('renderEmailSubjectString')->andReturn('Subject');
+    $systemService->shouldReceive('renderEmailTplString')->andReturn('Content');
+
+    $extensionService = Mockery::mock(Box\Mod\Extension\Service::class);
+    $extensionService->shouldReceive('isExtensionActive')->with(ExtensionType::Module->value, 'demo')->andReturn(false);
+
+    $emailService = Mockery::mock(Box\Mod\Email\Service::class);
+    $emailService->shouldReceive('sendMail')->zeroOrMoreTimes();
+
+    $di['mod_service'] = $di->protect(fn (string $service): object => match ($service) {
+        'client' => $clientService,
+        'system' => $systemService,
+        'extension' => $extensionService,
+        'email' => $emailService,
+        default => throw new RuntimeException("Unexpected service: $service"),
+    });
+
+    return $di;
 }
 
 test('normalize filter returns canonical enum values', function (): void {
@@ -76,12 +118,12 @@ test('get message receivers builds parameterized query', function (): void {
     $dbal = createMassmailerDbal();
     seedReceiverTables($dbal);
 
-    $model = (new MassmailerMessage())->setFilter(json_encode([
+    $model = (new MassmailerMessage())->setFilter([
         'client_status' => ['active'],
         'client_groups' => [1],
         'has_order' => [10],
         'has_order_with_status' => ['active'],
-    ], JSON_THROW_ON_ERROR));
+    ]);
 
     $service = new Box\Mod\Massmailer\Service();
     $service->setDi(createMassmailerDi($dbal));
@@ -89,14 +131,109 @@ test('get message receivers builds parameterized query', function (): void {
     expect($service->getMessageReceivers($model))->toBe([['id' => 1]]);
 });
 
+test('get message receivers excludes clients without a valid email', function (): void {
+    $dbal = createMassmailerDbal();
+    seedReceiverTables($dbal);
+
+    $model = (new MassmailerMessage())->setFilter([
+        'client_status' => ['active'],
+        'client_groups' => [1],
+    ]);
+
+    $service = new Box\Mod\Massmailer\Service();
+    $service->setDi(createMassmailerDi($dbal));
+
+    // Client 3 holds membership in groups 1 and 2, so a group-1 filter
+    // matches it alongside client 1; the other group-1 members are dropped
+    // for having no usable email address.
+    expect($service->getMessageReceivers($model))->toBe([['id' => 3], ['id' => 1]]);
+});
+
+test('get message receivers accepts a valid email with surrounding whitespace', function (): void {
+    $dbal = createMassmailerDbal();
+    seedReceiverTables($dbal);
+
+    $model = (new MassmailerMessage())->setFilter([
+        'client_status' => ['active'],
+        'client_groups' => [2],
+    ]);
+
+    $service = new Box\Mod\Massmailer\Service();
+    $service->setDi(createMassmailerDi($dbal));
+
+    expect($service->getMessageReceivers($model))->toBe([['id' => 3]]);
+});
+
 test('get message receivers rejects invalid stored filter', function (): void {
-    $model = (new MassmailerMessage())->setFilter(json_encode([
+    $model = (new MassmailerMessage())->setFilter([
         'client_status' => ['active', 'not-valid'],
-    ], JSON_THROW_ON_ERROR));
+    ]);
 
     $service = new Box\Mod\Massmailer\Service();
     $service->setDi(createMassmailerDi());
 
     expect(fn (): array => $service->getMessageReceivers($model))
         ->toThrow(InformationException::class, 'Mass mail filter contains invalid values for "client_status"');
+});
+
+test('send message rejects clients without a valid email', function (?string $email): void {
+    $service = new Box\Mod\Massmailer\Service();
+    $service->setDi(createSendMessageDi(clientWithEmail($email)));
+
+    $model = (new MassmailerMessage())->setSubject('Subject')->setContent('Content');
+
+    expect(fn (): bool => $service->sendMessage($model, 1))
+        ->toThrow(InformationException::class, 'Client does not have a valid email address');
+})->with([
+    'null' => [null],
+    'empty' => [''],
+    'whitespace only' => ['   '],
+    'zero' => ['0'],
+    'malformed' => ['not-an-email'],
+]);
+
+test('send message accepts a client with a valid email', function (): void {
+    $service = new Box\Mod\Massmailer\Service();
+    $service->setDi(createSendMessageDi(clientWithEmail(' client@example.com ')));
+
+    $model = (new MassmailerMessage())->setSubject('Subject')->setContent('Content');
+
+    expect($service->sendMessage($model, 1))->toBeTrue();
+});
+
+test('install creates the mod_massmailer table portably instead of via raw MySQL DDL', function (): void {
+    // Regression test: install() used to run raw MySQL-only DDL (backticks, ENGINE=InnoDB)
+    // directly via the legacy dbal service, which fails outright on PostgreSQL/SQLite - confirmed here
+    // against a real SQLite connection. mod_massmailer already exists in the pre-cutover schema, so this
+    // hook was already redundant on MySQL; it's only load-bearing on PG/SQLite.
+    $connection = DriverManager::getConnection(['driver' => 'pdo_sqlite', 'memory' => true]);
+    $em = FOSSBilling\Core\Doctrine\EntityManagerFactory::create($connection);
+
+    expect($connection->createSchemaManager()->tablesExist(['mod_massmailer']))->toBeFalse();
+
+    $capturedConfig = null;
+    $extensionServiceMock = Mockery::mock();
+    $extensionServiceMock->shouldReceive('setConfig')
+        ->once()
+        ->with(['ext' => 'mod_massmailer', 'limit' => '2', 'interval' => '10', 'test_client_id' => 1])
+        ->andReturnUsing(function (array $config) use (&$capturedConfig): void {
+            $capturedConfig = $config;
+        });
+
+    $di = new Pimple\Container();
+    $di['em'] = $em;
+    $di['mod_service'] = $di->protect(fn (string $name): object => $extensionServiceMock);
+
+    $service = new Box\Mod\Massmailer\Service();
+    $service->setDi($di);
+
+    $service->install();
+
+    expect($connection->createSchemaManager()->tablesExist(['mod_massmailer']))->toBeTrue()
+        ->and($capturedConfig)->toBe(['ext' => 'mod_massmailer', 'limit' => '2', 'interval' => '10', 'test_client_id' => 1]);
+});
+
+test('filter API requires structured input rather than serialized JSON', function (): void {
+    $service = new Box\Mod\Massmailer\Service();
+    expect(fn () => $service->normalizeFilter('{"client_status":["active"]}', true))->toThrow(InformationException::class);
 });

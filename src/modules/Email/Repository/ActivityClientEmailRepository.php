@@ -14,6 +14,7 @@ namespace Box\Mod\Email\Repository;
 use Box\Mod\Email\Entity\ActivityClientEmail;
 use Doctrine\ORM\EntityRepository;
 use Doctrine\ORM\QueryBuilder;
+use FOSSBilling\Core\SortOptions;
 
 class ActivityClientEmailRepository extends EntityRepository
 {
@@ -36,8 +37,7 @@ class ActivityClientEmailRepository extends EntityRepository
         // (derived from attachmentName), and hydrating every PDF for a page of results
         // would pull megabytes into memory just to render a list.
         $qb = $this->createQueryBuilder('e')
-            ->select('partial e.{id, clientId, sender, recipients, subject, contentHtml, contentText, attachmentName, attachmentMime, createdAt, updatedAt}')
-            ->orderBy('e.id', 'DESC');
+            ->select('partial e.{id, clientId, sender, recipients, subject, contentHtml, contentText, attachmentName, attachmentMime, createdAt, updatedAt}');
 
         if (!empty($data['id'])) {
             $qb->andWhere('e.id = :id')
@@ -71,12 +71,29 @@ class ActivityClientEmailRepository extends EntityRepository
 
         if (!empty($data['date_from'])) {
             $qb->andWhere('e.createdAt >= :date_from')
-                ->setParameter('date_from', new \DateTime($data['date_from'] . ' 00:00:00'));
+                ->setParameter('date_from', new \DateTimeImmutable($data['date_from'] . ' 00:00:00'));
         }
 
         if (!empty($data['date_to'])) {
             $qb->andWhere('e.createdAt <= :date_to')
-                ->setParameter('date_to', new \DateTime($data['date_to'] . ' 23:59:59'));
+                ->setParameter('date_to', new \DateTimeImmutable($data['date_to'] . ' 23:59:59'));
+        }
+
+        $sort = SortOptions::fromArray($data, [
+            'id' => 'e.id',
+            'sender' => 'e.sender',
+            'recipient' => 'e.recipients',
+            'subject' => 'e.subject',
+            'created_at' => 'e.createdAt',
+            'updated_at' => 'e.updatedAt',
+        ]);
+        if ($sort->isSorted()) {
+            $qb->orderBy($sort->expression, $sort->direction);
+            if ($sort->expression !== 'e.id') {
+                $qb->addOrderBy('e.id', $sort->direction);
+            }
+        } else {
+            $qb->orderBy('e.id', \SortDirection::Descending);
         }
 
         return $qb;
@@ -97,7 +114,7 @@ class ActivityClientEmailRepository extends EntityRepository
     {
         $email = $this->find($id);
         if (!$email instanceof ActivityClientEmail) {
-            throw new \FOSSBilling\InformationException('Email not found');
+            throw new \FOSSBilling\Core\Exception\InformationException('Email not found');
         }
 
         return $email;
@@ -110,7 +127,7 @@ class ActivityClientEmailRepository extends EntityRepository
     {
         $email = $this->findOneForClientById($clientId, $id);
         if (!$email instanceof ActivityClientEmail) {
-            throw new \FOSSBilling\InformationException('Email not found');
+            throw new \FOSSBilling\Core\Exception\InformationException('Email not found');
         }
 
         return $email;

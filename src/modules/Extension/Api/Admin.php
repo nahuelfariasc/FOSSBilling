@@ -12,10 +12,18 @@ declare(strict_types=1);
 namespace Box\Mod\Extension\Api;
 
 use Box\Mod\Extension\Entity\Extension;
-use FOSSBilling\Tools;
-use FOSSBilling\Validation\Api\RequiredParams;
+use Box\Mod\Extension\Event\AfterAdminDeactivateExtensionEvent;
+use Box\Mod\Extension\Event\AfterAdminInstallExtensionEvent;
+use Box\Mod\Extension\Event\AfterAdminUninstallExtensionEvent;
+use Box\Mod\Extension\Event\AfterAdminUpdateExtensionEvent;
+use Box\Mod\Extension\Event\BeforeAdminDeactivateExtensionEvent;
+use Box\Mod\Extension\Event\BeforeAdminInstallExtensionEvent;
+use Box\Mod\Extension\Event\BeforeAdminUninstallExtensionEvent;
+use Box\Mod\Extension\Event\BeforeAdminUpdateExtensionEvent;
+use FOSSBilling\Core\Enums\ExtensionType;
+use FOSSBilling\Core\Validation\Api\RequiredParams;
 
-class Admin extends \FOSSBilling\Api\AbstractApi
+class Admin extends \FOSSBilling\Core\Api\AbstractApi
 {
     /**
      * Get list of active and inactive extensions on system.
@@ -38,8 +46,8 @@ class Admin extends \FOSSBilling\Api\AbstractApi
     }
 
     /**
-     * Get list of extensions from extensions.fossbilling.org
-     * which can be installed on current version of FOSSBilling.
+     * Get the available extensions from extensions.fossbilling.org.
+     * Release compatibility is checked before download.
      *
      * @return array - list of extensions
      */
@@ -52,7 +60,10 @@ class Admin extends \FOSSBilling\Api\AbstractApi
         try {
             $list = $this->getDi()['extension_manager']->getExtensionList($type);
         } catch (\Exception $e) {
-            $this->getDi()['logger']->warning(sprintf('Failed to fetch extension list for type "%s": %s', $type ?? 'all', $e->getMessage()));
+            $this->getDi()['logger']->warning(
+                'Failed to fetch extension list for type "{type}": {exception_message}',
+                ['type' => $type ?? 'all', 'exception_message' => $e->getMessage(), 'exception' => $e]
+            );
 
             $list = [];
         }
@@ -69,7 +80,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
         $this->checkPermissions('extension', 'view');
 
         $extensionInfo = $this->getDi()['extension_manager']->getExtension($data['extension_id']);
-        $markdown = new \FOSSBilling\Twig\Markdown\FOSSBillingMarkdown($this->di);
+        $markdown = new \FOSSBilling\Core\Twig\Markdown\FOSSBillingMarkdown($this->di);
 
         return $markdown->convert($extensionInfo['readme']);
     }
@@ -97,10 +108,10 @@ class Admin extends \FOSSBilling\Api\AbstractApi
     {
         $this->checkPermissions('extension', 'view');
 
-        $data['disabled'] = Tools::normalizeBoolean($data['disabled'] ?? false);
-        $data['details'] = Tools::normalizeBoolean($data['details'] ?? true, true);
+        $data['disabled'] = \FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($data['disabled'] ?? false);
+        $data['details'] = \FOSSBilling\Core\Utils\Normalizer::normalizeBoolean($data['details'] ?? true, true);
 
-        return \FOSSBilling\i18n::getLocales($data['details'], $data['disabled']);
+        return \FOSSBilling\Core\I18n\I18n::getLocales($data['details'], $data['disabled']);
     }
 
     /**
@@ -108,14 +119,14 @@ class Admin extends \FOSSBilling\Api\AbstractApi
      *
      * @param array $data The post data sent to the API. Should contain a key named `locale_id` which is set to the locale ID to change. (`en_US` for example)
      *
-     * @throws \FOSSBilling\Exception
+     * @throws \FOSSBilling\Core\Exception\BaseException
      */
     #[RequiredParams(['locale_id' => 'Locale ID was not passed'])]
     public function toggle_language(array $data): bool
     {
         $this->checkPermissions('extension', 'manage_extensions');
 
-        return \FOSSBilling\i18n::toggleLocale($data['locale_id']);
+        return \FOSSBilling\Core\I18n\I18n::toggleLocale($data['locale_id']);
     }
 
     /**
@@ -128,7 +139,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
     {
         $this->checkPermissions('extension', 'view');
 
-        return \FOSSBilling\i18n::getLocaleCompletionPercent($data['locale_id']);
+        return \FOSSBilling\Core\I18n\I18n::getLocaleCompletionPercent($data['locale_id']);
     }
 
     /**
@@ -136,8 +147,9 @@ class Admin extends \FOSSBilling\Api\AbstractApi
      *
      * @return array
      *
-     * @throws \FOSSBilling\Exception
+     * @throws \FOSSBilling\Core\Exception\BaseException
      */
+    #[RequiredParams(['id' => 'Extension ID was not passed', 'type' => 'Extension type was not passed'])]
     public function update($data)
     {
         $this->checkPermissions('extension', 'manage_extensions');
@@ -145,9 +157,9 @@ class Admin extends \FOSSBilling\Api\AbstractApi
         $ext = $this->_getExtension($data);
         $service = $this->getService();
 
-        $this->getDi()['events_manager']->fire(['event' => 'onBeforeAdminUpdateExtension', 'params' => $ext]);
+        $this->getDi()['event_dispatcher']->dispatch(new BeforeAdminUpdateExtensionEvent((int) $ext->getId(), $ext->getType(), $ext->getName()));
         $ext2 = $service->update($ext);
-        $this->getDi()['events_manager']->fire(['event' => 'onAfterAdminUpdateExtension', 'params' => $ext2]);
+        $this->getDi()['event_dispatcher']->dispatch(new AfterAdminUpdateExtensionEvent((int) $ext2->getId(), $ext2->getType(), $ext2->getName()));
 
         return $ext2;
     }
@@ -157,7 +169,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
      *
      * @return array
      *
-     * @throws \FOSSBilling\Exception
+     * @throws \FOSSBilling\Core\Exception\BaseException
      */
     #[RequiredParams(['id' => 'Extension ID was not passed', 'type' => 'Extension type was not passed'])]
     public function activate($data)
@@ -174,22 +186,23 @@ class Admin extends \FOSSBilling\Api\AbstractApi
      *
      * @return bool - true
      *
-     * @throws \FOSSBilling\Exception
+     * @throws \FOSSBilling\Core\Exception\BaseException
      */
+    #[RequiredParams(['id' => 'Extension ID was not passed', 'type' => 'Extension type was not passed'])]
     public function deactivate($data): bool
     {
         $this->checkPermissions('extension', 'manage_extensions');
 
         $ext = $this->_getExtension($data);
 
-        $this->getDi()['events_manager']->fire(['event' => 'onBeforeAdminDeactivateExtension', 'params' => ['id' => $ext->getId()]]);
+        $this->getDi()['event_dispatcher']->dispatch(new BeforeAdminDeactivateExtensionEvent((int) $ext->getId(), $ext->getType(), $ext->getName()));
 
         $service = $this->getService();
         $service->deactivate($ext);
 
-        $this->getDi()['events_manager']->fire(['event' => 'onAfterAdminDeactivateExtension', 'params' => ['id' => $data['id'], 'type' => $data['type']]]);
+        $this->getDi()['event_dispatcher']->dispatch(new AfterAdminDeactivateExtensionEvent((int) $ext->getId(), $ext->getType(), $ext->getName()));
 
-        $this->getDi()['logger']->info('Deactivated extension "%s"', $data['type'] . ' ' . $data['id']);
+        $this->getDi()['logger']->info('Deactivated extension "{extension}"', ['extension' => $data['type'] . ' ' . $data['id']]);
 
         return true;
     }
@@ -202,11 +215,11 @@ class Admin extends \FOSSBilling\Api\AbstractApi
     {
         $this->checkPermissions('extension', 'uninstall_extensions');
 
-        $this->getDi()['events_manager']->fire(['event' => 'onBeforeAdminUninstallExtension', 'params' => ['type' => $data['type'], 'id' => $data['id']]]);
+        $this->getDi()['event_dispatcher']->dispatch(new BeforeAdminUninstallExtensionEvent((string) $data['type'], (string) $data['id']));
 
         $this->getService()->uninstall($data['type'], $data['id']);
 
-        $this->getDi()['events_manager']->fire(['event' => 'onAfterAdminUninstallExtension', 'params' => ['type' => $data['type'], 'id' => $data['id']]]);
+        $this->getDi()['event_dispatcher']->dispatch(new AfterAdminUninstallExtensionEvent((string) $data['type'], (string) $data['id']));
 
         return true;
     }
@@ -214,19 +227,19 @@ class Admin extends \FOSSBilling\Api\AbstractApi
     /**
      * Install new extension from extensions site.
      *
-     * @throws \FOSSBilling\Exception
+     * @throws \FOSSBilling\Core\Exception\BaseException
      */
     #[RequiredParams(['id' => 'Extension ID was not passed', 'type' => 'Extension type was not passed'])]
     public function install($data): array
     {
         $this->checkPermissions('extension', 'manage_extensions');
 
-        $this->getDi()['events_manager']->fire(['event' => 'onBeforeAdminInstallExtension', 'params' => $data]);
+        $this->getDi()['event_dispatcher']->dispatch(new BeforeAdminInstallExtensionEvent((string) $data['type'], (string) $data['id']));
 
         $service = $this->getService();
         $service->downloadAndExtract($data['type'], $data['id']);
 
-        $this->getDi()['events_manager']->fire(['event' => 'onAfterAdminInstallExtension', 'params' => $data]);
+        $this->getDi()['event_dispatcher']->dispatch(new AfterAdminInstallExtensionEvent((string) $data['type'], (string) $data['id']));
 
         return [
             'success' => true,
@@ -244,7 +257,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
      *
      * @return array - configuration parameters
      *
-     * @throws \FOSSBilling\Exception
+     * @throws \FOSSBilling\Core\Exception\BaseException
      */
     #[RequiredParams(['ext' => 'Parameter "ext" was not passed'])]
     public function config_get($data)
@@ -268,7 +281,7 @@ class Admin extends \FOSSBilling\Api\AbstractApi
      *
      * @return bool
      *
-     * @throws \FOSSBilling\Exception
+     * @throws \FOSSBilling\Core\Exception\BaseException
      */
     #[RequiredParams(['ext' => 'Parameter "ext" was not passed'])]
     public function config_save($data)
@@ -283,9 +296,9 @@ class Admin extends \FOSSBilling\Api\AbstractApi
     private function _getExtension($data)
     {
         $service = $this->getService();
-        $ext = $service->getExtensionRepository()->findOneByTypeAndName($data['type'], $data['id']);
+        $ext = $service->getExtensionRepository()->findOneByTypeAndName(ExtensionType::normalize((string) $data['type']), $data['id']);
         if (!$ext instanceof Extension) {
-            throw new \FOSSBilling\InformationException('Extension not found');
+            throw new \FOSSBilling\Core\Exception\InformationException('Extension not found');
         }
 
         return $ext;

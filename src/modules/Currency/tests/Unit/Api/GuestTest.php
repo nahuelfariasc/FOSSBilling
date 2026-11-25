@@ -126,7 +126,7 @@ test('get exception', function (): void {
     ->andReturn($repositoryMock);
 
     $guestApi->setService($service);
-    $this->expectException(FOSSBilling\Exception::class);
+    $this->expectException(FOSSBilling\Core\Exception\BaseException::class);
     $result = $guestApi->get([]);
 });
 
@@ -134,6 +134,15 @@ dataset('formatProvider', [
     [
         [
             'code' => 'EUR',
+        ],
+        'formatCurrency',
+        0.0,
+        '€0.00',
+    ],
+    [
+        [
+            'code' => 'EUR',
+            'price' => 'not-a-number',
         ],
         'formatCurrency',
         0.0,

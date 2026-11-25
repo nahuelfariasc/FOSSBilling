@@ -17,12 +17,16 @@ namespace Box\Mod\Order\Api;
 
 use Box\Mod\Client\Entity\Client as ClientEntity;
 use Box\Mod\Order\Entity\Order;
-use FOSSBilling\PaginationOptions;
+use FOSSBilling\Core\Pagination\Options;
+use FOSSBilling\Core\Validation\Api\RequiredParams;
 
-class Client extends \FOSSBilling\Api\AbstractApi
+class Client extends \FOSSBilling\Core\Api\AbstractApi
 {
     /**
      * Get list of orders.
+     *
+     * @optional string $sort - sort by one of: id, status, title, created_at, updated_at
+     * @optional string $direction - sort direction: ASC or DESC
      *
      * @return array
      */
@@ -38,7 +42,7 @@ class Client extends \FOSSBilling\Api\AbstractApi
             [$query, $bindings] = $this->getService()->getSearchQuery($data);
         }
 
-        $pager = $this->getDi()['pager']->getPaginatedResultSet($query, $bindings, PaginationOptions::fromArray($data));
+        $pager = $this->getDi()['pager']->getPaginatedResultSet($query, $bindings, Options::fromArray($data));
 
         $pager['list'] = $this->getService()->getBatchForApi(
             array_column($pager['list'], 'id'),
@@ -57,7 +61,7 @@ class Client extends \FOSSBilling\Api\AbstractApi
     {
         $model = $this->_getOrder($data);
 
-        return $this->getService()->toApiArray($model);
+        return $this->getService()->toApiArray($model, true, $this->getIdentity());
     }
 
     /**
@@ -69,7 +73,7 @@ class Client extends \FOSSBilling\Api\AbstractApi
         $list = $this->getService()->getOrderAddonsList($model);
         $result = [];
         foreach ($list as $order) {
-            $result[] = $this->getService()->toApiArray($order);
+            $result[] = $this->getService()->toApiArray($order, true, $this->getIdentity());
         }
 
         return $result;
@@ -83,10 +87,10 @@ class Client extends \FOSSBilling\Api\AbstractApi
     public function service($data)
     {
         $order = $this->_getOrder($data);
-        $status = $order instanceof Order ? $order->getStatus() : $order->status;
+        $status = $order->getStatus();
 
         if ($status !== Order::STATUS_ACTIVE) {
-            throw new \FOSSBilling\InformationException('Order is not active');
+            throw new \FOSSBilling\Core\Exception\InformationException('Order is not active');
         }
 
         return $this->getService()->getOrderServiceData($order, $this->getIdentity());
@@ -101,7 +105,7 @@ class Client extends \FOSSBilling\Api\AbstractApi
     {
         $model = $this->_getOrder($data);
         $productService = $this->di['mod_service']('product');
-        $productId = $model instanceof Order ? $model->getProductId() : $model->product_id;
+        $productId = $model->getProductId();
 
         return $productService->getUpgradablePairsByProductId((int) $productId);
     }
@@ -112,9 +116,9 @@ class Client extends \FOSSBilling\Api\AbstractApi
     public function delete($data)
     {
         $model = $this->_getOrder($data);
-        $status = $model instanceof Order ? $model->getStatus() : $model->status;
+        $status = $model->getStatus();
         if (!in_array($status, [Order::STATUS_PENDING_SETUP, Order::STATUS_FAILED_SETUP])) {
-            throw new \FOSSBilling\InformationException('Only pending and failed setup orders can be deleted.');
+            throw new \FOSSBilling\Core\Exception\InformationException('Only pending and failed setup orders can be deleted.');
         }
 
         return $this->getService()->deleteFromOrder($model);
@@ -128,34 +132,71 @@ class Client extends \FOSSBilling\Api\AbstractApi
         $this->getDi()['validator']->checkRequiredParamsForArray($required, $data);
 
         $order = $this->findOrderForIdentity($this->getIdentity(), (int) $data['id']);
-        if (!$order instanceof Order && !$order instanceof \Model_ClientOrder) {
-            throw new \FOSSBilling\InformationException('Order not found');
+        if (!$order instanceof Order) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Order not found');
         }
 
         return $order;
     }
 
-    private function getClientId(ClientEntity|\Model_Admin|\Model_Client|\Model_Guest $identity): int
+    /**
+     * Asks to cancel the service, with a type (immediate or end_of_period)
+     * and a reason.
+     */
+    #[RequiredParams(['type' => 'Choose when the service ends', 'reason' => 'Please tell us why you want to cancel.'])]
+    public function cancel_request($data): bool
     {
-        if ($identity instanceof ClientEntity) {
-            return (int) $identity->getId();
+        if (!is_string($data['type'] ?? null) || !is_string($data['reason'] ?? null)) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Cancellation type and reason must be strings.');
         }
+        $this->di['mod_service']('Order', 'CancelRequest')->create($this->_getOrder($data), $data['type'], $data['reason']);
 
-        if (!$identity instanceof \Model_Client) {
-            throw new \FOSSBilling\InformationException('Client identity not found');
-        }
-
-        return (int) $identity->id;
+        return true;
     }
 
-    private function findOrderForIdentity(ClientEntity|\Model_Admin|\Model_Client|\Model_Guest $identity, int $id): Order|\Model_ClientOrder|null
+    /**
+     * The waiting cancellation request of the service, or null.
+     *
+     * @return array|null
+     */
+    public function cancel_request_get($data)
     {
-        if ($identity instanceof ClientEntity) {
-            return $this->getService()->findEntityForClientById($identity, $id);
+        $request = $this->di['mod_service']('Order', 'CancelRequest')->pending($this->_getOrder($data));
+
+        return $request === null ? null : $this->di['mod_service']('Order', 'CancelRequest')->toApiArray($request);
+    }
+
+    /**
+     * Takes back the waiting cancellation request of the service.
+     */
+    public function cancel_request_withdraw($data): bool
+    {
+        $identity = $this->getIdentity();
+        if (!$identity instanceof ClientEntity) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Client identity not found');
+        }
+        $id = $data['request_id'] ?? null;
+        if ((!is_int($id) && !is_string($id)) || filter_var($id, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]) === false) {
+            throw new \FOSSBilling\Core\Exception\InformationException('A positive cancellation request ID is required.');
+        }
+        $this->di['mod_service']('Order', 'CancelRequest')->withdraw($this->_getOrder($data), $identity, (int) $id);
+
+        return true;
+    }
+
+    private function getClientId(object $identity): int
+    {
+        if (!$identity instanceof ClientEntity) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Client identity not found');
         }
 
-        if (!$identity instanceof \Model_Client) {
-            throw new \FOSSBilling\InformationException('Client identity not found');
+        return (int) $identity->getId();
+    }
+
+    private function findOrderForIdentity(object $identity, int $id): ?Order
+    {
+        if (!$identity instanceof ClientEntity) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Client identity not found');
         }
 
         return $this->getService()->findForClientById($identity, $id);
