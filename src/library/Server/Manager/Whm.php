@@ -719,7 +719,10 @@ class Server_Manager_Whm extends Server_Manager
      */
     private function getPackageName(Server_Package $package): string
     {
-        return $this->_config['username'] . '_' . $package->getName();
+        // Use the plan/package name as-is so it maps 1:1 to packages already
+        // created in WHM (no `username_` prefix). This lets FOSSBilling reuse
+        // existing cPanel packages instead of creating duplicates.
+        return $package->getName();
     }
 
     /**

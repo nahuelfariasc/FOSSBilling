@@ -73,6 +73,20 @@ jobs:
             --exclude ".editorconfig" \
             --exclude ".gitignore" \
             --exclude "src/install" \
+            --exclude "node_modules" \
+            --exclude "frontend" \
+            --exclude "Dockerfile" \
+            --exclude ".dockerignore" \
+            --exclude "package.json" \
+            --exclude "package-lock.json" \
+            --exclude "tsconfig.json" \
+            --exclude "cspell.json" \
+            --exclude ".php-cs-fixer.dist.php" \
+            --exclude "phpstan.neon" \
+            --exclude "phpstan-baseline.neon" \
+            --exclude "rector.php" \
+            --exclude "phpunit.xml.dist" \
+            --exclude "cypress.config.js" \
             -e "ssh -p ${{ secrets.STAGING_PORT }}" \
             ./ \
             ${{ secrets.STAGING_USER }}@${{ secrets.STAGING_HOST }}:~/deploy/panel-staging/releases/${{ env.RELEASE }}/
