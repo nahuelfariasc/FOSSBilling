@@ -294,12 +294,22 @@ class Server_Manager_Whm extends Server_Manager
 
     private function findProvisioningAccount(Server_Account $account): ?object
     {
-        $response = $this->request('listaccts', [
-            'api.version' => 1,
-            'search' => $account->getUsername(),
-            'searchtype' => 'user',
-            'searchmethod' => 'exact',
-        ]);
+        try {
+            $response = $this->request('listaccts', [
+                'api.version' => 1,
+                'search' => $account->getUsername(),
+                'searchtype' => 'user',
+                'searchmethod' => 'exact',
+            ]);
+        } catch (Server_Exception $e) {
+            // WHM returns "No accounts found." when the account doesn't exist yet.
+            // This is expected for new accounts - proceed with creation.
+            if (str_contains(strtolower($e->getMessage()), 'no accounts found')) {
+                $this->getLog()->debug('listaccts: no existing account found, proceeding with creation');
+                return null;
+            }
+            throw $e;
+        }
 
         // Log the raw response for debugging
         $this->getLog()->debug('listaccts response: ' . json_encode($response));
