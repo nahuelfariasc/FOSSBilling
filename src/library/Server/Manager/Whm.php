@@ -86,7 +86,7 @@ class Server_Manager_Whm extends Server_Manager
      */
     public function getLoginUrl(?Server_Account $account = null): string
     {
-        if ($account) {
+        if ($account && !empty($account->getUsername())) {
             $action = 'create_user_session';
             $params = [
                 'api.version' => 2,
@@ -121,7 +121,7 @@ class Server_Manager_Whm extends Server_Manager
      */
     public function getResellerLoginUrl(?Server_Account $account = null): string
     {
-        if ($account) {
+        if ($account && !empty($account->getUsername())) {
             // API action for creating a user session
             $action = 'create_user_session';
             $params = [
@@ -300,16 +300,35 @@ class Server_Manager_Whm extends Server_Manager
             'searchtype' => 'user',
             'searchmethod' => 'exact',
         ]);
-        if (($response->metadata->result ?? null) != 1 || !isset($response->data->acct) || !is_array($response->data->acct) || count($response->data->acct) > 1) {
+
+        // Log the raw response for debugging
+        $this->getLog()->debug('listaccts response: ' . json_encode($response));
+
+        // Handle different response formats (WHM API 1 vs newer versions)
+        $acctList = null;
+        if (isset($response->data->acct) && is_array($response->data->acct)) {
+            $acctList = $response->data->acct;
+        } elseif (isset($response->acct) && is_array($response->acct)) {
+            $acctList = $response->acct;
+        } elseif (isset($response->data) && is_array($response->data)) {
+            $acctList = $response->data;
+        }
+
+        if ($acctList === null) {
+            $this->getLog()->warning('Unexpected listaccts response format, proceeding with account creation');
+            return null;
+        }
+
+        if (count($acctList) > 1) {
             throw new Server_Exception('Could not verify the hosting account on the WHM server.');
         }
 
-        if ($response->data->acct === []) {
+        if ($acctList === []) {
             return null;
         }
-        $existing = $response->data->acct[0] ?? null;
+        $existing = $acctList[0] ?? null;
         if (!is_object($existing)) {
-            throw new Server_Exception('Could not verify the hosting account on the WHM server.');
+            return null;
         }
 
         return $existing;
