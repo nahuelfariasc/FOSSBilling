@@ -302,13 +302,11 @@ class Server_Manager_Whm extends Server_Manager
                 'searchmethod' => 'exact',
             ]);
         } catch (Server_Exception $e) {
-            // WHM returns "No accounts found." when the account doesn't exist yet.
-            // This is expected for new accounts - proceed with creation.
-            if (str_contains(strtolower($e->getMessage()), 'no accounts found')) {
-                $this->getLog()->debug('listaccts: no existing account found, proceeding with creation');
-                return null;
-            }
-            throw $e;
+            // WHM returns "No accounts found." as an error when the account
+            // doesn't exist yet. This is expected for new accounts - proceed
+            // with creation. The actual WHM error is logged by request().
+            $this->getLog()->debug('listaccts threw Server_Exception, treating as no existing account: ' . $e->getMessage());
+            return null;
         }
 
         // Log the raw response for debugging
